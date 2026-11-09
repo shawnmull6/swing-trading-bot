@@ -63,6 +63,7 @@ ignore = [
 "tests/**" = ["S101", "ANN", "PLR2004", "FBT", "S105", "S106", "S608", "PT012", "PT018"]
 # Only constant column lists are interpolated; every value is a bound parameter.
 "src/swing_trading_bot/ledger/repositories.py" = ["S608"]
+"src/swing_trading_bot/ledger/loss_limit_store.py" = ["S608"]
 "src/swing_trading_bot/__init__.py" = ["T201"]
 
 [tool.mypy]

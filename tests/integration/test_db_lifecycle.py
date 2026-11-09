@@ -36,6 +36,8 @@ N = len(packaged_migrations())
 EXPECTED_TABLES = {
     "calendar_fetches",
     "settlement_days",
+    "session_closes",
+    "settlement_resolutions",
     "schema_migrations",
     "database_identity",
     "portfolios",

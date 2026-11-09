@@ -1,8 +1,8 @@
 # Milestone M1 — Core Infrastructure & Portfolio Accounting
 
-Status: **Revision 3 — architecture approved; all decisions final. Steps 1–5 approved;
-step 6 (virtual portfolio accounting) implemented and awaiting review (see ARCHITECTURE
-§12.6 fixture correction and §12.7). No order submission; no commits until reviewed.**
+Status: **Revision 3 — architecture approved; all decisions final. Steps 1–6 approved;
+step 7 (equity baselines & loss limits, plus accounting review) implemented and awaiting
+review (see ARCHITECTURE §12.8). No order submission; no commits until reviewed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal
@@ -264,6 +264,8 @@ M1 is complete when all of the following are demonstrated:
 | Corporate actions (splits) on held symbols | Operational (M2+) | halt; manual ADJUSTMENT workflow designed in M2 |
 | Interest/other credits on the $100k | Assumption | classified EXTERNAL; unknown activity types → UNEXPLAINED → halt until classified |
 | Paper account is 4× margin; broker won't stop leverage | Verified | virtual gate + broker cash backstop; operator settings (D15); U6 |
+| Fee reported both on a fill and as a FEE activity (double count) | Adapter contract | Alpaca adapter sets fill fees to 0; regulatory fees only via FEE activities (§12.8); CT confirms fill activities carry no fees |
+| Late activity executed before booked fills (average-cost order) | Detected | Booked then halt `OUT_OF_ORDER`; restatement procedure required before M2 |
 | Paper fills are optimistic | Known | out of M1 scope; slippage tracking in M2 |
 | PDT/settlement regulation changes | Regulatory | rules in configurable account profiles, not hard-coded |
 | SQLite loss/corruption | Operational | WAL + FULL sync, backups, startup invariants |
@@ -275,6 +277,7 @@ TradePlan implementation, protective stops/exits, cancel-on-halt, corporate-acti
 adjustments, notifications, dashboards.
 
 ## 9. M2 entry criteria (preview)
-SDK write-path retries disabled and tested; M2 pre-execution contract
+SDK write-path retries disabled and tested; out-of-order fill restatement procedure and
+execution-ordered ingestion in place (ARCHITECTURE §12.8); M2 pre-execution contract
 suite designed; Alpaca execution adapter reviewed separately; U6 preflight enforced;
 explicit approval to submit paper orders.

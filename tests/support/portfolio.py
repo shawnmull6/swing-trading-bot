@@ -61,6 +61,7 @@ def new_ledger(
     with_calendar: bool = True,
     calendar_at: datetime = NOW,
     calendar_range: tuple[date, date] = (FIXTURE_START, FIXTURE_END),
+    created_at: datetime | None = None,
 ) -> tuple[Database, VirtualPortfolio]:
     db = Database.create(path, RuntimeMode.SIMULATE, now=NOW)
     with db.transaction() as tx:
@@ -71,7 +72,7 @@ def new_ledger(
             initial_capital=D("5000"),
             max_capital_allocation=D("5000"),
             account_profile="cash_conservative",
-            at=NOW - timedelta(days=30),
+            at=created_at if created_at is not None else NOW - timedelta(days=30),
         )
     if with_calendar:
         seed_calendar(db, calendar_at - timedelta(minutes=5), *calendar_range)

@@ -170,7 +170,7 @@ def test_rejection_of_internal_problems_is_recorded(db: Database) -> None:
 
 
 def test_migration_0002_schema(db: Database) -> None:
-    assert db.pragma("user_version") == len(packaged_migrations()) == 2
+    assert db.pragma("user_version") == len(packaged_migrations()) >= 2
     with db.read() as s:
         tables = {
             str(r[0]) for r in s.fetch_all("SELECT name FROM sqlite_master WHERE type='table'")
@@ -219,7 +219,7 @@ def test_upgrade_from_schema_version_1(tmp_path: Path) -> None:
     path = tmp_path / "v1.sqlite3"
     Database.create(path, RuntimeMode.SIMULATE, migrations=packaged_migrations()[:1]).close()
     with Database.open(path, RuntimeMode.SIMULATE) as upgraded:
-        assert upgraded.pragma("user_version") == 2
+        assert upgraded.pragma("user_version") == len(packaged_migrations())
         with upgraded.transaction() as tx:
             assert store.record_fetch(tx, trading_fetch(FETCHED)).accepted
 

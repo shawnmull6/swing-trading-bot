@@ -931,6 +931,111 @@ freshness), `ledger/balances.py`, `ledger/portfolio.py` (`VirtualPortfolio`),
   last completed session (a `LATEST_TRADE` at/after that session's open — extended-hours
   prints are accepted — or a `SESSION_CLOSE_BAR` for that date); calendar unavailable →
   `UNVERIFIABLE`.
+
+### 12.8 Step 7: accounting review and loss limits (as built)
+
+#### Accounting review (before step 7)
+
+1. **Cash-conservation identity and fee signs.**
+
+   `cash + Σ position cost basis = deposits + Σ realized P&L + dividends + fee entries + adjustments`
+
+   Sign conventions (enforced at input and by the `cash_entry_signs` invariant):
+
+   | Item | Stored as | Effect |
+   |---|---|---|
+   | Buy fill fee `f` (magnitude ≥ 0) | inside BUY entry `−(q·p + f)` | adds `f` to cost basis |
+   | Sell fill fee `f` (magnitude ≥ 0) | inside SELL entry `+(q·p − f)` | reduces realized P&L by `f` |
+   | Standalone FEE activity | FEE entry `< 0` | reduces cash only |
+   | DIVIDEND | DIVIDEND entry `> 0` | increases cash only |
+
+   Each fee lands in exactly one place, so nothing is counted twice *provided the broker
+   reports it once*. The ledger cannot detect a fee reported both on a fill and as a
+   separate FEE activity, so this is an **adapter contract** for step 9: Alpaca fill
+   activities carry no fees and regulatory fees (TAF/SEC) arrive only as FEE activities,
+   so the Alpaca adapter sets `ConfirmedFill.fees = 0`. `ConfirmedFill` rejects negative
+   fees and non-positive qty/price; `CashActivity` rejects FEE ≥ 0 and DIVIDEND ≤ 0 (a
+   fee refund needs an explicit mapping). `PortfolioSnapshot.total_fees` = fill fees +
+   |FEE entries|.
+2. **Unknown settlement dates.** Balances are recomputed from the journal, so a NULL
+   `settles_on` keeps sell proceeds unavailable across restarts and over any amount of
+   time. `resolve_settlements` is idempotent (NULL-only update, set-once trigger, UNIQUE
+   audit row) and now **auditable**: each resolution writes `settlement_resolutions`
+   (entry, trade date, settlement date, time, method, accepted calendar fetch ids used;
+   migration 0003, append-only).
+3. **Booking order vs execution order.** Average cost (and so each sell's realized
+   P&L and the remaining cost basis) depends on the order in which buys and sells are
+   applied. The ledger applies fills in **booking order**, the order of record. Totals
+   are order-independent in one sense (cash and quantity are sums), but the split
+   between realized P&L and remaining cost basis is not. Step 6 did not detect a late
+   activity whose execution time precedes already-booked fills for the same symbol. Now
+   such a fill is **booked (broker truth) and then halts** (`OUT_OF_ORDER`,
+   `RECON_EXECUTION`). Ordering is per portfolio and symbol.
+   **Recovery requirements before M2** (M2 entry criterion):
+   * activity ingestion must apply each page in ascending execution time and never
+     book a later page before an earlier one (§8.4 already pages ascending);
+   * an operator **restatement** procedure: re-derive average cost and per-fill realized
+     P&L for the affected symbol in execution order, record the differences as audited
+     `ADJUSTMENT` entries (fills stay append-only), re-run invariants, then resume;
+   * the overlap re-scan (§8.4) must route late activities through this path rather than
+     silently booking them.
+
+#### Equity baselines and loss limits
+
+Code: `domain/loss_limits.py` (pure math), `ledger/loss_limit_store.py`,
+`ledger/loss_limits.py` (`LossLimitMonitor`), migration `0003_loss_limits.sql`.
+
+* **Migration 0003** adds `settlement_resolutions` and `session_closes` (immutable official
+  close per symbol and session), and rebuilds `equity_snapshots` and `loss_limit_events`.
+  Those tables existed since 0001 but no earlier step wrote them; the rebuild aborts if
+  rows exist. Snapshots record `applies_to` (session, or week Monday),
+  `reference_session` and its close time, `basis` (`SESSION_CLOSE` / `INCEPTION`), equity,
+  cash, market value and the closes used. They are UNIQUE per
+  (portfolio, kind, applies_to). Events reference their baseline snapshot and record
+  loss, loss %, threshold and evidence, with the same uniqueness rule, so repeated
+  evaluation never duplicates an event.
+* **Current session:** today's session until its close; after the close or on a
+  non-trading day, the next session.
+  **Daily baseline:** equity at the previous session's official close, i.e. the cash
+  journal up to the close time plus the quantities held at that time × each symbol's
+  recorded official close. If any held symbol has no recorded close, there is no
+  baseline (`SESSION_BASELINE_MISSING`); nothing is estimated. If the portfolio was
+  created after that close, the baseline is the inception capital (`INCEPTION`).
+  **Weekly baseline:** equity at the close of the last session before the current
+  week's Monday (handles holiday Mondays, Fridays and Thanksgiving weeks). Both are
+  written once and never recomputed or reset, by a restart or by a resume.
+* **Limits** compare against the recorded baseline (inclusive, exact Decimal,
+  `baseline − equity ≥ pct × baseline`):
+  * daily 2% → `DAILY_LOCKOUT` for the session. It blocks new entries until a baseline
+    for a later session exists, and stays active (with `SESSION_BASELINE_MISSING`) if
+    the next baseline cannot be built.
+  * A second lockout within the 5-session window (this session + 4 before) →
+    `DAILY_REPEAT_HALT` + persistent halt `DAILY_LOSS_REPEAT`. If the calendar cannot
+    determine the window, this fails closed (halts).
+  * weekly 5% → `WEEKLY_HALT` + persistent halt `WEEKLY_DRAWDOWN`. The breach keeps
+    blocking new entries (`WEEKLY_LIMIT_ACTIVE`) for the rest of that week even after
+    an operator resume; the resume itself is not undone.
+* **Mark-to-market:** current equity comes from `VirtualPortfolio.snapshot`, which uses
+  fresh marks only. Missing or stale marks → `EQUITY_UNKNOWN` (no breach can be
+  evaluated, entries blocked). Missing or stale calendar → `CALENDAR_UNAVAILABLE`.
+* **Overnight gaps:** since the daily baseline is the prior official close, the first
+  valid price of a new session (`GapObservation`: quantity held at that close, prior
+  close, price, P&L, %) counts toward both limits at that evaluation. Losses are
+  measured when `evaluate` runs; the caller (sync loop) must evaluate during sessions.
+* **Gap stress (U3):** a hypothetical 15% adverse move on every position's market value
+  and on working buy commitments. Limits are 3% (per position) and 10% (portfolio) of
+  the **recorded session-baseline equity**. An exceeded portfolio limit blocks new
+  entries; an exceeded per-position limit is reported for the step 11 risk gate. It is
+  a scenario, not a maximum possible loss (§11.3).
+* **Reporting:** `LossLimitMonitor.report` is read-only (writes nothing). It returns
+  baselines, equity, daily/weekly loss, loss %, budget and remaining budget, lockout
+  status and session, weekly-breach status, lockouts in the 5-session window, gaps,
+  gap-stress exposure and blockers. `evaluate` writes baselines, events and halts.
+  Blockers apply to **new entries only**: risk-reducing exits stay conceptually
+  permitted (`RISK_REDUCING_EXITS_PERMITTED`); exit execution is not part of M1.
+* **Session closes** are recorded through `record_session_close` (immutable; an
+  identical re-record is a no-op, a different price a `CONFLICT`). The step 9
+  market-data adapter will feed them from daily bars.
 ---
 
 ## 13. Configuration & secrets

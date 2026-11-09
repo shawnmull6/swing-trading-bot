@@ -193,6 +193,29 @@ class CapitalLimits:
         return out
 
 
+class CashEntrySigns:
+    """Sign conventions: DEPOSIT > 0, BUY < 0, FEE < 0, DIVIDEND > 0 (SELL may be any
+    sign only in the pathological case fees > proceeds; ADJUSTMENT is signed)."""
+
+    name = "cash_entry_signs"
+
+    def check(self, s: Session) -> list[Violation]:
+        out: list[Violation] = []
+        for entry_id, kind_raw, amount_raw in s.fetch_all(
+            "SELECT id, kind, amount FROM cash_entries"
+        ):
+            kind, amount = str_from_db(kind_raw), dec_from_db(amount_raw)
+            ok = {
+                "DEPOSIT": amount > ZERO,
+                "BUY": amount < ZERO,
+                "FEE": amount < ZERO,
+                "DIVIDEND": amount > ZERO,
+            }.get(kind, True)
+            if not ok:
+                out.append(Violation(self.name, str(entry_id), f"{kind} amount {amount}"))
+        return out
+
+
 class ReservationBounds:
     name = "reservation_bounds"
 
@@ -214,6 +237,7 @@ def accounting_invariants(today: TodayFn) -> tuple[Invariant, ...]:
         PositionCostReplay(),
         CashConservation(today),
         CapitalLimits(today),
+        CashEntrySigns(),
         ReservationBounds(),
     )
 

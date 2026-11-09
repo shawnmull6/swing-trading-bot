@@ -21,6 +21,7 @@ content is a ``CONFLICT`` and halts without touching the books.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -59,6 +60,7 @@ from swing_trading_bot.domain.valuation import (
 from swing_trading_bot.ledger.accounting_invariants import accounting_checker
 from swing_trading_bot.ledger.balances import Balances, compute_balances
 from swing_trading_bot.ledger.calendar_store import CalendarStore
+from swing_trading_bot.ledger.codec import ts_to_db
 from swing_trading_bot.ledger.db import Database, Session, Tx
 from swing_trading_bot.ledger.errors import PersistenceError, RecordNotFoundError
 from swing_trading_bot.ledger.invariants import InvariantReport, Violation
@@ -98,6 +100,7 @@ class InsufficientBuyingCapacityError(AccountingError):
 
 class FillOutcome(StrEnum):
     APPLIED = "APPLIED"
+    OUT_OF_ORDER = "OUT_OF_ORDER"
     DUPLICATE = "DUPLICATE"
     CONFLICT = "CONFLICT"
     UNATTRIBUTED = "UNATTRIBUTED"
@@ -124,6 +127,16 @@ class ConfirmedFill:
     transaction_time: datetime
     raw_json: str
 
+    def __post_init__(self) -> None:
+        # Sign convention: qty, price and fees are magnitudes. A fee charged on a fill is
+        # recorded here OR as a standalone FEE activity, never both (adapter contract).
+        if self.qty <= ZERO or self.price <= ZERO:
+            raise ValueError("fill qty and price must be positive")
+        if self.fees < ZERO:
+            raise ValueError("fill fees are a non-negative magnitude")
+        if self.transaction_time.utcoffset() is None:
+            raise ValueError("transaction_time must be timezone-aware")
+
     @property
     def net_cash(self) -> Decimal:
         if self.side is Side.BUY:
@@ -137,10 +150,18 @@ class CashActivity:
 
     activity_id: str
     kind: CashActivityKind
-    amount: Decimal  # signed, as reported by the broker (fees negative, dividends positive)
+    amount: Decimal  # signed cash effect: FEE < 0 (charge), DIVIDEND > 0 (credit)
     occurred_at: datetime
     raw_json: str
     symbol: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is CashActivityKind.FEE and self.amount >= ZERO:
+            raise ValueError("FEE amount must be negative (a charge); refunds need a mapping")
+        if self.kind is CashActivityKind.DIVIDEND and self.amount <= ZERO:
+            raise ValueError("DIVIDEND amount must be positive")
+        if self.occurred_at.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +229,11 @@ class PortfolioSnapshot:
     @property
     def entry_eligible(self) -> bool:
         return not self.entry_blockers
+
+    @property
+    def total_fees(self) -> Decimal:
+        """All fees paid: fill-level magnitudes plus standalone FEE charges (stored < 0)."""
+        return self.fill_fees - self.balances.fee_entries
 
 
 HookFn = Callable[[str], None]
@@ -416,6 +442,7 @@ class VirtualPortfolio:
         orphan = order is None
         if order is None:
             order = self._create_orphan(tx, fill, client_order_id, now)
+        later_booked = self._later_fill_exists(tx, order.portfolio_id, fill)
 
         pos_rec = self._positions.get(tx, order.portfolio_id, fill.symbol)
         before = (
@@ -528,15 +555,33 @@ class VirtualPortfolio:
         )
         if hook:
             hook("before_commit")
-        if orphan:
+        if later_booked:
+            # Average cost is computed in booking order. A fill that executed before fills
+            # already booked for this symbol is recorded (broker truth) but would make the
+            # stored average cost / realized P&L differ from execution order: halt for an
+            # operator restatement (see ARCHITECTURE §12.8).
             self._halt(tx, HaltReason.RECON_EXECUTION,
-                       f"fill {fill.activity_id} for unknown bot order {client_order_id}",
-                       now)  # fmt: skip
-            return ProcessResult(FillOutcome.ORPHAN, halted=True, fill_id=fill_id,
-                                 halt_reasons=(HaltReason.RECON_EXECUTION,),
+                       f"fill {fill.activity_id} executed before already-booked fills for "
+                       f"{fill.symbol}: out-of-order booking", now)  # fmt: skip
+        if orphan or later_booked:
+            reasons = (HaltReason.RECON_EXECUTION,)
+            outcome = FillOutcome.ORPHAN if orphan else FillOutcome.OUT_OF_ORDER
+            if orphan:
+                self._halt(tx, HaltReason.RECON_EXECUTION,
+                           f"fill {fill.activity_id} for unknown bot order {client_order_id}",
+                           now)  # fmt: skip
+            return ProcessResult(outcome, halted=True, fill_id=fill_id, halt_reasons=reasons,
                                  settles_on=settles_on)  # fmt: skip
         return ProcessResult(FillOutcome.APPLIED, halted=False, fill_id=fill_id,
                              settles_on=settles_on)  # fmt: skip
+
+    def _later_fill_exists(self, tx: Tx, portfolio_id: int, fill: ConfirmedFill) -> bool:
+        row = tx.fetch_one(
+            "SELECT 1 FROM fills f JOIN orders o ON o.client_order_id = f.client_order_id "
+            "WHERE o.portfolio_id = ? AND f.symbol = ? AND f.filled_at > ? LIMIT 1",
+            (portfolio_id, fill.symbol, ts_to_db(fill.transaction_time)),
+        )
+        return row is not None
 
     def _create_orphan(
         self, tx: Tx, fill: ConfirmedFill, client_order_id: str, now: datetime
@@ -615,14 +660,41 @@ class VirtualPortfolio:
 
     # ------------------------------------------------------------ settlement
     def resolve_settlements(self, *, now: datetime) -> int:
-        """Fill in settlement dates that could not be determined at booking time."""
+        """Fill in settlement dates that could not be determined at booking time.
+
+        Idempotent (only NULL dates are touched, each at most once — enforced by a
+        set-once trigger and a UNIQUE audit row) and auditable: every resolution writes a
+        ``settlement_resolutions`` row naming the accepted calendar fetches used.
+        """
         resolved = 0
         with self._db.transaction() as tx:
+            coverage = self._calendars.load(tx).coverage
             for entry in self._cash.list_unresolved_settlements(tx, self._pid(tx)):
                 settles_on = self._settlement_date(tx, entry.trade_date, now)
-                if settles_on is not None and entry.id is not None:
-                    self._cash.resolve_settlement(tx, entry.id, settles_on)
-                    resolved += 1
+                if settles_on is None or entry.id is None:
+                    continue
+                fetch_ids = sorted(
+                    {
+                        r.fetch_id
+                        for r in coverage
+                        if r.fetch_id is not None
+                        and (r.contains(entry.trade_date) or r.contains(settles_on))
+                    }
+                )
+                self._cash.resolve_settlement(tx, entry.id, settles_on)
+                tx.insert(
+                    "INSERT INTO settlement_resolutions (cash_entry_id, trade_date, settles_on, "
+                    "resolved_at, method, calendar_fetch_ids_json) "
+                    "VALUES (?, ?, ?, ?, 'CALENDAR', ?)",
+                    (
+                        entry.id,
+                        entry.trade_date.isoformat(),
+                        settles_on.isoformat(),
+                        ts_to_db(now),
+                        json.dumps(fetch_ids),
+                    ),
+                )
+                resolved += 1
         return resolved
 
     # ----------------------------------------------------------- invariants
