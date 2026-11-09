@@ -1,0 +1,37 @@
+# Risk limits — approved decisions D14, U1–U3, U7 (docs/M1_PLAN.md §2–3).
+# Percentages are fractions of CURRENT VIRTUAL EQUITY. Quote every decimal value:
+# unquoted decimals are parsed as floats and rejected.
+
+max_position_pct_equity: "0.20"      # concentration, measured at market value (U8)
+max_open_positions: 4
+max_order_notional: "1000"
+planned_risk_pct_equity: "0.005"     # (entry - stop) x qty
+min_price: "10"
+max_sync_age_seconds: 120
+
+gap_stress:                          # a SCENARIO, not a maximum possible loss (U3)
+  scenario_gap_pct: "0.15"
+  max_position_scenario_loss_pct_equity: "0.03"
+  max_portfolio_scenario_loss_pct_equity: "0.10"
+
+loss_limits:
+  max_daily_loss_pct: "0.02"         # vs prior session close baseline -> lockout (U1)
+  daily_lockout_escalation_count: 2  # 2 lockouts ...
+  daily_lockout_escalation_sessions: 5   # ... within 5 sessions -> persistent halt
+  max_weekly_drawdown_pct: "0.05"    # vs prior calendar week close -> persistent halt (U2)
+  weekly_baseline: calendar_week
+
+mark_freshness:                      # U7, ARCHITECTURE §6.6
+  max_age_in_session_seconds: 900
+  max_future_skew_seconds: 5
+  max_cross_check_divergence_pct: "0.05"
+
+ambiguous_orders:                    # D12 / U4, ARCHITECTURE §10.3
+  min_absent_lookups: 3
+  min_absent_window_seconds: 600
+  list_scan_lookback_seconds: 300
+  escalate_after_seconds: 1800
+
+reconciliation:
+  max_snapshot_retries: 3
+  max_consecutive_inconclusive: 5

@@ -1,0 +1,55 @@
+# Virtual operating policy — D6/D7, U5 (ARCHITECTURE §6.3).
+# Describes how the VIRTUAL portfolio behaves. The actual Alpaca paper account is a
+# margin account; none of its permissions (leverage, shorting, buying power) apply here.
+
+active_profile: cash_conservative
+
+profiles:
+  cash_conservative:
+    account_type: CASH
+    selectable: true
+    description: >-
+      Conservative cash-account emulation: T+1 settlement on the settlement calendar,
+      buys from settled cash only (no good-faith violations possible), no leverage,
+      no shorting, no intentional same-day round trips.
+    market_timezone: America/New_York
+    settlement:
+      settlement_cycle_days: 1
+      calendar_source: alpaca
+      buys_require_settled_cash: true
+      proceeds_available_at: start_of_settlement_date_market_tz
+      min_calendar_coverage_days: 10
+    max_leverage: "1"
+    allow_short: false
+    allow_fractional: false
+    allow_extended_hours: false
+    allowed_asset_classes: [US_EQUITY]
+    allowed_instrument_types: [EQUITY, ETF]
+    buy_order_types: [LIMIT]
+    allow_same_day_round_trip: false   # discretionary same-session exits blocked
+    allow_same_day_risk_exit: true     # risk-reducing exits allowed once exits exist (U5)
+    pdt_emulation: false               # PDT is a margin-account rule; not applied to cash
+
+  margin_small:
+    account_type: MARGIN
+    selectable: false                  # reserved; not selectable in M1
+    description: >-
+      Reserved profile for a future small margin account. Kept to document that PDT
+      rules differ by account type; it still may not use leverage or shorting in M1.
+    market_timezone: America/New_York
+    settlement:
+      settlement_cycle_days: 1
+      calendar_source: alpaca
+      buys_require_settled_cash: true
+      proceeds_available_at: start_of_settlement_date_market_tz
+      min_calendar_coverage_days: 10
+    max_leverage: "1"
+    allow_short: false
+    allow_fractional: false
+    allow_extended_hours: false
+    allowed_asset_classes: [US_EQUITY]
+    allowed_instrument_types: [EQUITY, ETF]
+    buy_order_types: [LIMIT]
+    allow_same_day_round_trip: false
+    allow_same_day_risk_exit: true
+    pdt_emulation: true
