@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -128,13 +128,69 @@ def test_intraday_breach_and_next_session_reset(holding: Setup) -> None:
     assert r.blockers == ()
 
 
-def test_lockout_lifts_after_close_once_next_baseline_exists(holding: Setup) -> None:
+def _breach(db: Database, pf: VirtualPortfolio, mon: LossLimitMonitor, day: date,
+            prev: date) -> None:  # fmt: skip
+    close(mon, "AAPL", prev, "100.00")
+    r = evaluate_at(db, pf, mon, et(day, 14), {"AAPL": "94.00"})
+    assert r.lockout_active and r.lockout_session == day
+
+
+NOV24, NOV25, NOV26, NOV27 = (date(2026, 11, d) for d in (24, 25, 26, 27))
+SAT, SUN = date(2026, 11, 14), date(2026, 11, 15)
+
+
+@pytest.mark.parametrize(
+    ("breach_day", "prev", "checks"),
+    [
+        pytest.param(MON, date(2026, 11, 6), [
+            (et(MON, 16, 1), True),     # right after the close
+            (et(MON, 20), True),        # evening: Tuesday's baseline already exists
+            (et(TUE, 3), True),         # overnight
+            (et(TUE, 9, 29), True),     # one minute before the next open
+            (et(TUE, 9, 30), False),    # next session open + baseline -> cleared
+        ], id="overnight"),
+        pytest.param(FRI, THU, [
+            (et(FRI, 17), True),
+            (et(SAT, 12), True),        # weekend
+            (et(SUN, 20), True),
+            (et(NEXT_MON, 9, 29), True),
+            (et(NEXT_MON, 9, 31), False),
+        ], id="weekend"),
+        pytest.param(NOV25, NOV24, [
+            (et(NOV25, 18), True),
+            (et(NOV26, 12), True),      # Thanksgiving: exchange closed
+            (et(NOV27, 9, 29), True),
+            (et(NOV27, 9, 30), False),  # Friday early-close session opens normally
+        ], id="holiday"),
+    ],
+)  # fmt: skip
+def test_lockout_expires_only_at_next_session_open(
+    holding: Setup, breach_day: date, prev: date, checks: list[tuple[datetime, bool]]
+) -> None:
+    db, pf, mon = holding
+    _breach(db, pf, mon, breach_day, prev)
+    close(mon, "AAPL", breach_day, "94.00")
+    for when, active in checks:
+        r = evaluate_at(db, pf, mon, when, {"AAPL": "94.00"})
+        assert r.lockout_active is active, when
+        assert (LossBlocker.DAILY_LOSS_LOCKOUT in r.blockers) is active, when
+
+
+def test_lockout_persists_at_next_open_without_a_baseline(holding: Setup) -> None:
     db, pf, mon = holding
     evaluate_at(db, pf, mon, et(MON, 14), {"AAPL": "94.00"})
-    close(mon, "AAPL", MON, "94.00")
-    r = evaluate_at(db, pf, mon, et(MON, 17), {"AAPL": "94.00"})  # after close: current = TUE
-    assert r.current_session == TUE
-    assert not r.lockout_active
+    r = evaluate_at(db, pf, mon, et(TUE, 9, 31), {"AAPL": "94.00"})  # no Monday close recorded
+    assert r.lockout_active
+    assert LossBlocker.SESSION_BASELINE_MISSING in r.blockers
+
+
+def test_lockout_fails_closed_without_calendar(holding: Setup) -> None:
+    db, pf, mon = holding
+    evaluate_at(db, pf, mon, et(MON, 14), {"AAPL": "94.00"})
+    with db.read() as s:
+        r = mon.report(s, now=et(THU, 10))  # calendar data is stale by Thursday
+    assert LossBlocker.CALENDAR_UNAVAILABLE in r.blockers
+    assert r.lockout_active and LossBlocker.DAILY_LOSS_LOCKOUT in r.blockers
 
 
 # ------------------------------------------------------ repeat breaches
@@ -372,3 +428,97 @@ def test_config_matches_approved_parameters() -> None:
     assert (CONFIG.gap_scenario_pct, CONFIG.gap_position_pct, CONFIG.gap_portfolio_pct) == (
         D("0.15"), D("0.03"), D("0.10"))  # fmt: skip
     assert SnapshotKind.WEEK_BASELINE.value == "WEEK_BASELINE"
+
+
+# ------------------------------------------- weekly resume verification (fix 2)
+
+
+def _halt_events(db: Database) -> list[tuple[str, str]]:
+    with db.read() as s:
+        return [(e.action, e.reason_code) for e in TradingStateRepository().events(s)]
+
+
+def _resume(db: Database, result: ReconciliationResult | None, at: datetime) -> ResumeOutcome:
+    with db.transaction() as tx:
+        run = (
+            9999 if result is None else ReconciliationRunsRepository().append(tx, result, None, at)
+        )
+        return TradingStateRepository().resume(
+            tx, detail="operator", actor="operator", at=at, reconciliation_run_id=run
+        )
+
+
+def test_weekly_resume_requires_clean_recon_and_never_bypasses_or_duplicates(
+    holding: Setup, tmp_path: Path
+) -> None:
+    db, pf, mon = holding
+    close(mon, "AAPL", MON, "100.00")
+    evaluate_at(db, pf, mon, et(TUE, 9, 31), {"AAPL": "87.00"})  # weekly 260 >= 250
+    weekly_halts = [e for e in _halt_events(db) if e == ("HALT", "WEEKLY_DRAWDOWN")]
+    assert len(weekly_halts) == 1
+    # Resume needs a clean reconciliation: a missing or mismatched run is refused.
+    assert _resume(db, None, et(TUE, 10)) is ResumeOutcome.REFUSED
+    assert _resume(db, ReconciliationResult.MISMATCH, et(TUE, 10)) is ResumeOutcome.REFUSED
+    with db.read() as s:
+        assert TradingStateRepository().get(s).halted
+    assert _resume(db, ReconciliationResult.OK, et(TUE, 11)) is ResumeOutcome.RESUMED
+    # Later in the same week, even with a deeper drawdown: still blocked, no new halt.
+    # Wednesday 85 vs Tuesday's 86 close is only -20 (no second daily lockout).
+    for when, price in [(et(TUE, 12), "86.00"), (et(WED, 11), "85.00"), (et(FRI, 15), "99.00")]:
+        if when.date() == WED:
+            close(mon, "AAPL", TUE, "86.00")
+        if when.date() == FRI:
+            close(mon, "AAPL", WED, "85.00")
+            close(mon, "AAPL", THU, "99.00")
+        r = evaluate_at(db, pf, mon, when, {"AAPL": price})
+        assert r.weekly_breach_active and LossBlocker.WEEKLY_LIMIT_ACTIVE in r.blockers, when
+    assert [e for e in _halt_events(db) if e == ("HALT", "WEEKLY_DRAWDOWN")] == weekly_halts
+    assert events(db, LossEventKind.WEEKLY_HALT) == [MON]
+    with db.read() as s:
+        assert not TradingStateRepository().get(s).halted  # the resume itself stands
+    # A new breach in the following week is a new event and a new halt.
+    close(mon, "AAPL", FRI, "99.00")
+    r = evaluate_at(db, pf, mon, et(NEXT_MON, 10), {"AAPL": "85.00"})  # 4980 -> 4700
+    assert r.week_start == NEXT_MON and r.weekly_breach_active
+    assert events(db, LossEventKind.WEEKLY_HALT) == [MON, NEXT_MON]
+    assert [e for e in _halt_events(db) if e == ("HALT", "WEEKLY_DRAWDOWN")] == weekly_halts * 2
+
+
+# --------------------------------------- first-week policy, midweek start (fix 3)
+
+
+@pytest.mark.parametrize(
+    "created", [et(WED, 8), et(WED, 11), et(TUE, 18)], ids=["pre-open", "intraday", "evening"]
+)
+def test_midweek_start_uses_inception_capital_without_history(
+    tmp_path: Path, created: datetime
+) -> None:
+    db, pf = new_ledger(tmp_path / "mid.sqlite3", created_at=created)
+    mon = monitor(db, pf)
+    r = evaluate_at(db, pf, mon, et(WED, 12), {})
+    for snap in (r.daily_baseline, r.weekly_baseline):
+        assert snap is not None
+        assert snap.basis is BaselineBasis.INCEPTION
+        assert snap.reference_session is None and snap.reference_at == created
+        assert (snap.equity, snap.cash, snap.market_value, snap.marks) == (
+            D(5000),
+            D(5000),
+            D(0),
+            [],
+        )
+    assert r.week_start == MON
+    hold(db, pf, "AAPL", "10", "100.00", at=et(WED, 13))
+    close(mon, "AAPL", WED, "98.00")
+    r_thu = evaluate_at(db, pf, mon, et(THU, 10), {"AAPL": "98.00"})
+    assert r_thu.daily_baseline is not None
+    assert r_thu.daily_baseline.basis is BaselineBasis.SESSION_CLOSE
+    assert r_thu.daily_baseline.equity == D("4980.00")
+    assert r_thu.weekly_baseline == r.weekly_baseline  # first week stays on inception
+    assert r_thu.weekly is not None and r_thu.weekly.loss == D("20.00")
+    close(mon, "AAPL", THU, "98.00")
+    close(mon, "AAPL", FRI, "98.00")
+    r_next = evaluate_at(db, pf, mon, et(NEXT_MON, 10), {"AAPL": "98.00"})
+    assert r_next.weekly_baseline is not None
+    assert r_next.weekly_baseline.basis is BaselineBasis.SESSION_CLOSE
+    assert r_next.weekly_baseline.reference_session == FRI
+    db.close()

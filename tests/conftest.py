@@ -12,10 +12,13 @@ from __future__ import annotations
 import os
 import socket
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, NoReturn
 
 import pytest
 from hypothesis import HealthCheck, settings
+
+from swing_trading_bot.ledger.db import Database
 
 settings.register_profile("dev", deadline=None, max_examples=200)
 settings.register_profile(
@@ -54,6 +57,37 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "alpaca_paper" in item.keywords:
             item.add_marker(skip)
+
+
+PRODUCTION_DATA_DIR = (Path(__file__).resolve().parents[1] / "data").resolve()
+
+
+class ProductionLedgerAccessError(RuntimeError):
+    """A test tried to create or open a database under the repository's data/ dir."""
+
+
+@pytest.fixture(autouse=True)
+def _protect_production_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests may only use isolated temporary databases (simulation ledgers under
+    tmp_path); the production ledger location is off limits."""
+    original_create = Database.create.__func__  # type: ignore[attr-defined]
+    original_open = Database.open.__func__  # type: ignore[attr-defined]
+
+    def _guard(path: Path) -> None:
+        resolved = Path(path).resolve()
+        if resolved == PRODUCTION_DATA_DIR or PRODUCTION_DATA_DIR in resolved.parents:
+            raise ProductionLedgerAccessError(f"tests must not touch {resolved}")
+
+    def create(cls: type[Database], path: Path, *args: Any, **kwargs: Any) -> Database:
+        _guard(path)
+        return original_create(cls, path, *args, **kwargs)  # type: ignore[no-any-return]
+
+    def open_(cls: type[Database], path: Path, *args: Any, **kwargs: Any) -> Database:
+        _guard(path)
+        return original_open(cls, path, *args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(Database, "create", classmethod(create))
+    monkeypatch.setattr(Database, "open", classmethod(open_))
 
 
 @pytest.fixture(autouse=True)

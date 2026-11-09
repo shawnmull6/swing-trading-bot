@@ -157,6 +157,16 @@ class EquitySnapshotsRepository:
         )
         return None if row is None else self._from_row(row)
 
+    def applies_to_after(
+        self, s: Session, portfolio_id: int, kind: SnapshotKind, after: date
+    ) -> list[date]:
+        rows = s.fetch_all(
+            "SELECT applies_to FROM equity_snapshots WHERE portfolio_id = ? AND kind = ? "
+            "AND applies_to > ? ORDER BY applies_to",
+            (portfolio_id, kind.value, date_to_db(after)),
+        )
+        return [date_from_db(r[0]) for r in rows]
+
     def exists_after(self, s: Session, portfolio_id: int, kind: SnapshotKind, after: date) -> bool:
         return (
             s.fetch_one(

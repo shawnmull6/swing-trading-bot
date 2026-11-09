@@ -11,6 +11,9 @@ from pathlib import Path
 import pytest
 
 import swing_trading_bot
+from swing_trading_bot.domain.enums import RuntimeMode
+from swing_trading_bot.ledger.db import Database
+from tests.conftest import ProductionLedgerAccessError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / "src" / "swing_trading_bot"
@@ -53,15 +56,21 @@ def test_no_float_usage_in_source() -> None:
                 offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
             if isinstance(node, ast.Constant) and isinstance(node.value, float):
                 offenders.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno} (float literal)")
-    # domain/money.py is allowed to *name* float in order to reject it.
-    allowed_prefix = str(Path("src/swing_trading_bot/domain/money.py"))
-    offenders = [o for o in offenders if not o.startswith(allowed_prefix)]
+    # money.py and broker/mapping.py may *name* float in order to reject it.
+    allowed = (
+        str(Path("src/swing_trading_bot/domain/money.py")),
+        str(Path("src/swing_trading_bot/broker/mapping.py")),
+    )
+    offenders = [o for o in offenders if not o.startswith(allowed)]
     assert offenders == []
 
 
-def test_source_never_imports_alpaca_in_steps_1_to_3() -> None:
-    """No broker integration exists yet; config/domain/observability stay broker-agnostic."""
+def test_alpaca_sdk_is_imported_only_by_the_read_transport() -> None:
+    """Domain, config, ledger and observability stay broker-agnostic; the SDK is confined
+    to broker/alpaca_http.py (step 9)."""
     for path in _source_files():
+        if path.name == "alpaca_http.py" and path.parent.name == "broker":
+            continue
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -93,3 +102,13 @@ def test_ledger_package_has_no_network_or_broker_imports() -> None:
                 continue
             for name in names:
                 assert name.split(".")[0] not in banned, f"{path}: imports {name}"
+
+
+def test_tests_cannot_touch_the_production_ledger(tmp_path: Path) -> None:
+    for target in (REPO_ROOT / "data" / "ledger.sqlite3", REPO_ROOT / "data" / "x" / "y.db"):
+        with pytest.raises(ProductionLedgerAccessError):
+            Database.create(target, RuntimeMode.SIMULATE)
+        with pytest.raises(ProductionLedgerAccessError):
+            Database.open(target, RuntimeMode.OBSERVE)
+    assert not (REPO_ROOT / "data" / "ledger.sqlite3").exists()
+    Database.create(tmp_path / "ok.sqlite3", RuntimeMode.SIMULATE).close()  # tmp is fine

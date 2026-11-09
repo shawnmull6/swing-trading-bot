@@ -1006,9 +1006,12 @@ Code: `domain/loss_limits.py` (pure math), `ledger/loss_limit_store.py`,
   written once and never recomputed or reset, by a restart or by a resume.
 * **Limits** compare against the recorded baseline (inclusive, exact Decimal,
   `baseline − equity ≥ pct × baseline`):
-  * daily 2% → `DAILY_LOCKOUT` for the session. It blocks new entries until a baseline
-    for a later session exists, and stays active (with `SESSION_BASELINE_MISSING`) if
-    the next baseline cannot be built.
+  * daily 2% → `DAILY_LOCKOUT` for the session (blocks new entries). **Expiry (step 7
+    correction):** a lockout clears only when a *later* session has actually **opened**
+    (`open_at ≤ now`) **and** has a recorded session baseline. A next-session baseline
+    written after the close, overnight, over a weekend or on a holiday is necessary but
+    not sufficient. With no usable calendar, an existing lockout is reported active (fail
+    closed).
   * A second lockout within the 5-session window (this session + 4 before) →
     `DAILY_REPEAT_HALT` + persistent halt `DAILY_LOSS_REPEAT`. If the calendar cannot
     determine the window, this fails closed (halts).
@@ -1036,6 +1039,206 @@ Code: `domain/loss_limits.py` (pure math), `ledger/loss_limit_store.py`,
 * **Session closes** are recorded through `record_session_close` (immutable; an
   identical re-record is a no-op, a different price a `CONFLICT`). The step 9
   market-data adapter will feed them from daily bars.
+
+#### Step 7 corrections (review of step 7)
+
+* **Weekly resume (verified).** A `WEEKLY_HALT` sets one persistent halt. `resume` is
+  refused (and audited as `RESUME_REFUSED`) without an `OK` reconciliation run. A
+  successful resume clears the halt flag, but the week's breach keeps blocking new
+  entries (`WEEKLY_LIMIT_ACTIVE`) until the next calendar week's baseline. Re-evaluation
+  in the same week, even at a deeper drawdown, writes no new event and no new halt. A
+  breach in a later week is a new event with a new halt.
+* **First-week policy for a portfolio started midweek.** Any baseline whose reference
+  close is earlier than the portfolio's creation uses `INCEPTION`: equity = cash =
+  initial capital, no positions, no marks, `reference_session` NULL,
+  `reference_at = created_at`. This covers creation before the open, intraday, or after
+  the close. The first (partial) week's weekly baseline therefore stays at inception
+  capital all week. Daily baselines switch to official closes from the first session
+  that follows a session the portfolio existed through. From the next calendar week,
+  the weekly baseline is the prior Friday's (last session's) close. No historical
+  valuation is ever fabricated.
+
+### 12.9 Step 8: broker ports and SimBroker (as built)
+
+Code: `broker/ports.py`, `broker/errors.py`, `broker/models.py`, `broker/mapping.py`,
+`broker/sim.py`.
+
+* **Ports.** `BrokerReadPort` (account, account config, clock, calendar, positions, open
+  orders, orders since, order by client id, paginated activities) and
+  `BrokerExecutionPort` (`submit_order`, `cancel_order`) are separate
+  `runtime_checkable` protocols; `PriceMarkSource` (`get_marks`) is a third. A static test
+  asserts the only concrete class with `submit_order` + `cancel_order` is `SimBroker`.
+* **Error taxonomy.** Each error states `order_state` (`NOT_CREATED`, `EXISTS`, `UNKNOWN`,
+  `NOT_APPLICABLE`) and `retryable`:
+
+  | Error | Meaning |
+  |---|---|
+  | `OrderRejectedError` | definitive rejection, no order |
+  | `DuplicateClientOrderIdError` | the order exists: adopt, never treat as a rejection |
+  | `AmbiguousSubmissionError` | any transport failure on submit, before or after receipt |
+  | `AuthenticationError` | never retried |
+  | `RateLimitedError` | not processed, safe to retry, `retry_after` as a timedelta |
+  | `ServiceUnavailableError` | reads only |
+  | `InvalidBrokerDataError` | the response could not be mapped exactly |
+  | `NotCancelableError` | cancel refused; the order is terminal or not visible |
+  | `OrderNotFoundError` | absence, which is not proof of non-existence |
+* **Snapshots.** `AccountSnapshot` (no `buying_power` field — a static test forbids reading
+  it anywhere; `non_marginable_buying_power` is the cash backstop), `AccountConfigSnapshot`
+  (with `m2_protections_in_place` for U6), `MarketClock`, `BrokerActivity` (FILLs carry
+  the broker `order_id`, as Alpaca does — no client id), `ActivityPage`
+  (`last_id`, `possibly_more`), `SubmitOrderRequest`; orders and positions reuse the domain
+  models. Exact Decimals, timezone-aware timestamps.
+* **Raw mapping.** `broker/mapping.py` parses Alpaca-shaped JSON (numbers as strings)
+  strictly: floats, NaN, missing fields, unknown enums, naive timestamps and malformed
+  dates → `InvalidBrokerDataError`. SimBroker produces raw JSON and routes every
+  response through this module; the step 9 read adapter will reuse it.
+* **SimBroker.**
+  * In memory only: no database, no network, no randomness. An injected `SimClock`
+    supplies time.
+  * Scheduled events (fills, cancels, expirations, post-accept rejections, fee and
+    dividend activities) run in (time, sequence) order, **as of their scheduled time**,
+    whenever any port method is next called. IDs come from a counter, and activity IDs
+    use Alpaca's sortable `timestamp::uuid` shape.
+  * `event_log` makes replays comparable exactly.
+  * Scripted submit outcomes: `Accept` (optional visibility delay or initial status),
+    `Reject`, `AcceptThenFail` (504 / read timeout / reset after the order was created),
+    `FailBeforeReceipt`, `RateLimit` and `AuthFailure`. A duplicate client ID raises
+    `DuplicateClientOrderIdError`.
+  * Order-visibility and activity-reporting delays, either global or per event.
+  * Cancels go through `pending_cancel`, with a configurable delay, and fills can race
+    them.
+  * No-shorting and buying-power rejections.
+  * Positions with average entry price, cash, account config, clock and calendar
+    derived from loaded calendar fetches, and marks.
+  * Ascending ID pagination (page size 1..100) with an `after` time filter.
+  * Injectable read faults and payload corruption.
+* **Delayed activities.** A test shows an execution reported late sorting *before* the
+  stored cursor (so a cursor-only sync misses it) and being found by the `after`
+  overlap re-scan of §8.4.
+* **Test isolation.** A test-wide guard refuses `Database.create/open` anywhere under the
+  repository's `data/` directory; simulation ledgers live under `tmp_path`.
+* **Fixed during step 8.** Events were first stamped with the time the simulator was
+  next polled rather than their scheduled time; the deterministic-replay test caught it.
+
+### 12.10 Step 9: broker-contract refinements and the read-only Alpaca adapter (as built)
+
+#### Refinements to the step 8 contract
+
+* **Retry semantics.** `BrokerError.retryable` was replaced by `read_retryable`: it means
+  only that a *read* may be repeated under a bounded policy. No error class marks a
+  write as safe to retry. After a failed submit, `submit_failure_state(err)` returns
+  `NOT_CREATED` only for `OrderRejectedError` (the broker's explicit rejection) and
+  `EXISTS` for `DuplicateClientOrderIdError`. Everything else is `UNKNOWN`: 429, 5xx,
+  504, timeouts, resets, auth failures and malformed responses. `RateLimitedError` is
+  now read-only in meaning (`order_state = NOT_APPLICABLE`), and SimBroker reports a 429
+  on submit as `AmbiguousSubmissionError(status_code=429)`. Client order IDs stay stable
+  across any recovery.
+* **Opaque activity IDs.** Callers never compare, sort or parse activity IDs, and never
+  assume contiguity. `page_token` is an implementation-defined opaque cursor.
+  `get_activities` gained `until`, so `(after, until]` windows can overlap.
+  `broker/activity_feed.py` provides `collect_activities` (follows the cursor, at most
+  `max_pages` pages, detects non-advancing cursors and repeated IDs) and
+  `merge_activities` (dedupes by ID; the same ID with different content →
+  `InvalidBrokerDataError`). Ledger ingestion is idempotent by activity ID, so
+  re-reading a window is always safe.
+
+#### `AlpacaPaperReadAdapter`
+
+Code: `broker/alpaca_http.py` (transport + retries), `broker/alpaca_read.py` (adapter),
+`broker/mapping.py` (extended). It implements `BrokerReadPort` and `PriceMarkSource`
+and defines no submit/replace/cancel method.
+
+* **Why raw GET requests, not alpaca-py client methods** (alpaca-py 0.45.0 source):
+  1. No account-activities method.
+  2. `response.json()` decodes JSON numbers as floats, and market-data prices are JSON
+     numbers.
+  3. `RESTClient._request` silently retries 429/504 for **every** verb, with fixed 3 s
+     sleeps, and ignores `retry_attempts=0`.
+  4. No request timeout.
+  5. Naive datetimes in request models are assumed to be UTC.
+
+  The adapter therefore uses a transport with one method, `get_json` (HTTP GET only),
+  limited to `https://paper-api.alpaca.markets/v2` and
+  `https://data.alpaca.markets/v2`. It uses `allow_redirects=False` and timeouts of
+  (5 s connect, 20 s read), and decodes with `json.loads(..., parse_float=Decimal)`.
+  From alpaca-py it takes the base URLs (`BaseURL.TRADING_PAPER`, `BaseURL.DATA`) and
+  the auth headers (`RESTClient._get_default_headers()` on a throw-away client that is
+  never stored). No `TradingClient` or data client is ever constructed, so no SDK retry
+  loop can run, and there is no write path to retry. A test pins the SDK's retry
+  behaviour so an upgrade forces a review before any M2 write adapter exists.
+* **Endpoints:**
+
+  | Read | Endpoint |
+  |---|---|
+  | Account | `GET /account` |
+  | Account configuration | `GET /account/configurations` |
+  | Clock | `GET /clock` |
+  | Calendar | `GET /calendar?start&end&date_type=TRADING\|SETTLEMENT` |
+  | Positions | `GET /positions` |
+  | Orders | `GET /orders?status=open\|all&direction=asc&limit=500&nested=false&after&until` |
+  | Order by client ID | `GET /orders:by_client_order_id?client_order_id=` (404 → `None`) |
+  | Activities | `GET /account/activities?direction=asc&page_size&page_token&after&until` |
+  | Latest trades (marks) | data `GET /stocks/trades/latest?symbols&feed` |
+  | Session closes | data `GET /stocks/bars?symbols&timeframe=1Day&start&end&feed&adjustment=raw&limit=1000&page_token` |
+* **Parsing.** Trading values must be decimal strings; floats are rejected. Market data
+  numbers arrive as `Decimal` via `parse_float=Decimal` (ints are accepted exactly;
+  floats and bools are rejected). Timestamps need a UTC offset, and nanoseconds are
+  truncated to microseconds by Python 3.12's `fromisoformat`. Order statuses outside
+  the §3 V6 table raise `UnknownBrokerStatusError` (persistent halt
+  `UNMAPPED_BROKER_STATUS`). Calendar times must be `HH:MM` America/New_York.
+  Positions with a duplicate symbol, an order lookup returning another client ID,
+  duplicate activity IDs within a page, a page larger than requested, or a page
+  repeating its cursor all raise `InvalidBrokerDataError`.
+* **Orders pagination:** pages of 500, ascending by submission time. Each next page
+  starts 1 µs before the previous page's last `submitted_at` (so orders sharing a
+  boundary timestamp aren't skipped), and results are deduplicated by order ID.
+  No progress → error. At most 50 pages.
+* **Activity pagination:** the opaque cursor is the last activity ID of the previous
+  page, as Alpaca documents; this is unverified. `ActivityPage.possibly_more` (full
+  page) triggers one more request.
+* **Bounded read retries** (`DEFAULT_READ_POLICIES`). Only `RateLimitedError` and
+  `ServiceUnavailableError` are retried; auth failures, request errors and invalid
+  data are raised immediately.
+  * Standard reads: 3 attempts, 0.5 / 1 / 2 / 4 s backoff (max 4 s), honouring
+    `Retry-After` up to the cap.
+  * Order lookup by client ID: 4 attempts, because recovery depends on it.
+  * Marks: 2 attempts, max 2 s, because a stale mark is better than a slow one.
+* **Price marks.** `get_marks` uses the latest trade per symbol, with its exchange
+  timestamp `t`, received time and feed (default `iex`). Missing symbols are simply
+  absent. Freshness is judged by `domain.valuation.assess_mark` (§6.6/§12.7), never by
+  the adapter. `Position.current_price` has no timestamp and is exposed only through
+  `get_position_price_crosscheck()`; it is never a mark. `get_session_closes` returns
+  `BrokerSessionClose` values from daily bars (bar `t` must fall on the session date in
+  America/New_York); converting them into ledger `SessionClose` rows is left to the
+  caller (the broker package never imports the ledger).
+* **Tests** run fully offline. They use a scripted `ReadOnlyHttp` fake and a fake
+  `requests` session; sockets are blocked. Six optional read-only contract tests in
+  `tests/contract/` run only with `RUN_ALPACA_PAPER_TESTS=1` and operator authorization,
+  and load credentials with `load_settings(.env)` inside each test.
+
+#### Alpaca behaviour still to verify (read-only contract tests, operator-authorized)
+
+* Activities:
+  * `page_token` semantics with `direction=asc`;
+  * the `after`/`until` filters (exclusive or inclusive; timestamps or dates);
+  * whether non-trade activities always carry `net_amount` and `date`;
+  * how journal and adjustment types (JNLC, JNLS, CSD, …) appear;
+  * late posting of fees and dividends relative to the cursor.
+* `/calendar?date_type=SETTLEMENT`: exact row shape and that `date` is the settlement day.
+  Whether TRADING rows' `settlement_date` is populated and accounts for clearing
+  holidays (§12.6).
+* `GET /orders:by_client_order_id` returns 404 (not 422) for unknown IDs, and how soon a
+  new order becomes visible (M2).
+* `/orders` `after` filters by `submitted_at`, and the maximum `limit` is 500.
+* Market data:
+  * which feed the account may use;
+  * that latest-trade `t` is an exchange timestamp;
+  * that daily-bar `t` is midnight America/New_York.
+* **The IEX daily-bar close is not the consolidated official close.** A SIP
+  subscription (or another official-close source) is needed before baselines rely on
+  it for M2.
+* Whether the trading API ever sends a monetary field as a JSON number. That would be
+  rejected (fail closed), not converted.
 ---
 
 ## 13. Configuration & secrets

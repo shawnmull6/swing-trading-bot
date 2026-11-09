@@ -410,23 +410,39 @@ class LossLimitMonitor:
         pid = snap.balances.portfolio_id
         blockers: list[LossBlocker] = []
         problems = list(extra_problems)
+        calendar: TradingCalendar | None
         try:
+            calendar = self._calendar(s, now)
             ctx: SessionContext | None = session_context(
-                self._calendar(s, now), now, self._config.escalation_sessions
+                calendar, now, self._config.escalation_sessions
             )
         except CalendarError as exc:
-            ctx = None
+            calendar = ctx = None
             problems.append(f"calendar: {exc}")
             blockers.append(LossBlocker.CALENDAR_UNAVAILABLE)
         if snap.equity is None:
             blockers.append(LossBlocker.EQUITY_UNKNOWN)
-        if ctx is None:
+        lockouts = self._events.list(s, pid, LossEventKind.DAILY_LOCKOUT)
+        lockout_session = lockouts[-1].applies_to if lockouts else None
+        if ctx is None or calendar is None:
+            # Without a calendar the expiry of a lockout cannot be verified: fail closed.
+            # The calendar week (Mon-Sun) is plain date arithmetic, so a weekly breach for
+            # this week is still reported.
+            today = now.astimezone(MARKET_TZ).date()
+            week_start = today - timedelta(days=today.weekday())
+            weekly_active = (
+                self._events.get(s, pid, LossEventKind.WEEKLY_HALT, week_start) is not None
+            )
+            if lockout_session is not None:
+                blockers.append(LossBlocker.DAILY_LOSS_LOCKOUT)
+            if weekly_active:
+                blockers.append(LossBlocker.WEEKLY_LIMIT_ACTIVE)
             return LossLimitReport(
-                as_of=now, current_session=None, week_start=None, daily_baseline=None,
+                as_of=now, current_session=None, week_start=week_start, daily_baseline=None,
                 weekly_baseline=None, equity=snap.equity, daily=None, weekly=None,
-                lockout_active=False, lockout_session=None, weekly_breach_active=False,
-                recent_lockouts=(), window=None, gaps=(), gap_stress=None,
-                blockers=tuple(blockers),
+                lockout_active=lockout_session is not None, lockout_session=lockout_session,
+                weekly_breach_active=weekly_active, recent_lockouts=(), window=None, gaps=(),
+                gap_stress=None, blockers=tuple(dict.fromkeys(blockers)),
                 problems=tuple(problems),
             )  # fmt: skip
         current = ctx.current.session_date
@@ -442,13 +458,8 @@ class LossLimitMonitor:
         if snap.equity is not None and weekly_base is not None:
             weekly = LimitMeasure(weekly_base.equity, snap.equity, self._config.weekly_pct)
 
-        lockouts = self._events.list(s, pid, LossEventKind.DAILY_LOCKOUT)
-        lockout_session = lockouts[-1].applies_to if lockouts else None
-        lockout_active = lockout_session is not None and (
-            lockout_session == current
-            or not self._snapshots.exists_after(
-                s, pid, SnapshotKind.SESSION_BASELINE, lockout_session
-            )
+        lockout_active = lockout_session is not None and not self._lockout_cleared(
+            s, pid, calendar=calendar, lockout_session=lockout_session, current=current, now=now
         )
         if lockout_active:
             blockers.append(LossBlocker.DAILY_LOSS_LOCKOUT)
@@ -472,6 +483,32 @@ class LossLimitMonitor:
             recent_lockouts=recent, window=window, gaps=gaps, gap_stress=stress,
             blockers=tuple(dict.fromkeys(blockers)), problems=tuple(problems),
         )  # fmt: skip
+
+    def _lockout_cleared(
+        self,
+        s: Session,
+        pid: int,
+        *,
+        calendar: TradingCalendar,
+        lockout_session: date,
+        current: date,
+        now: datetime,
+    ) -> bool:
+        """A daily lockout clears only when a LATER session has actually opened
+        (open time <= now) AND has a recorded session baseline. A baseline alone, written
+        after the close or over a weekend/holiday, is necessary but not sufficient."""
+        for later in self._snapshots.applies_to_after(
+            s, pid, SnapshotKind.SESSION_BASELINE, lockout_session
+        ):
+            if later > current:
+                break
+            try:
+                opened = calendar.session(later).open_at <= now
+            except CalendarError:
+                return False
+            if opened:
+                return True
+        return False
 
     @staticmethod
     def _gaps(
