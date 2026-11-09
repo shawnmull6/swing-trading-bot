@@ -25,8 +25,10 @@ from swing_trading_bot.domain.calendar import (
     TradingSession,
 )
 from tests.support.calendar_fixture import (
+    BASELINE_ASSUMPTION,
     FIXTURE_END,
     FIXTURE_START,
+    NON_SETTLEMENT_WEEKDAYS,
     fixture_sessions,
     is_fixture_settlement_day,
     settlement_fetch,
@@ -76,10 +78,11 @@ SESSIONS = [s.session_date for s in fixture_sessions()]
         (D(2026, 11, 27), D(2026, 11, 30), "early close Friday"),
         (D(2026, 12, 24), D(2026, 12, 28), "early close before Christmas"),
         (D(2026, 12, 31), D(2027, 1, 4), "year end over New Year holiday"),
-        (D(2026, 4, 2), D(2026, 4, 3), "Good Friday: exchange closed, settlement day"),
-        (D(2026, 7, 2), D(2026, 7, 3), "Jul 3: exchange holiday, banks open"),
-        (D(2027, 7, 2), D(2027, 7, 6), "Jul 5 2027: both closed"),
-        (D(2027, 12, 23), D(2027, 12, 24), "Christmas observed: exchange-only closure"),
+        (D(2026, 4, 2), D(2026, 4, 6), "Good Friday: no CNS settlement (VERIFIED A#9732)"),
+        (D(2026, 7, 2), D(2026, 7, 6), "Jul 3: no CNS settlement (VERIFIED A#9778)"),
+        (D(2026, 6, 18), D(2026, 6, 22), "Juneteenth: DTC closed (VERIFIED B#24302-26)"),
+        (D(2027, 7, 2), D(2027, 7, 6), "Jul 5 2027 (ASSUMPTION)"),
+        (D(2027, 12, 23), D(2027, 12, 27), "Christmas observed 2027 (ASSUMPTION)"),
     ],
 )
 def test_settlement_dates(calendar: TradingCalendar, trade: date, settles: date, case: str) -> None:
@@ -134,8 +137,52 @@ def test_explicit_settlement_disagreeing_with_derived_rejected() -> None:
         TradingCalendar(data, as_of=AS_OF, max_age=MAX_AGE)
 
 
+def test_exchange_closure_that_is_a_settlement_day_is_supported() -> None:
+    """Logic test with a hand-built hypothetical calendar (not a real-world claim): if the
+    authoritative settlement calendar lists a day on which the exchange is closed, a trade
+    on the prior session settles that day."""
+    start, end = D(2030, 6, 3), D(2030, 6, 14)  # outside the fixture: purely hypothetical
+    fetched = datetime(2030, 6, 1, tzinfo=UTC)
+    sessions = tuple(
+        s for s in _sessions_for(start, end) if s.session_date != D(2030, 6, 7)
+    )  # exchange closed Fri Jun 7
+    trading = CalendarFetch(CalendarKind.TRADING, start, end, fetched, "hypothetical", sessions)
+    days = tuple(
+        start + timedelta(days=i) for i in range(12) if (start + timedelta(days=i)).weekday() < 5
+    )
+    settlement = CalendarFetch(
+        CalendarKind.SETTLEMENT, start, end, fetched, "hypothetical", settlement_days=days
+    )
+    calendar = cal(trading, settlement, as_of=fetched)
+    assert not calendar.is_trading_session(D(2030, 6, 7))
+    assert calendar.is_settlement_day(D(2030, 6, 7))
+    assert calendar.settlement_date(D(2030, 6, 6)) == D(2030, 6, 7)
+
+
+def _sessions_for(start: date, end: date) -> list[TradingSession]:
+    out = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5:
+            out.append(_session(d))
+        d += timedelta(days=1)
+    return out
+
+
+def test_fixture_provenance_is_explicit() -> None:
+    verified = {d for d, p in NON_SETTLEMENT_WEEKDAYS.items() if p.status == "VERIFIED"}
+    assert verified == {D(2026, 4, 3), D(2026, 6, 19), D(2026, 7, 3)}
+    for d, p in NON_SETTLEMENT_WEEKDAYS.items():
+        assert p.source, d
+        if p.status == "ASSUMPTION":
+            assert "step 15" in p.source
+    assert NON_SETTLEMENT_WEEKDAYS[D(2026, 11, 26)].status == "ASSUMPTION"  # Thanksgiving
+    assert BASELINE_ASSUMPTION.status == "ASSUMPTION"
+
+
 def test_settlement_day_queries() -> None:
-    assert FULL.is_settlement_day(D(2026, 4, 3))  # Good Friday
+    assert not FULL.is_settlement_day(D(2026, 4, 3))  # Good Friday: VERIFIED no CNS settlement
+    assert FULL.is_settlement_day(D(2026, 4, 6))
     assert not FULL.is_settlement_day(D(2026, 11, 11))  # Veterans Day
     assert not FULL.is_settlement_day(D(2026, 11, 14))  # Saturday
     with pytest.raises(CalendarCoverageError):

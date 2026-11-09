@@ -259,6 +259,25 @@ class OrdersRepository:
         if n != 1:
             raise ConcurrencyConflictError(f"send attempt already recorded for {client_order_id}")
 
+    def record_fill_progress(
+        self,
+        tx: Tx,
+        client_order_id: str,
+        *,
+        filled_qty: Decimal,
+        avg_fill_price: Decimal | None,
+        at: datetime,
+    ) -> None:
+        """Update fill totals from booked fills. Status changes stay with the order
+        lifecycle (broker-confirmed statuses, step 12); this never touches status."""
+        n = tx.execute(
+            "UPDATE orders SET filled_qty = ?, avg_fill_price = ?, updated_at = ? "
+            "WHERE client_order_id = ?",
+            (dec_to_db(filled_qty), opt_dec_to_db(avg_fill_price), ts_to_db(at), client_order_id),
+        )
+        if n != 1:
+            raise RecordNotFoundError(f"order {client_order_id} not found")
+
     def set_broker_order_id(
         self, tx: Tx, client_order_id: str, broker_order_id: str, at: datetime
     ) -> None:
@@ -635,6 +654,11 @@ class FillsRepository:
         )
         return [self._from_row(r) for r in rows]
 
+    def list_in_application_order(self, s: Session) -> list[FillRecord]:
+        """Fills in the order they were booked (rowid) — the order accounting used."""
+        rows = s.fetch_all(f"SELECT {self._COLS} FROM fills ORDER BY id")
+        return [self._from_row(r) for r in rows]
+
     def list_all(self, s: Session) -> list[FillRecord]:
         rows = s.fetch_all(f"SELECT {self._COLS} FROM fills ORDER BY filled_at, id")
         return [self._from_row(r) for r in rows]
@@ -715,6 +739,9 @@ class CashEntriesRepository:
         )
         if n != 1:
             raise ConcurrencyConflictError(f"cash entry {entry_id} has no unresolved settlement")
+
+    def list_unresolved_settlements(self, s: Session, portfolio_id: int) -> list[CashEntryRecord]:
+        return [e for e in self.list_for_portfolio(s, portfolio_id) if e.settles_on is None]
 
     def list_for_portfolio(self, s: Session, portfolio_id: int) -> list[CashEntryRecord]:
         rows = s.fetch_all(

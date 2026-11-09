@@ -1,8 +1,8 @@
 # Milestone M1 — Core Infrastructure & Portfolio Accounting
 
-Status: **Revision 3 — architecture approved; all decisions final. Steps 1–4 approved;
-step 5 (calendar & settlement) implemented and awaiting review (see ARCHITECTURE §12.6).
-No order submission; no commits until reviewed.**
+Status: **Revision 3 — architecture approved; all decisions final. Steps 1–5 approved;
+step 6 (virtual portfolio accounting) implemented and awaiting review (see ARCHITECTURE
+§12.6 fixture correction and §12.7). No order submission; no commits until reviewed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal
@@ -254,6 +254,7 @@ M1 is complete when all of the following are demonstrated:
 | Activities endpoint not wrapped by SDK; float models (V3) | Verified | Raw `get` + Decimal parsing; contract test 5 |
 | Unknown-client-id lookup error shape; post-submit visibility latency | Assumption | M1 CT 4; latency only testable in M2 |
 | Paper `settlement_date` populated & correct on bank holidays | Assumption | M1 CT 3; fail closed if missing |
+| Settlement eligibility of exchange holidays, Thanksgiving, Columbus/Veterans Day, 2027 dates | Assumption (fixture) | Only 2026-04-03, 2026-06-19, 2026-07-03 verified from DTCC/NSCC notices; all others confirmed by M1 CT 3 against Alpaca's SETTLEMENT calendar |
 | Activity id ordering / `page_token` semantics; late-posted activities | Assumption | M1 CT 8; overlap re-scan + daily full re-scan regardless |
 | Market-data feed entitlement and timestamp semantics (IEX may be sparse) | Assumption | M1 CT 9; stale marks block entries; feed recorded per mark |
 | Alpaca calendar horizon ends 2029 | Future risk | Startup check warns when cache horizon < 1 year |

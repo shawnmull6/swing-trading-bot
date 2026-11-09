@@ -863,6 +863,74 @@ migration `0002_calendar_coverage.sql`.
   national day of mourning) appear as changed rows — the store rejects these as conflicts
   for operator attention rather than overwriting history. Mapping raw Alpaca JSON into
   `CalendarFetch` belongs to the step 9 adapter.
+* **Fixture correction (step 6 review).** The synthetic test fixture originally treated
+  Good Friday 2026 and 2026-07-03 as settlement days because banks were open. DTCC/NSCC
+  Important Notices contradict that: A#9732 (2026-03-06) states "No CNS activity will
+  settle on Friday, April 3, 2026" and A#9778 (2026-06-05) states the same for July 3;
+  DTC B#24302-26 states DTC is closed on Juneteenth 2026. The fixture now encodes
+  non-settlement weekdays explicitly with provenance (`VERIFIED` for those three, all
+  others — including Thanksgiving 2026, Columbus/Veterans Day and all of 2027 — marked
+  `ASSUMPTION` pending the step 15 contract tests). Lesson recorded: settlement
+  eligibility must come from the clearing calendar, never from bank or exchange
+  schedules. The calendar logic itself was unchanged.
+
+### 12.7 Step 6 implementation notes (virtual portfolio accounting, as built)
+
+Code: `domain/accounting.py` (pure average-cost math), `domain/valuation.py` (mark
+freshness), `ledger/balances.py`, `ledger/portfolio.py` (`VirtualPortfolio`),
+`ledger/accounting_invariants.py`. No schema change; repositories gained
+`OrdersRepository.record_fill_progress`, `FillsRepository.list_in_application_order`,
+`CashEntriesRepository.list_unresolved_settlements`.
+
+* **Initialization.** `VirtualPortfolio.initialize` writes the portfolio row and one settled
+  `DEPOSIT` equal to initial capital (used by `init-ledger` in step 14; tests use simulation
+  ledgers only). M1 allows exactly one deposit (`initial_deposit` invariant).
+* **Balances** (`compute_balances`, recomputed from the journal): cash = Σ entries;
+  unsettled proceeds = SELL entries whose `settles_on` is NULL or after today (market tz);
+  settled cash; buy commitments = Σ ACTIVE reservations; available = settled − commitments;
+  deployed = Σ open-position cost basis + commitments; headroom = 5,000 − deployed;
+  **buying capacity = max(0, min(available, headroom))**.
+* **Reservations.** `reserve_buy` reserves `qty × limit + fee_estimate`, rounded up, only for a
+  `PENDING_SUBMIT` limit buy, and refuses if it exceeds buying capacity (an accounting
+  guard; the full risk gate is step 11). Each buy fill reduces the remaining reservation by
+  `filled qty × limit` (floored at 0), so price improvement is already reflected in cash.
+  `close_reservation` refuses unless the order is in a **broker-confirmed terminal status**
+  (recorded by the caller in the same transaction): FILLED → `CONSUMED`, otherwise
+  `RELEASED`; the remainder returns to available cash. This prevents premature release.
+* **Fills** (`process_fill`, one transaction): activity (idempotent) → fill (with
+  `avg_cost_before`, `realized_pnl`) → BUY/SELL cash entry (buy debit immediate; sell credit
+  immediate but unsettled) → position → reservation → order `filled_qty`/`avg_fill_price`
+  (status is untouched: the lifecycle is step 12) → order event. Settlement date comes from
+  the stored calendar; if unavailable it is stored as NULL (proceeds stay unavailable,
+  `UNRESOLVED_SETTLEMENT` blocks entries) and `resolve_settlements` fills it in later —
+  never guessed.
+* **Duplicates / anomalies.** Exact replay → `DUPLICATE`, no change. Same activity id,
+  different content → `CONFLICT`, books untouched, persistent halt `RECON_EXECUTION`.
+  Non-bot fill → activity recorded `UNEXPLAINED`, nothing booked, halt. Fill for an unknown
+  `stb-` id → booked against an `ORPHAN` order, then halt.
+* **Average cost.** Cost basis is stored, average derived. A partial sell removes
+  `cost × sold / held` quantized to 0.0001 (half-even); a full close removes the entire
+  remainder (no residue). Oversells are booked (negative quantity, zero cost) and halt via
+  invariants. Fill-level fees go into buy cost basis / reduce sell realized P&L; standalone
+  `FEE` activities and `DIVIDEND`s are cash entries available immediately and are not
+  attributed to a position's realized P&L.
+* **Post-commit invariants** (data + accounting): initial deposit, fill↔cash linkage (exact
+  amount), average-cost replay of positions and per-fill realized P&L (in booking order),
+  **cash conservation** `cash + Σ cost basis = deposits + Σ realized + dividends + fee
+  entries + adjustments` (exact), cash ≥ 0, available cash ≥ 0, deployed ≤ ceiling,
+  reservation bounds. Any violation → persistent `LEDGER_INVARIANT` halt (not re-written
+  while the identical violation persists).
+* **Valuation.** `snapshot` reports balances, positions (qty, cost basis, average cost,
+  realized), mark assessments, market value, unrealized P&L, equity and market exposure
+  (market value + commitments). If any non-flat position lacks a FRESH mark, market value,
+  unrealized P&L, equity and market exposure are `None` (never estimated) and
+  `STALE_OR_MISSING_MARKS` blocks new entries. Other entry blockers: unresolved settlement,
+  negative available cash, ceiling exceeded, negative position, no buying capacity.
+* **Mark freshness** (§6.6) as implemented: future timestamps rejected; receipt within
+  `max_sync_age`; in session: as of this session and within 15 minutes; otherwise dated the
+  last completed session (a `LATEST_TRADE` at/after that session's open — extended-hours
+  prints are accepted — or a `SESSION_CLOSE_BAR` for that date); calendar unavailable →
+  `UNVERIFIABLE`.
 ---
 
 ## 13. Configuration & secrets
