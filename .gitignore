@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+alpaca.txt
+
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+data/
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
