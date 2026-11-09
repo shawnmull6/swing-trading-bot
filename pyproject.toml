@@ -1,7 +1,7 @@
 [project]
 name = "swing-trading-bot"
 version = "0.1.0"
-description = "Add your description here"
+description = "Paper-only, fail-closed swing-trading bot with a virtual portfolio ledger"
 readme = "README.md"
 authors = [
     { name = "Shawn Mull", email = "shawn_mull@yahoo.com" }
@@ -25,8 +25,78 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.170.15",
     "mypy>=2.4.1",
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.17.4",
 ]
+
+# --------------------------------------------------------------------------- tooling
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["scripts", "*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "SIM",           # simplify
+    "RUF",           # ruff-specific
+    "S",             # bandit (security)
+    "DTZ",           # timezone-naive datetimes are forbidden
+    "PT",            # pytest style
+    "C4",            # comprehensions
+    "PIE", "RET", "TID", "PL", "N", "ANN", "BLE", "FBT", "T20",
+]
+ignore = [
+    "PLR2004",       # magic values are fine in tests/config constants
+    "PLR0913",       # many-argument constructors are acceptable for frozen models
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ANN", "PLR2004", "FBT", "S105", "S106", "S608", "PT012", "PT018"]
+# Only constant column lists are interpolated; every value is a bound parameter.
+"src/swing_trading_bot/ledger/repositories.py" = ["S608"]
+"src/swing_trading_bot/__init__.py" = ["T201"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+module = ["yaml", "yaml.*"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+filterwarnings = ["error"]
+markers = [
+    "alpaca_paper: read-only contract tests against the Alpaca paper API (opt-in via RUN_ALPACA_PAPER_TESTS=1)",
+]
+
+[tool.coverage.run]
+source = ["swing_trading_bot"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "\\.\\.\\."]
