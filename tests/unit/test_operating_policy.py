@@ -78,6 +78,16 @@ def test_m1_constraints_cannot_be_relaxed(
         load_operating_policy(_write(tmp_path, raw))
 
 
+def test_calendar_settings_and_t_plus_one_only(tmp_path: Path, raw: dict[str, Any]) -> None:
+    s = load_operating_policy(POLICY_YAML).profile.settlement
+    assert s.min_calendar_coverage_days == 10
+    assert s.calendar_max_age_hours == 36
+    assert s.calendar_horizon_warning_days == 365
+    raw["profiles"]["cash_conservative"]["settlement"]["settlement_cycle_days"] = 2
+    with pytest.raises(ConfigFileError, match="T\\+1"):
+        load_operating_policy(_write(tmp_path, raw))
+
+
 def test_unsettled_buys_cannot_be_enabled(tmp_path: Path, raw: dict[str, Any]) -> None:
     raw["profiles"]["cash_conservative"]["settlement"]["buys_require_settled_cash"] = False
     with pytest.raises(ConfigFileError, match="settled cash"):

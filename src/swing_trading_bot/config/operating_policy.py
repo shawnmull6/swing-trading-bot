@@ -28,6 +28,8 @@ class SettlementPolicy(_Strict):
     buys_require_settled_cash: bool
     proceeds_available_at: Literal["start_of_settlement_date_market_tz"]
     min_calendar_coverage_days: int = Field(strict=True, ge=1)
+    calendar_max_age_hours: int = Field(strict=True, ge=1, le=168)
+    calendar_horizon_warning_days: int = Field(strict=True, ge=1)
 
 
 class AccountProfile(_Strict):
@@ -85,6 +87,8 @@ def _enforce_m1_constraints(name: str, profile: AccountProfile) -> None:
         problems.append("only equities and ETFs are permitted")
     if not profile.settlement.buys_require_settled_cash:
         problems.append("buys must require settled cash")
+    if profile.settlement.settlement_cycle_days != 1:
+        problems.append("settlement cycle must be T+1 (calendar logic implements T+1 only)")
     if problems:
         raise ValueError(f"profile {name!r} violates M1 constraints: " + "; ".join(problems))
 

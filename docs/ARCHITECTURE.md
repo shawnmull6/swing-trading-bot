@@ -809,6 +809,60 @@ authoritative schema.
   equity snapshots, loss-limit events and resolution attempts arrive with the steps that
   use them; their tables already exist.
 
+
+### 12.6 Step 5 implementation notes (calendar & settlement, as built)
+
+Code: `domain/calendar.py` (pure logic), `ledger/calendar_store.py` (persistence),
+migration `0002_calendar_coverage.sql`.
+
+* **Why migration 0002 was necessary.** 0001's `market_calendar` could not distinguish a
+  holiday (inside fetched range, no row) from never-fetched data, had nowhere to store the
+  separate settlement-day calendar, and lacked provenance for staleness. 0002 adds
+  `calendar_fetches` (append-only log of every fetch with its requested range, row count,
+  payload SHA-256, `ACCEPTED`/`REJECTED` and problems), `settlement_days`, and rebuilds
+  `market_calendar` with `first_fetch_id` / `last_confirmed_fetch_id` (replacing
+  `fetched_at`), `open_at < close_at`, `settlement_date > session_date`, and triggers
+  (hours immutable, `settlement_date` set once, no deletes). The rebuild aborts if legacy
+  rows without provenance exist (fail closed).
+* **Coverage.** A date is known for a calendar kind only if an `ACCEPTED` fetch's requested
+  range contains it. Every API raises `CalendarCoverageError` outside coverage.
+* **Staleness.** Coverage of a date is stale when its newest covering fetch is older than
+  `calendar_max_age_hours` (36) **and** the date was not already in the past (market tz)
+  when fetched — history does not go stale, forecasts do. Stale data raises
+  `StaleCalendarError`.
+* **Settlement date** (`settlement_date(trade_date)`): requires a covered trading session;
+  sources are the provider's per-session `settlement_date` and the first settlement day
+  strictly after the trade date on the settlement calendar. If both exist they must agree
+  (else `ContradictoryCalendarError`); if neither exists → `SettlementDateUnavailableError`.
+  There is no weekday-arithmetic fallback.
+* **Fetch acceptance.** `record_fetch` rejects (records, does not apply) a fetch that is
+  internally inconsistent (weekend sessions/settlement days, duplicates, rows outside the
+  range, open ≥ close, hours outside 09:30–16:00 ET or not on the session date,
+  settlement date not after/too far after the trade date or on a weekend, empty long
+  ranges), that changes accepted history in overlapping dates (session added/removed/
+  re-timed, settlement date changed or withdrawn, settlement-day status changed), or that
+  would create a cross-calendar contradiction. Filling a previously missing per-session
+  settlement date is allowed. Identical refetches refresh `last_confirmed_fetch_id` and
+  staleness.
+* **APIs:** `is_trading_session`, `next_trading_session`, `previous_trading_session`
+  (strict), `session` (incl. `is_early_close`, local open/close), `is_settlement_day`,
+  `settlement_date`, `calendar_coverage(start, end)` → `CoverageReport`,
+  `require_coverage`, `require_future_coverage(days)`, `horizon_status(warning_days)`
+  (contiguous fresh horizon per calendar, days remaining, the provider's documented end
+  2029-12-31, warning flag).
+* **Policy additions** (`config/operating_policy.yaml` → `settlement`):
+  `calendar_max_age_hours: 36`, `calendar_horizon_warning_days: 365`; M1 also enforces
+  `settlement_cycle_days == 1` because only T+1 is implemented.
+* **Offline fixture:** `tests/support/calendar_fixture.py`, a synthetic, hand-entered
+  2025-12 .. 2027-12 calendar (NYSE holidays, early closes, Fed holidays including
+  Columbus/Veterans Day, Saturday holidays not observed by banks). Not a source of truth.
+* **Alpaca assumptions to confirm with contract tests (CT 3, step 15):** TRADING rows exist
+  only for open sessions; `open`/`close` are ET wall-clock times that include early closes;
+  per-session `settlement_date` is populated and reflects bank holidays; `date_type=
+  SETTLEMENT` returns exactly the settlement-eligible dates; late calendar changes (e.g. a
+  national day of mourning) appear as changed rows — the store rejects these as conflicts
+  for operator attention rather than overwriting history. Mapping raw Alpaca JSON into
+  `CalendarFetch` belongs to the step 9 adapter.
 ---
 
 ## 13. Configuration & secrets

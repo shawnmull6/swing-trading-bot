@@ -1,8 +1,8 @@
 # Milestone M1 — Core Infrastructure & Portfolio Accounting
 
-Status: **Revision 3 — architecture approved; all decisions final. Steps 1–3 approved;
-step 4 (persistence) implemented and awaiting review (see ARCHITECTURE §12.5). No order
-submission; no commits until reviewed.**
+Status: **Revision 3 — architecture approved; all decisions final. Steps 1–4 approved;
+step 5 (calendar & settlement) implemented and awaiting review (see ARCHITECTURE §12.6).
+No order submission; no commits until reviewed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

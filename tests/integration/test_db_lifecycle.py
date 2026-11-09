@@ -31,7 +31,11 @@ from swing_trading_bot.ledger.repositories import SyncStateRepository, TradingSt
 
 from .conftest import T0, at
 
+N = len(packaged_migrations())
+
 EXPECTED_TABLES = {
+    "calendar_fetches",
+    "settlement_days",
     "schema_migrations",
     "database_identity",
     "portfolios",
@@ -142,7 +146,7 @@ def test_reopen_preserves_state(db: Database, db_path: Path) -> None:
         with again.read() as s:
             assert SyncStateRepository().get(s, "activities.cursor_id") == "abc::1"
             assert TradingStateRepository().get(s).halted is True
-            assert s.scalar("SELECT count(*) FROM schema_migrations") == 1
+            assert s.scalar("SELECT count(*) FROM schema_migrations") == N
         assert again.identity.created_at == T0
 
 
@@ -151,15 +155,15 @@ def test_repeated_open_does_not_reapply_migrations(db: Database, db_path: Path) 
     for i in range(3):
         with Database.open(db_path, RuntimeMode.SIMULATE, now=at(i)) as again, again.read() as s:
             rows = s.fetch_all("SELECT version, applied_at FROM schema_migrations")
-            assert rows == [(1, "2026-11-09T15:30:00.000000+00:00")]
+            assert rows == [(v, "2026-11-09T15:30:00.000000+00:00") for v in range(1, N + 1)]
 
 
 def test_pending_migration_applied_on_open(db: Database, db_path: Path) -> None:
     db.close()
-    extra = Migration(2, "extra", "CREATE TABLE extra_table (x TEXT NOT NULL) STRICT;\n")
+    extra = Migration(N + 1, "extra", "CREATE TABLE extra_table (x TEXT NOT NULL) STRICT;\n")
     migrations = (*packaged_migrations(), extra)
     with Database.open(db_path, RuntimeMode.SIMULATE, migrations=migrations) as again:
-        assert again.pragma("user_version") == 2
+        assert again.pragma("user_version") == N + 1
     # The default (packaged-only) application now sees a newer schema and refuses.
     with pytest.raises(UnsupportedSchemaVersionError, match="newer"):
         Database.open(db_path, RuntimeMode.SIMULATE)
@@ -167,11 +171,13 @@ def test_pending_migration_applied_on_open(db: Database, db_path: Path) -> None:
 
 def test_failed_pending_migration_keeps_previous_version(db: Database, db_path: Path) -> None:
     db.close()
-    bad = Migration(2, "bad", "CREATE TABLE t2 (x TEXT) STRICT;\nINSERT INTO nope VALUES (1);\n")
+    bad = Migration(
+        N + 1, "bad", "CREATE TABLE t2 (x TEXT) STRICT;\nINSERT INTO nope VALUES (1);\n"
+    )
     with pytest.raises(MigrationError, match="rolled back"):
         Database.open(db_path, RuntimeMode.SIMULATE, migrations=(*packaged_migrations(), bad))
     with Database.open(db_path, RuntimeMode.SIMULATE) as again, again.read() as s:
-        assert again.pragma("user_version") == 1
+        assert again.pragma("user_version") == N
         assert s.scalar("SELECT count(*) FROM sqlite_master WHERE name = 't2'") == 0
 
 
@@ -187,14 +193,14 @@ def test_interrupted_migration_process_kill_is_atomic(tmp_path: Path, db: Databa
         from swing_trading_bot.ledger import migrator
         from swing_trading_bot.ledger.db import Database
         extra = migrator.Migration(
-            2, "extra",
+            {N + 1}, "extra",
             "CREATE TABLE k1 (x TEXT) STRICT;\\nCREATE TABLE k2 (x TEXT) STRICT;\\n"
             "CREATE TABLE k3 (x TEXT) STRICT;\\n",
         )
         original = migrator.apply_pending
         def killing(conn, migrations, **kw):
             def hook(version, index):
-                if version == 2 and index == 2:
+                if version == {N + 1} and index == 2:
                     os._exit(17)
             return original(conn, migrations, **kw, before_statement=hook)
         import swing_trading_bot.ledger.db as dbmod
@@ -208,7 +214,7 @@ def test_interrupted_migration_process_kill_is_atomic(tmp_path: Path, db: Databa
     )
     assert result.returncode == 17, result.stderr.decode()
     with Database.open(path, RuntimeMode.SIMULATE) as again, again.read() as s:
-        assert again.pragma("user_version") == 1
+        assert again.pragma("user_version") == N
         names = {str(r[0]) for r in s.fetch_all("SELECT name FROM sqlite_master")}
         assert not {"k1", "k2", "k3"} & names
         assert integrity_report(s, full=True).ok
@@ -326,10 +332,10 @@ def test_unsupported_schema_version_refused(db: Database) -> None:
     conn = _raw(path)
     conn.execute("DROP TRIGGER schema_migrations_no_update")
     conn.execute(
-        "INSERT INTO schema_migrations VALUES (2, 'future', ?, '2030-01-01T00:00:00.000000+00:00')",
-        ("f" * 64,),
+        "INSERT INTO schema_migrations VALUES (?, 'future', ?, '2030-01-01T00:00:00.000000+00:00')",
+        (N + 1, "f" * 64),
     )
-    conn.execute("PRAGMA user_version = 2")
+    conn.execute(f"PRAGMA user_version = {N + 1}")
     conn.close()
     with pytest.raises(UnsupportedSchemaVersionError, match="newer"):
         Database.open(path, RuntimeMode.SIMULATE)

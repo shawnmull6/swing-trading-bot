@@ -19,6 +19,8 @@ profiles:
       buys_require_settled_cash: true
       proceeds_available_at: start_of_settlement_date_market_tz
       min_calendar_coverage_days: 10
+      calendar_max_age_hours: 36         # calendar refreshed daily; 12h slack
+      calendar_horizon_warning_days: 365  # warn when fresh coverage ends within a year
     max_leverage: "1"
     allow_short: false
     allow_fractional: false
@@ -43,6 +45,8 @@ profiles:
       buys_require_settled_cash: true
       proceeds_available_at: start_of_settlement_date_market_tz
       min_calendar_coverage_days: 10
+      calendar_max_age_hours: 36         # calendar refreshed daily; 12h slack
+      calendar_horizon_warning_days: 365  # warn when fresh coverage ends within a year
     max_leverage: "1"
     allow_short: false
     allow_fractional: false

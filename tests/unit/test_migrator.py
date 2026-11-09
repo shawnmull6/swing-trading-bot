@@ -54,7 +54,10 @@ def test_packaged_migrations_are_contiguous_and_named() -> None:
 
 def test_packaged_schema_never_uses_real_or_defaults_for_values() -> None:
     code_lines = [
-        ln for ln in packaged_migrations()[0].sql.splitlines() if not ln.lstrip().startswith("--")
+        ln
+        for m in packaged_migrations()
+        for ln in m.sql.splitlines()
+        if not ln.lstrip().startswith("--")
     ]
     sql = "\n".join(code_lines).upper()
     assert re.search(r"\bREAL\b", sql) is None
