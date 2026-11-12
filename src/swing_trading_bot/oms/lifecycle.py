@@ -23,7 +23,10 @@ from enum import StrEnum
 
 from swing_trading_bot.broker.errors import (
     AuthenticationError,
+    IncompleteRetrievalError,
     InvalidBrokerDataError,
+    RateLimitedError,
+    ServiceUnavailableError,
     UnknownBrokerStatusError,
 )
 from swing_trading_bot.domain.broker_status import (
@@ -110,6 +113,25 @@ def read_error_halt(exc: BaseException) -> HaltReason | None:
         return HaltReason.UNMAPPED_BROKER_STATUS
     if isinstance(exc, InvalidBrokerDataError):
         return HaltReason.BROKER_PAYLOAD
+    return None
+
+
+_OUTAGE_KINDS = {"timeout": "TIMEOUT", "network": "NETWORK", "http": "SERVER_ERROR"}
+
+
+def read_error_outage_category(exc: BaseException) -> str | None:
+    """The broker-outage category of a failed READ (§10.5 circuit breaker), or None when
+    the failure does not count toward an outage. Anything :func:`read_error_halt` maps to
+    a dedicated halt (auth, unmapped status, malformed payload) never counts; neither do
+    lookups that merely found nothing. Network, timeout, 5xx, unavailable and 429 count."""
+    if read_error_halt(exc) is not None:
+        return None
+    if isinstance(exc, RateLimitedError):
+        return "RATE_LIMITED"
+    if isinstance(exc, ServiceUnavailableError):
+        return _OUTAGE_KINDS.get(exc.kind, "UNAVAILABLE")
+    if isinstance(exc, IncompleteRetrievalError) and exc.__cause__ is not None:
+        return read_error_outage_category(exc.__cause__)
     return None
 
 

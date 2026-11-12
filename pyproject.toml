@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-swing-trading-bot = "swing_trading_bot:main"
+swing-trading-bot = "swing_trading_bot.app.cli:entrypoint"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]

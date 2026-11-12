@@ -170,6 +170,59 @@ def verify_applied(conn: sqlite3.Connection, migrations: Sequence[Migration]) ->
     return newest
 
 
+def pending_migrations(
+    conn: sqlite3.Connection, migrations: Sequence[Migration]
+) -> tuple[Migration, ...]:
+    """Migrations not yet applied, after verifying the recorded history (read-only)."""
+    validate_sequence(migrations)
+    current = verify_applied(conn, migrations)
+    return tuple(migrations[current:])
+
+
+def apply_pending_atomic(
+    conn: sqlite3.Connection,
+    migrations: Sequence[Migration],
+    *,
+    now: datetime,
+    before_statement: StatementHook | None = None,
+) -> list[int]:
+    """Apply every pending migration of an **existing** database in ONE transaction.
+
+    Used by the explicit migration workflow: either every pending migration (with its
+    history row and ``user_version``) commits, or none does, so a failure or a crash
+    leaves the ledger exactly at its previous version."""
+    if conn.in_transaction:
+        raise MigrationError("migrations must not run inside an open transaction")
+    pending = pending_migrations(conn, migrations)
+    if pending and pending[0].version == 1:
+        raise IncompleteDatabaseError("refusing to create a schema outside Database.create")
+    if not pending:
+        return []
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for migration in pending:
+            for index, statement in enumerate(migration.statements()):
+                if before_statement is not None:
+                    before_statement(migration.version, index)
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, checksum, applied_at) "
+                "VALUES (?, ?, ?, ?)",
+                (migration.version, migration.name, migration.checksum, ts_to_db(now)),
+            )
+            conn.execute(f"PRAGMA user_version = {int(migration.version)}")
+        conn.execute("COMMIT")
+    except BaseException as exc:
+        _rollback_if_open(conn)
+        if isinstance(exc, Exception) and not isinstance(exc, MigrationError):
+            detail = str(exc.args[0]) if exc.args else type(exc).__name__
+            raise MigrationError(
+                f"migration to version {pending[-1].version} failed and was rolled back: {detail}"
+            ) from exc
+        raise
+    return [m.version for m in pending]
+
+
 def _rollback_if_open(conn: sqlite3.Connection) -> None:
     if conn.in_transaction:
         conn.execute("ROLLBACK")

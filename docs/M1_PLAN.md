@@ -5,8 +5,10 @@ Status: **Revision 3 — architecture approved; all decisions final. Steps 1–1
 conditionally approved; step 13.1 (reconciliation hardening, §12.18) conditionally
 approved; step 13.2 (rebaseline accounting corrections: unverified dividends unresolved,
 event-specific acknowledgements, corrected cash equation) implemented and awaiting review
-(§12.19). Position adjustments are not implemented (operational limitation). Live read-only
-contract checks not run. No Alpaca order submission; no commits until reviewed.**
+(§12.19). Steps 13–13.2 committed. Step 14 (runtime & CLI, A§12.20) approved. Step 14.1
+(broker-outage circuit breaker, A§12.21) implemented and awaiting review. Position
+adjustments are not implemented (operational limitation). Live read-only contract checks
+not run. No Alpaca order submission; step 14.1 not committed until reviewed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal
@@ -88,6 +90,7 @@ Each step lands with its tests; quality gates (§5.5) must pass at every step.
 | 12 | OrderManager & recovery | tx A–D, ambiguous-order protocol (A§10.3), activity ingestion, orphan handling, post-commit invariants |
 | 13 | Reconciler | baselines, execution/order/position/cash checks, consistent-snapshot loop, INCONCLUSIVE escalation, two-step rebaseline workflow and audited adjustments (A§8.5) |
 | 14 | Runtime & CLI | lock, startup sequence, commands (§4.1) |
+| 14.1 | Broker-outage breaker | §10.5 escalation: ≥ 3 failed sync cycles ≥ 60 s apart spanning ≥ 30 min → `BROKER_OUTAGE`; durable streak; reset on a complete sync; gate `BROKER_OUTAGE_ACTIVE` (A§12.21) |
 | 15 | Hardening | fault-injection suite, read-only contract tests run once against paper, docs reconciled with code, `check_connection.py` replaced by `status --broker` |
 
 ### 4.1 CLI (M1)
@@ -106,6 +109,13 @@ simulate SCENARIO                # OrderManager + SimBroker on a separate sim le
 backup PATH
 ```
 No command can create a real order in M1.
+
+*As built (step 14, A§12.20):* `init-ledger` requires `--confirm-path`, `--confirm-account`
+and `--confirm-environment`; added `migrate --backup PATH` and read-only `portfolio`,
+`orders`, `halts`, `audit`; inspection commands take `--sim-run RUN_ID`; `adjust` is not
+implemented; `simulate` accepts `happy-path`, `partial-cancel`, `ambiguous-adopt`,
+`never-received`, `restart-recovery`, `unexplained-deposit` or `all`. Broker-backed
+commands need the Step 15 credential loading (exit 7 until then).
 
 ## 5. Test plan
 
@@ -181,7 +191,7 @@ No command can create a real order in M1.
 | | interest on external cash | classified EXTERNAL; OK |
 | | fill activity lags order `filled_qty` | INCONCLUSIVE → block → OK next cycle; 5× → halt |
 | **Invariant breach** | broker fill exceeds reservation / creates negative available cash | fill **is** booked; then `LEDGER_INVARIANT` halt |
-| **API failures** | 5xx burst → circuit open | transient block; prolonged → persistent halt |
+| **API failures** | 5xx burst → circuit open | transient block (`BROKER_OUTAGE_ACTIVE`); ≥ 3 failed cycles ≥ 60 s apart over ≥ 30 min → `BROKER_OUTAGE` halt; one failure never escalates |
 | | 401 | immediate persistent halt, no retries |
 | | unmapped status / float payload | persistent halt |
 | **Crash safety** | exception injected mid tx C | rollback; replay converges |

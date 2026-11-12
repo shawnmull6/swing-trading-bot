@@ -35,3 +35,8 @@ ambiguous_orders:                    # D12 / U4, ARCHITECTURE §10.3
 reconciliation:
   max_snapshot_retries: 3
   max_consecutive_inconclusive: 5
+
+broker_outage:                       # §10.5 circuit breaker (step 14.1); NOT a trading limit
+  min_outage_seconds: 1800           # >= 30 min from the first failure of the streak ...
+  min_failed_cycles: 3               # ... and >= 3 distinct failed sync cycles ...
+  min_cycle_spacing_seconds: 60      # ... counted only when >= 60 s apart

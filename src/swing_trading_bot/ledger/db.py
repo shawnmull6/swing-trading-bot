@@ -7,8 +7,12 @@ Opening a database
   the same transaction as migration 0001.
 * :meth:`Database.open` opens an **existing** file only (refuses if missing, so a typo
   can never silently produce an empty ledger), verifies the application id, migration
-  history and checksums, applies pending migrations atomically, checks the mode and
-  runs SQLite integrity and foreign-key checks.
+  history and checksums, checks the mode, applies pending migrations atomically and
+  runs SQLite integrity and foreign-key checks. Pending migrations are applied
+  implicitly **only** to simulation ledgers opened with ``auto_migrate=True``; an
+  observe (account-backed) ledger with pending migrations is refused with
+  :class:`MigrationRequiredError` and must go through the explicit, backed-up
+  ``ledger/migration_guard.py`` workflow.
 * ``paper_execute`` is not constructible in M1.
 
 Transactions
@@ -44,6 +48,7 @@ from swing_trading_bot.ledger.errors import (
     DatabaseNotFoundError,
     ForeignDatabaseError,
     IncompleteDatabaseError,
+    MigrationRequiredError,
     ModeMismatchError,
     NestedTransactionError,
     PersistenceError,
@@ -51,7 +56,12 @@ from swing_trading_bot.ledger.errors import (
     TransactionClosedError,
     wrap_sqlite_error,
 )
-from swing_trading_bot.ledger.migrator import Migration, apply_pending, packaged_migrations
+from swing_trading_bot.ledger.migrator import (
+    Migration,
+    apply_pending,
+    packaged_migrations,
+    pending_migrations,
+)
 
 APPLICATION_NAME: Final = "swing-trading-bot"
 APPLICATION_ID: Final = 0x53544231  # "STB1"
@@ -239,7 +249,10 @@ class Database:
         now: datetime | None = None,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         migrations: Sequence[Migration] | None = None,
+        auto_migrate: bool = True,
     ) -> Self:
+        """Open an existing ledger. ``auto_migrate`` only ever applies to simulation
+        ledgers; observe ledgers never migrate here (see the module docstring)."""
         _refuse_unsupported_mode(mode)
         if not path.is_file():
             raise DatabaseNotFoundError(f"database not found: {path}")
@@ -252,12 +265,25 @@ class Database:
                 )
             if app_id != APPLICATION_ID:
                 raise ForeignDatabaseError(f"{path} was not created by {APPLICATION_NAME}")
-            apply_pending(
-                conn,
-                migrations if migrations is not None else packaged_migrations(),
-                now=now if now is not None else utc_now(),
-                bootstrap=None,
-            )
+            known = migrations if migrations is not None else packaged_migrations()
+            stored = _stored_mode(conn)
+            if stored is not None and stored is not mode:
+                raise ModeMismatchError(
+                    f"database {path} is a '{stored.value}' ledger; refusing to open it in "
+                    f"'{mode.value}' mode"
+                )
+            pending = pending_migrations(conn, known)
+            if (
+                pending
+                and stored is not None
+                and (stored is not RuntimeMode.SIMULATE or not auto_migrate)
+            ):
+                raise MigrationRequiredError(
+                    f"{path} is at schema version {pending[0].version - 1}; "
+                    f"{len(pending)} migration(s) pending. Run the explicit, backed-up "
+                    "'migrate' command; ledgers are never migrated implicitly here"
+                )
+            apply_pending(conn, known, now=now if now is not None else utc_now(), bootstrap=None)
             db = cls._finish_open(conn, path, mode)
         except sqlite3.Error as exc:
             conn.close()
@@ -381,6 +407,23 @@ class Database:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+def _stored_mode(conn: sqlite3.Connection) -> RuntimeMode | None:
+    """The mode recorded at creation, or None for a database without an identity row
+    (pre-bootstrap / foreign; later checks reject those)."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'database_identity'"
+    ).fetchone()
+    if exists is None:
+        return None
+    row = conn.execute("SELECT mode FROM database_identity WHERE id = 1").fetchone()
+    if row is None:
+        return None
+    try:
+        return RuntimeMode(str(row[0]))
+    except ValueError:
+        raise IncompleteDatabaseError(f"unknown ledger mode {row[0]!r}") from None
 
 
 def _refuse_unsupported_mode(mode: RuntimeMode) -> None:

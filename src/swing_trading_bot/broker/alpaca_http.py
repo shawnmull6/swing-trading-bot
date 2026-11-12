@@ -144,9 +144,11 @@ class AlpacaReadTransport:
                 allow_redirects=False,
             )
         except requests.Timeout:
-            raise ServiceUnavailableError(f"{context}: timeout") from None
+            raise ServiceUnavailableError(f"{context}: timeout", kind="timeout") from None
         except requests.RequestException as exc:
-            raise ServiceUnavailableError(f"{context}: {type(exc).__name__}") from None
+            raise ServiceUnavailableError(
+                f"{context}: {type(exc).__name__}", kind="network"
+            ) from None
         raise_for_status(response, context)
         return decode_json(response.text)
 

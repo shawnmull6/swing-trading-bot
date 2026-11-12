@@ -47,6 +47,13 @@ class MigrationError(PersistenceError):
     pass
 
 
+class MigrationRequiredError(PersistenceError):
+    """The ledger has pending migrations that may not be applied implicitly.
+
+    Account-backed (observe) ledgers are migrated only by the explicit, backed-up
+    ``migrate`` workflow (``ledger/migration_guard.py``); inspection opens never migrate."""
+
+
 class ModeMismatchError(PersistenceError):
     pass
 

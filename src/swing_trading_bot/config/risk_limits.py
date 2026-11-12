@@ -77,6 +77,14 @@ class ReconciliationPolicy(_Strict):
     max_consecutive_inconclusive: PositiveInt
 
 
+class BrokerOutagePolicy(_Strict):
+    """§10.5 circuit breaker (approved step 14.1). Not a trading risk limit."""
+
+    min_outage_seconds: PositiveInt = 1800
+    min_failed_cycles: PositiveInt = 3
+    min_cycle_spacing_seconds: PositiveInt = 60
+
+
 class RiskLimits(_Strict):
     max_position_pct_equity: Fraction
     max_open_positions: PositiveInt
@@ -89,6 +97,7 @@ class RiskLimits(_Strict):
     mark_freshness: MarkFreshness
     ambiguous_orders: AmbiguousOrderPolicy
     reconciliation: ReconciliationPolicy
+    broker_outage: BrokerOutagePolicy = BrokerOutagePolicy()
 
     @model_validator(mode="after")
     def _coherent(self) -> Self:

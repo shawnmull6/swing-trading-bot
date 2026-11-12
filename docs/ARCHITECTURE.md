@@ -1,7 +1,9 @@
 # Swing Trading Bot — Architecture
 
 Status: **Revision 3 — architecture approved; all decisions (D1–D15, U1–U9) final.
-M1 implementation in progress (steps 1–3).** Decision log: `docs/M1_PLAN.md` §2.
+M1 steps 1–13.2 implemented; step 14 (runtime & CLI, §12.20) approved;
+step 14.1 (broker-outage breaker, §12.21) implemented and awaiting review; step 15 not
+started.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -88,8 +90,14 @@ src/swing_trading_bot/
                classify.py, reconciler.py (step 13); rebaseline.py (step 13.1)
   ledger/      … baselines.py, acknowledgements.py (steps 13-13.2)
   observability/ logging.py (JSON + secret redaction)
-  app/         runtime.py (lock, startup sequence), cli.py
+  app/         runtime.py, cli.py, commands.py, lock.py, … (step 14, §12.20)
 ```
+
+*As built:* `broker/alpaca_marks.py` and `broker/resilience.py` do not exist — marks and
+bounded read retries live in `broker/alpaca_read.py` / `broker/alpaca_http.py`; the broker-outage
+circuit breaker is in `ledger/broker_outage.py` (§12.21). `risk/exposure.py` and `risk/loss_limits.py`
+do not exist — exposure is in `ledger/portfolio.py`, loss limits in `ledger/loss_limits.py`.
+The repository module is `ledger/repositories.py`.
 
 Dependency direction: `app → oms → risk → ledger → domain`; `oms → broker → domain`.
 `broker` never imports `ledger`. Future strategy / TradePlan code depends on `oms`
@@ -2004,6 +2012,222 @@ broker and ledger positions differ. The audited `ADJUSTMENT` command of §8.5 is
 implemented** in M1. A position difference therefore stays a persistent halt that only
 a code-level remedy (a future audited adjustment command) can clear. Operators must
 not attempt to fix it by rebaselining or by editing the ledger.
+### 12.20 Step 14: runtime orchestration and the operator CLI (as built)
+
+Package `app/`: `cli.py` (argparse, D14-1), `commands.py` (lock → open → operation →
+close), `runtime.py` (wiring and sequences), `init_ledger.py`, `views.py` (read-only
+inspection), `lock.py`, `paths.py`, `config.py`, `exit_codes.py`, `safety.py`,
+`simulation.py`, `sim_calendar.py`. Ledger additions: `ledger/backup.py`,
+`ledger/migration_guard.py`, `MigrationRequiredError`, `migrator.pending_migrations` /
+`apply_pending_atomic`, `Database.open(auto_migrate=)`, and an observe-mode provenance
+check in `CalendarStore.record_fetch`. **No schema change.** Console script:
+`swing-trading-bot = swing_trading_bot.app.cli:entrypoint`.
+
+**1. Broker access and credentials.** Commands receive broker access only through an
+injected `Dependencies.broker_factory`. Step 14 ships **no** production factory and never
+reads `.env`, settings or credentials: broker-backed commands exit 7 (`CONFIG`,
+`BrokerNotConfiguredError`) until the separately authorized Step 15 credential loading.
+All Step 14 tests use the real `AlpacaPaperReadAdapter` over an offline GET-only fake
+transport (`tests/support/alpaca_account.py`).
+
+**2. Command side effects** (contract in `app/safety.py`, verified by
+`tests/integration/test_cli_safety.py`):
+
+| Command | Broker | Ledger writes | OMS recovery | Halts | Confirmation | Lock |
+|---|---|---|---|---|---|---|
+| `status` | none | none | no | none | none | shared |
+| `status --broker` | read-only | none | no | none | none | shared |
+| `portfolio` | none | none | no | none | none | shared |
+| `orders` | none | none | no | none | none | shared |
+| `halts` | none | none | no | none | none | shared |
+| `audit` | none | none | no | none | none | shared |
+| `init-ledger` | read-only | creates a new ledger | no | creates INITIALIZED | `--confirm-path`, `--confirm-account`, `--confirm-environment` must match | exclusive |
+| `migrate` | none | schema migration (after verified backup) | no | none | `--backup PATH` (new file) | exclusive |
+| `backup` | none | writes a new backup file only | no | none | PATH must not exist | shared |
+| `sync` | read-only | sync / audit records | yes | may create (never clears) | none | exclusive |
+| `reconcile` | read-only | sync / reconciliation / audit records | yes | may create (never clears) | none | exclusive |
+| `halt` | none | operator audit records | no | creates OPERATOR | `--reason` | exclusive |
+| `resume` | read-only | sync / reconciliation / audit records | yes | clears only after a CLEAN reconciliation | `--reason` | exclusive |
+| `resolve-order` | read-only | sync / reconciliation / audit records | yes | may create (never clears) | `--confirm-absent` | exclusive |
+| `rebaseline propose` | read-only | reconciliation / audit records | no | may create (never clears) | `--reason`; ledger halted | exclusive |
+| `rebaseline approve` | read-only | reconciliation / audit records | no | re-records REBASELINE (halt kept) | exact `--acknowledge-unexplained` amount, `--reason` | exclusive |
+| `simulate` | SimBroker only (in memory) | new simulation ledger only | yes | inside the simulation ledger only | none | exclusive |
+
+Inspection commands open the ledger without migrating, read one `query_only` snapshot,
+never call the broker and never run recovery or invariant halting; a test proves the
+full-ledger fingerprint and the broker call log are unchanged. Broker cash/equity is
+never displayed.
+
+**3. Runtime lifecycle** (§10.1). Every operational command: dependency/config checks →
+exclusive lock → `Database.open(auto_migrate=False)` (mode, identity, integrity) →
+post-commit invariant check (§10.1 step 2; a violation halts `LEDGER_INVARIANT`) →
+command sequence → close → unlock. The **sync cycle** (`runtime.sync_cycle`, used by
+`sync`, `reconcile`, `resume`):
+
+1. preflight, outside any transaction: account, configuration, clock. The connected
+   account/environment must equal the identity recorded by `init-ledger`; a mismatch
+   halts `RECON_ACCOUNT` **before** anything is ingested. Auth / malformed payload →
+   §10.5 halt (`AUTH`, `BROKER_PAYLOAD`, …); any other read failure stops the cycle with
+   exit 8 and no halt;
+2. calendar refresh when the newest accepted fetch is ≥ 24 h old or covers < 30 days
+   ahead (fetch window: today − 7 … today + 60);
+3. `recover_after_restart`: forced lookups → sync → escalation (never a send);
+4. marks for held symbols;
+5. `LossLimitMonitor.evaluate`;
+6. `broker.last_successful_sync` written only when the sync status is OK.
+
+`reconcile` adds `Reconciler.run` and `TradingGates.run_startup`. `resume` runs the
+`reconcile` sequence, then `resume_after_clean_reconciliation` (refusals audited as
+`RESUME_REFUSED`). `resolve-order`: preflight → one lookup → list scan → activity scan
+→ reconciliation → evidence-gated `confirm_absent`. `rebaseline propose/approve`:
+preflight → `Rebaseliner.propose/confirm` only (no separate sync cycle, so nothing else
+moves the evidence the proposal is bound to).
+
+**4. Safe initialization** (`init-ledger`). Target checks (no ledger or SQLite sidecar;
+the data directory may contain only `sim/`, the ledger lock file and `.gitkeep`) →
+exclusive lock → read-only evidence: account, configuration, clock, positions, open
+orders, a tail-confirmed 7-day activity window, both calendars, then account, positions
+and open orders again. Refused unless: environment `paper`; USD; not restricted; no
+pending fees; flat (no positions, no open orders) on both reads; activity history read
+to its end; cash unchanged between reads. Then the operator must confirm the exact
+target path, account id and environment (`CONFIRMATION_REQUIRED`, exit 3, nothing
+created, the required values are shown). The ledger is built under a temporary name —
+calendars (must be ACCEPTED), $5,000 virtual portfolio, recorded identity, INIT broker
+baseline (broker cash; equity = cash on a flat account) — in one transaction, then
+hard-linked into place (no-clobber) and verified. The INITIALIZED halt from database
+creation is kept. No other command creates a ledger (`Database.open` refuses a missing
+file).
+
+**5. Migration safety** (D14-5). `Database.open` reads the stored mode *before*
+migrating and refuses a mismatch; an observe ledger with pending migrations is always
+refused (`MigrationRequiredError`), as is any ledger opened with `auto_migrate=False`
+(all CLI opens). Simulation ledgers keep the earlier auto-migration when opened directly.
+`migrate --backup PATH` (exclusive lock): verify app id, mode, migration history (gaps,
+newer schema, checksum/name, `user_version`) and integrity → consistent online backup to
+a new 0600 file, verified from a fresh connection (`integrity_check`, app id, schema
+version, content digest over schema and every row) → all pending migrations in **one**
+transaction → reopen. A failure or a killed process leaves the original at its previous
+version (tested in-process and with `os._exit` mid-migration); an invalid backup aborts
+before any migration.
+
+**6. Concurrency** (D14-2). `<ledger>.lock` + `fcntl.flock`, non-blocking; exclusive for
+operations, shared for inspection and backup; taken before the database is opened or
+migrated and held until the command finishes. The kernel releases it when the process
+dies (tested with a spawned process killed while holding it). The JSON note in the lock
+file (pid, host, command) is diagnostic only; ownership is never read from it. Deviation
+from §10.1: one lock per ledger, not a single `data/bot.lock`, so simulations never block
+the observe ledger.
+
+**7. Exit codes** (`app/exit_codes.py`). 0 OK, 1 internal error or failed scenario,
+2 usage, 3 refused, 4 persistent halt raised in this run, MISMATCH or account mismatch,
+5 INCONCLUSIVE / incomplete sync, 6 lock held, 7 configuration (incl. no broker access),
+8 broker unavailable, 9 ledger (missing, mode, integrity, migration, backup).
+Precedence: 1 > 2 > 6 > 7 > 9 > 4 > 8 > 5 > 3 > 0. Inspection commands return 0 while
+reporting a halt; `sync` returns 0 when it completed even if a pre-existing halt is still
+set; INCONCLUSIVE and MISMATCH are never 0. `--json` gives a stable envelope (`command`,
+`command_id`, `exit_code`, `exit_meaning`, `hypothetical`, `result`); logs are redacted
+JSON on stderr carrying the `command_id`.
+
+**8. Simulation isolation** (D14-3, D14-4). `simulate SCENARIO|all [--run-id]` creates a
+new ledger under `<data>/sim/` and runs one scripted scenario in one process against an
+in-memory SimBroker with a synthetic weekday calendar (source `sim:synthetic-weekdays`).
+`CalendarStore` rejects every calendar source except `alpaca` for observe ledgers, so
+synthetic calendars can never become observe evidence. Observe loss baselines accept
+`OFFICIAL` closes only (D14-8). `app/simulation.py` is the only `app/` module that
+constructs `SimulationExecution`/`OrderManager` (AST test) and is imported lazily by
+`simulate` only. All simulation output and inspection of simulation ledgers is labelled
+hypothetical. Scenario proposals are fixed and scripted (no signal logic);
+`TRADING_ENABLED` is set only inside the simulation wiring. Scenarios: `happy-path`,
+`partial-cancel`, `ambiguous-adopt`, `never-received` (operator absence confirmation at
++26 min), `restart-recovery` (crash after submit, restart, adoption),
+`unexplained-deposit` (MISMATCH → refused resume → rebaseline → resume).
+
+**9. Idempotency.** Verified on economic effects, not the whole-ledger fingerprint:
+repeated sync/reconcile with unchanged broker evidence never duplicates fills, fee
+bookings, cash entries or activities and never changes reservations, positions, order
+state or order events, while reconciliation runs are appended and outcomes repeat.
+Existing step 13 behaviour, now documented: every MISMATCH run re-records its halt (a
+`halt_events` row referencing that run); the halt state itself is unchanged.
+
+**10. Deviations and decisions.**
+1. Per-ledger lock files (above).
+2. `migrate` was added to the §4.1 command list; `portfolio`, `orders`, `halts` and
+   `audit` were added as read-only inspection commands.
+3. `adjust` is not implemented (D14-9, §12.19 ¶4).
+4. `status --broker` evaluates gates read-only and never writes; it does not run
+   preflight (which can halt).
+5. A preflight identity mismatch halts `RECON_ACCOUNT` before ingestion (the reconciler
+   reports the same as a MISMATCH, but only after a sync would have ingested the other
+   account's activities).
+6. *(Superseded by §12.21: the §10.5 broker-outage circuit breaker is implemented
+   with the approved policy.)*
+
+### 12.21 Step 14.1: broker-outage circuit breaker (as built)
+
+Implements §10.5 "repeated failures → … escalate to persistent halt after a configurable
+outage duration" with the approved policy. Supersedes §12.20 ¶10.6. Code:
+`ledger/broker_outage.py` (state, policy, persistence, escalation),
+`oms/lifecycle.read_error_outage_category` (classification, next to `read_error_halt`),
+`app/runtime.RecordingBroker` and `sync_cycle` (integration), `risk/gates.py`
+(`BROKER_OUTAGE_ACTIVE`), `config/risk.yaml` → `broker_outage` (policy values; not a
+trading limit). **No migration.**
+
+**1. Policy** (`OutagePolicy`; `risk.yaml` `broker_outage`). The persistent halt
+`BROKER_OUTAGE` (existing reason) is raised only when **all** hold for the current
+streak: ≥ 3 *counted* failed sync cycles; ≥ 30 min from the first failure to the latest
+counted failure; counted cycles ≥ 60 s apart (a failure < 60 s after the last counted
+cycle updates `last_failed_at` but is not counted). Boundaries are inclusive (exactly
+30:00 and exactly 60 s qualify). Only counted failures advance escalation, so one
+failure followed by any amount of silence never escalates.
+
+**2. What counts.** A sync cycle (`sync`, `reconcile`, `resume`) is *failed* when any
+broker read in it raised a qualifying error: `ServiceUnavailableError` (network →
+`NETWORK`, timeout → `TIMEOUT`, 5xx → `SERVER_ERROR`, otherwise `UNAVAILABLE`),
+`RateLimitedError` (`RATE_LIMITED`), or an `IncompleteRetrievalError` caused by one.
+`ServiceUnavailableError` gained a `kind` tag set by the transport, so categories need no
+message parsing. Never counted: anything `read_error_halt` maps to a dedicated halt
+(auth, unmapped status, malformed payload), lookups that found nothing, other request
+errors, identity mismatches, ledger, reconciliation and operator outcomes — those keep
+their existing behaviour. All services in the runtime read through one
+`RecordingBroker`, which remembers every escaped broker error during the cycle (after
+the adapter's own bounded retries); the cycle is recorded **once**, with the first
+qualifying category, however many requests failed.
+
+**3. Durable state.** `sync_state['broker.outage']`, JSON with UTC timestamps:
+`active`, and for the streak `first_failed_at`, `last_failed_at`, `last_counted_at`,
+`counted_cycles`, `category` (latest), `categories` (all seen), `escalated_at`. A cycle
+is identified by its start time from the injected clock; a report not later than
+`last_failed_at` is a duplicate and changes nothing. Process restarts read the same
+row; nothing depends on uptime or in-memory counters.
+
+**4. Escalation and reset.**
+* Escalation writes the halt (actor `outage_breaker`, detail lists cycles, span and
+  categories, and any prior halt) and `escalated_at` in **one** transaction; later
+  checks of the same streak never write another halt event.
+* A cycle that is *complete* — preflight OK, sync OK, calendar refresh and marks without
+  error, no qualifying failure — and later than the last failure resets the streak (the
+  old streak is kept under `previous`). A reset never clears a halt.
+* Any other cycle (partial, auth, identity, payload, …) leaves the streak unchanged
+  (`UNCHANGED`).
+* New entries are blocked at once: an active streak is a TRANSIENT gate finding
+  `BROKER_OUTAGE_ACTIVE`, independent of the 120 s sync-age rule; live broker failures
+  also block through `BROKER_UNAVAILABLE`.
+* Recovery from `BROKER_OUTAGE` is the existing workflow only: fresh broker evidence, a
+  CLEAN reconciliation and an explicit `resume`.
+
+**5. Exit codes.** A cycle with a qualifying failure exits 8; one that escalates exits 4;
+a cycle that ran but did not complete (e.g. calendar refresh failed) now exits 5 instead
+of 0 (correction to §12.20 ¶7).
+
+**6. Scope and deviations.**
+1. The breaker observes sync cycles only. `resolve-order` and `rebaseline` run preflight
+   without a sync cycle; their broker failures exit 8 but are not counted.
+2. Policy values live in `risk.yaml` (as §10.5's "configurable" asks) under a section
+   that is explicitly not a trading risk limit; the model defaults equal the approved
+   values.
+3. `BROKER_OUTAGE_ACTIVE` does not block risk-reducing exits by itself (live broker
+   failures already do, via `EXIT_BLOCKING`); exits do not exist in M1.
+
 ---
 
 ## 13. Configuration & secrets
@@ -2021,4 +2245,6 @@ not attempt to fix it by rebaselining or by editing the ledger.
 Strategy/signals, scheduler, websocket stream, Alpaca execution adapter, TradePlan /
 RTH-01 implementation, protective stops and exits, cancel-on-halt, corporate actions
 (splits, mergers — they surface as reconciliation mismatches and halt), notifications,
-dashboards. Fees and cash dividends on ledger positions *are* booked in M1 (tx C).
+dashboards. Fees attributable to bot orders are booked in M1 (tx C). Cash dividends are
+**not** booked: every DIV is preserved as UNEXPLAINED until entitlement can be verified
+(§12.19).

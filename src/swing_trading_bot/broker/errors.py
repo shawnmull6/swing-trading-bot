@@ -90,9 +90,19 @@ class RateLimitedError(BrokerError):
 
 class ServiceUnavailableError(BrokerError):
     """A read failed transiently (timeout, connection error, 5xx). Retryable for reads
-    only; a transport failure on submit is AmbiguousSubmissionError."""
+    only; a transport failure on submit is AmbiguousSubmissionError.
+
+    ``kind`` says which transport condition it was (``timeout``, ``network``,
+    ``http`` for a 5xx, or ``unavailable`` when unspecified); the broker-outage circuit
+    breaker records it as the failure category."""
 
     read_retryable = True
+
+    def __init__(
+        self, message: str, *, status_code: int | None = None, kind: str = "unavailable"
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.kind = "http" if status_code is not None and status_code >= 500 else kind
 
 
 class BrokerRequestError(BrokerError):

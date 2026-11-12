@@ -1,0 +1,197 @@
+"""A stateful, offline Alpaca paper account behind the REAL ``AlpacaPaperReadAdapter``.
+
+Only the HTTP transport is fake (``FakeTransport``: GET-only, no sockets). The account
+holds cash, positions, open orders, posted activities and prices, and answers the
+read endpoints the adapter uses from that state, so the CLI runs end to end offline.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from typing import Any
+
+from swing_trading_bot.broker.alpaca_read import AlpacaPaperReadAdapter
+from swing_trading_bot.broker.errors import BrokerError, OrderNotFoundError
+from swing_trading_bot.domain.calendar import MARKET_TZ
+from tests.support.alpaca_fake import ACCOUNT, CONFIG, FakeTransport
+from tests.support.calendar_fixture import fixture_sessions, fixture_settlement_days
+
+# Monday 2026-11-09 10:00 ET, inside a regular session of the fixture calendar.
+START = datetime(2026, 11, 9, 15, 0, tzinfo=UTC)
+ACCOUNT_ID = "paper-acct-0001"
+READ_PATHS = frozenset(
+    {
+        "/account",
+        "/account/configurations",
+        "/clock",
+        "/calendar",
+        "/positions",
+        "/orders",
+        "/orders:by_client_order_id",
+        "/account/activities",
+        "/stocks/trades/latest",
+    }
+)
+
+
+class Clock:
+    def __init__(self, now: datetime = START) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kw: float) -> datetime:
+        self.now += timedelta(**kw)
+        return self.now
+
+
+def _parse(params: Mapping[str, str], key: str) -> datetime | None:
+    raw = params.get(key)
+    return None if raw is None else datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+
+@dataclass
+class FakeAlpacaAccount:
+    clock: Clock = field(default_factory=Clock)
+    account_id: str = ACCOUNT_ID
+    cash: Decimal = Decimal("100000.00")
+    account_overrides: dict[str, Any] = field(default_factory=dict)
+    positions: list[dict[str, Any]] = field(default_factory=list)
+    open_orders: list[dict[str, Any]] = field(default_factory=list)
+    activities: list[tuple[datetime, dict[str, Any]]] = field(default_factory=list)
+    prices: dict[str, Decimal] = field(default_factory=dict)
+    failures: dict[str, list[BrokerError]] = field(default_factory=dict)
+    down: dict[str, Callable[[], BrokerError]] = field(default_factory=dict)
+    """Paths that fail on every request until removed ("*" = every path)."""
+    transport: FakeTransport = field(default_factory=FakeTransport)
+    _seq: int = 0
+
+    def __post_init__(self) -> None:
+        routes = {
+            "/account": self._account,
+            "/account/configurations": lambda _p: dict(CONFIG),
+            "/clock": self._clock,
+            "/calendar": self._calendar,
+            "/positions": lambda _p: list(self.positions),
+            "/orders": self._orders,
+            "/orders:by_client_order_id": self._by_client_id,
+            "/account/activities": self._activities,
+        }
+        for path, handler in routes.items():
+            self.transport.always("trading", path, self._guard(path, handler))
+        self.transport.always(
+            "data", "/stocks/trades/latest", self._guard("/stocks/trades/latest", self._trades)
+        )
+
+    # ---------------------------------------------------------------- control
+    def adapter(self) -> AlpacaPaperReadAdapter:
+        return AlpacaPaperReadAdapter(self.transport, clock=self.clock, sleep=lambda _d: None)
+
+    def fail(self, path: str, *errors: BrokerError) -> None:
+        self.failures.setdefault(path, []).extend(errors)
+
+    def deposit(self, amount: str, kind: str = "CSD") -> str:
+        """An external cash movement posted now (not the bot's)."""
+        self.cash += Decimal(amount)
+        return self.post(
+            {"activity_type": kind, "date": self.clock.now.astimezone(MARKET_TZ).date().isoformat(),
+             "net_amount": amount, "description": kind, "status": "executed"}
+        )  # fmt: skip
+
+    def post(self, row: dict[str, Any]) -> str:
+        self._seq += 1
+        aid = f"{self.clock.now:%Y%m%d%H%M%S%f}::{self._seq:08d}"
+        self.activities.append((self.clock.now, {"id": aid, **row}))
+        return aid
+
+    def paths_called(self) -> set[str]:
+        return {path for _service, path, _params in self.transport.calls}
+
+    # ---------------------------------------------------------------- handlers
+    def _guard(self, path: str, handler: Any) -> Any:
+        def run(params: Mapping[str, str]) -> object:
+            queue = self.failures.get(path)
+            if queue:
+                raise queue.pop(0)
+            outage = self.down.get(path) or self.down.get("*")
+            if outage is not None:
+                raise outage()
+            return json.dumps(handler(params))
+
+        return run
+
+    def _account(self, _p: Mapping[str, str]) -> dict[str, Any]:
+        return {
+            **ACCOUNT,
+            "id": self.account_id,
+            "cash": str(self.cash),
+            "non_marginable_buying_power": str(self.cash),
+            "equity": str(self.cash),
+            "pending_reg_taf_fees": "0",
+            **self.account_overrides,
+        }
+
+    def _clock(self, _p: Mapping[str, str]) -> dict[str, Any]:
+        local = self.clock.now.astimezone(MARKET_TZ)
+        day = local.date()
+        return {
+            "timestamp": local.isoformat(),
+            "is_open": 9 * 60 + 30 <= local.hour * 60 + local.minute < 16 * 60
+            and day.weekday() < 5,
+            "next_open": datetime.combine(day + timedelta(days=1), datetime.min.time(),
+                                          tzinfo=MARKET_TZ).replace(hour=9, minute=30).isoformat(),
+            "next_close": local.replace(hour=16, minute=0, second=0, microsecond=0).isoformat(),
+        }  # fmt: skip
+
+    def _calendar(self, p: Mapping[str, str]) -> list[dict[str, Any]]:
+        start, end = date.fromisoformat(p["start"]), date.fromisoformat(p["end"])
+        if p["date_type"] == "SETTLEMENT":
+            return [{"date": d.isoformat()} for d in fixture_settlement_days(start, end)]
+        return [
+            {
+                "date": s.session_date.isoformat(),
+                "open": s.open_at.astimezone(MARKET_TZ).strftime("%H:%M"),
+                "close": s.close_at.astimezone(MARKET_TZ).strftime("%H:%M"),
+                "settlement_date": None
+                if s.settlement_date is None
+                else s.settlement_date.isoformat(),
+            }
+            for s in fixture_sessions(start, end)
+        ]
+
+    def _orders(self, p: Mapping[str, str]) -> list[dict[str, Any]]:
+        return list(self.open_orders) if p["status"] in {"open", "all"} else []
+
+    def _by_client_id(self, p: Mapping[str, str]) -> dict[str, Any]:
+        coid = p["client_order_id"]
+        for o in self.open_orders:
+            if o["client_order_id"] == coid:
+                return o
+        raise OrderNotFoundError("not found", status_code=404)
+
+    def _activities(self, p: Mapping[str, str]) -> list[dict[str, Any]]:
+        after, until = _parse(p, "after"), _parse(p, "until")
+        token, size = p.get("page_token"), int(p["page_size"])
+        rows = [
+            row
+            for posted, row in sorted(self.activities, key=lambda x: x[1]["id"])
+            if (after is None or posted > after)
+            and (until is None or posted <= until)
+            and (token is None or row["id"] > token)
+        ]
+        return rows[:size]
+
+    def _trades(self, p: Mapping[str, str]) -> dict[str, Any]:
+        wanted = p["symbols"].split(",")
+        return {
+            "trades": {
+                s: {"p": float(self.prices[s]), "t": self.clock.now.isoformat()}
+                for s in wanted
+                if s in self.prices
+            }
+        }

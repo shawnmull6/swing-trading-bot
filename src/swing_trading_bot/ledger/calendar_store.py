@@ -21,6 +21,7 @@ import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import StrEnum
+from typing import Final
 
 from swing_trading_bot.domain.calendar import (
     CalendarData,
@@ -41,6 +42,15 @@ from swing_trading_bot.ledger.codec import (
     ts_to_db,
 )
 from swing_trading_bot.ledger.db import Session, Tx
+
+AUTHORITATIVE_CALENDAR_SOURCES: Final = frozenset({"alpaca"})
+"""Calendar providers accepted by account-backed (observe) ledgers. Any other source
+(``sim``, synthetic fixtures) is recorded as REJECTED there and never becomes coverage."""
+
+
+def _ledger_mode(s: Session) -> str | None:
+    row = s.fetch_one("SELECT mode FROM database_identity WHERE id = 1")
+    return None if row is None else str(row[0])
 
 
 class FetchStatus(StrEnum):
@@ -110,6 +120,16 @@ class CalendarStore:
     def record_fetch(self, tx: Tx, fetch: CalendarFetch) -> FetchResult:
         current = self.load(tx)
         problems = list(fetch.problems())
+        if (
+            not problems
+            and _ledger_mode(tx) != "simulate"
+            and (fetch.source not in AUTHORITATIVE_CALENDAR_SOURCES)
+        ):
+            # Synthetic / simulated calendars are evidence only inside simulation ledgers.
+            problems.append(
+                f"calendar source {fetch.source!r} is not authoritative for an account-backed "
+                "ledger"
+            )
         if not problems:
             problems.extend(current.conflicts_with(fetch))
         if not problems:

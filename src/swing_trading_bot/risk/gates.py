@@ -46,6 +46,7 @@ from swing_trading_bot.domain.enums import ActivityAttribution, OrderStatus, Run
 from swing_trading_bot.ledger.accounting_invariants import accounting_checker
 from swing_trading_bot.ledger.acknowledgements import ACKNOWLEDGED_ACTIVITY_SQL
 from swing_trading_bot.ledger.activity_coverage import complete_through
+from swing_trading_bot.ledger.broker_outage import load_streak
 from swing_trading_bot.ledger.calendar_store import CalendarStore
 from swing_trading_bot.ledger.codec import ts_from_db
 from swing_trading_bot.ledger.db import Database, Session, assert_no_transaction
@@ -110,6 +111,7 @@ class GateReason(StrEnum):
     BROKER_ACCOUNT_RESTRICTED = "BROKER_ACCOUNT_RESTRICTED"
     MARKET_CLOSED = "MARKET_CLOSED"
     BROKER_SYNC_STALE = "BROKER_SYNC_STALE"
+    BROKER_OUTAGE_ACTIVE = "BROKER_OUTAGE_ACTIVE"
     ACTIVITY_COVERAGE_INCOMPLETE = "ACTIVITY_COVERAGE_INCOMPLETE"
     RECONCILIATION_STALE = "RECONCILIATION_STALE"
     RECONCILIATION_INCONCLUSIVE = "RECONCILIATION_INCONCLUSIVE"
@@ -560,6 +562,18 @@ class TradingGates:
         tr = GateLayer.TRANSIENT
         c = self._config
         out: list[GateFinding] = []
+        streak = load_streak(s)
+        if streak is not None:
+            # A failed sync cycle blocks new entries at once, before any escalation and
+            # regardless of how recent the last successful sync was (§12.21).
+            out.append(
+                GateFinding(
+                    tr,
+                    GateReason.BROKER_OUTAGE_ACTIVE,
+                    f"{streak.counted_cycles} failed sync cycle(s) since "
+                    f"{streak.first_failed_at.isoformat()} ({streak.category})",
+                )
+            )
         last_sync = SyncStateRepository().get(s, LAST_SUCCESSFUL_SYNC)
         if last_sync is None or now - ts_from_db(last_sync) > c.max_sync_age:
             out.append(
