@@ -91,6 +91,11 @@ class BrokerActivity:
     leaves_qty: Decimal | None = None
     order_status: str | None = None
     fill_type: str | None = None
+    description: str | None = None
+    per_share_amount: Decimal | None = None
+    """Non-trade activities: Alpaca may send ``order_id`` (fees), ``qty`` and
+    ``per_share_amount`` (dividends) and a free-text ``description``. Their presence on
+    real paper-account FEE/DIV activities is a pre-M2 contract-test item (§12.18)."""
 
     @property
     def is_fill(self) -> bool:

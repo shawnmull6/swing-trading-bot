@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -10,7 +11,12 @@ from typing import Any
 
 import pytest
 
-from swing_trading_bot.broker.activity_feed import collect_window, merge_activities
+from swing_trading_bot.broker.activity_feed import (
+    DEFAULT_RESCAN_POLICY,
+    collect_window,
+    merge_activities,
+    rescans_due,
+)
 from swing_trading_bot.broker.errors import IncompleteRetrievalError, ServiceUnavailableError
 from swing_trading_bot.broker.models import ActivityPage, BrokerActivity, SubmitOrderRequest
 from swing_trading_bot.broker.sim import SimBroker, SimClock, SimConfig
@@ -137,3 +143,73 @@ def test_coverage_marker_moves_only_forward_for_complete_contiguous_windows(db: 
     assert advance(T0 - 5 * MIN, T0 + 10 * MIN, complete=True)  # overlapping: moves
     with db.read() as s:
         assert complete_through(s) == T0 + 10 * MIN
+
+
+# --------------------------- posting lag is an assumption, not a guarantee (step 10 fix)
+
+
+def test_post_beyond_the_lag_is_missed_until_a_historical_rescan(db: Database) -> None:
+    """A fill executed at T0+1m but posted 40 minutes later (beyond the assumed 15-minute
+    lag) falls inside a window already marked complete. Forward windows never see it;
+    only a historical re-scan that reaches back over it does."""
+    sim, clock = sim_with_fills(timedelta(minutes=40))
+    seen: dict[str, BrokerActivity] = {}
+
+    clock.advance_to(T0 + 20 * MIN)
+    w1 = collect_window(sim, after=None, until=T0 + 5 * MIN, now=clock.now(), posting_lag=LAG)
+    assert w1.complete and w1.activities == ()  # "complete" -- but the fill is not posted yet
+    with db.transaction() as tx:
+        assert advance_coverage(tx, after=w1.after, until=w1.until, complete=w1.complete,
+                                at=clock.now())  # fmt: skip
+    clock.advance_to(T0 + 60 * MIN)  # the fill has now been posted
+    w2 = collect_window(sim, after=w1.until, until=T0 + 45 * MIN, now=clock.now(),
+                        posting_lag=LAG)  # fmt: skip
+    seen.update((a.activity_id, a) for a in (*w1.activities, *w2.activities))
+    assert w2.complete and seen == {}  # forward progress alone misses it
+
+    windows = rescans_due(DEFAULT_RESCAN_POLICY, now=clock.now(),
+                          complete_through=w2.until, last_periodic_rescan=None,
+                          baseline_at=None)  # fmt: skip
+    assert [w.kind for w in windows] == ["OVERLAP", "PERIODIC"]
+    for planned in windows:
+        found = collect_window(sim, after=planned.after, until=planned.until, now=clock.now(),
+                               posting_lag=LAG)  # fmt: skip
+        seen.update((a.activity_id, a) for a in found.activities)
+    assert len(seen) == 1  # found only by re-reading history
+
+
+def test_overlap_shorter_than_the_delay_still_misses_it() -> None:
+    sim, clock = sim_with_fills(timedelta(hours=3))  # posted 3 hours late
+    clock.advance_to(T0 + 4 * timedelta(hours=1))
+    overlap_only = collect_window(
+        sim,
+        after=T0 + timedelta(hours=2),
+        until=clock.now() - LAG,
+        now=clock.now(),
+        posting_lag=LAG,
+    )
+    assert overlap_only.activities == ()
+    longer = collect_window(sim, after=T0 - timedelta(days=1), until=clock.now() - LAG,
+                            now=clock.now(), posting_lag=LAG)  # fmt: skip
+    assert len(longer.activities) == 1
+
+
+def test_rescan_policy_validation_and_planning() -> None:
+    p = DEFAULT_RESCAN_POLICY
+    assert p.overlap >= p.posting_lag and p.periodic_lookback > p.overlap
+    with pytest.raises(ValueError, match="overlap"):
+        replace(p, overlap=timedelta(minutes=5))
+    with pytest.raises(ValueError, match="further back"):
+        replace(p, periodic_lookback=timedelta(minutes=30))
+    with pytest.raises(ValueError, match="periodic_every"):
+        replace(p, periodic_every=timedelta(0))
+    now = T0 + timedelta(hours=2)
+    recent = rescans_due(
+        p, now=now, complete_through=now - LAG,
+        last_periodic_rescan=now - timedelta(hours=1), baseline_at=None,
+    )  # fmt: skip
+    assert [w.kind for w in recent] == ["OVERLAP"]  # periodic not due yet
+    full = rescans_due(p, now=now, complete_through=None, last_periodic_rescan=now,
+                       baseline_at=T0 - timedelta(days=30), reconciling=True)  # fmt: skip
+    assert [(w.kind, w.after) for w in full] == [("FULL_HISTORY", T0 - timedelta(days=30))]
+    assert all(w.until == now - p.posting_lag for w in full)

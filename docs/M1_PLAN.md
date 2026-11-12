@@ -1,9 +1,12 @@
 # Milestone M1 — Core Infrastructure & Portfolio Accounting
 
-Status: **Revision 3 — architecture approved; all decisions final. Steps 1–9 approved
-(step 9 with integration refinements, §12.11); step 10 (startup readiness & trading gates)
-implemented and awaiting review (§12.12). Live read-only contract checks not run.
-No order submission; no commits until reviewed.**
+Status: **Revision 3 — architecture approved; all decisions final. Steps 1–12 approved
+(step 12 final safety checks resolved, §12.16); step 13 (broker reconciliation, §12.17)
+conditionally approved; step 13.1 (reconciliation hardening, §12.18) conditionally
+approved; step 13.2 (rebaseline accounting corrections: unverified dividends unresolved,
+event-specific acknowledgements, corrected cash equation) implemented and awaiting review
+(§12.19). Position adjustments are not implemented (operational limitation). Live read-only
+contract checks not run. No Alpaca order submission; no commits until reviewed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

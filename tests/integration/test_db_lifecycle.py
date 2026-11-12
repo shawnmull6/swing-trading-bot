@@ -60,6 +60,9 @@ EXPECTED_TABLES = {
     "halt_events",
     "sync_state",
     "reconciliation_runs",
+    "reconciliation_findings",
+    "rebaseline_events",
+    "rebaseline_acknowledgements",
 }
 
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final
 
@@ -43,6 +44,7 @@ from swing_trading_bot.broker.ports import BrokerReadPort
 from swing_trading_bot.domain.calendar import CalendarError
 from swing_trading_bot.domain.enums import ActivityAttribution, OrderStatus, RuntimeMode
 from swing_trading_bot.ledger.accounting_invariants import accounting_checker
+from swing_trading_bot.ledger.acknowledgements import ACKNOWLEDGED_ACTIVITY_SQL
 from swing_trading_bot.ledger.activity_coverage import complete_through
 from swing_trading_bot.ledger.calendar_store import CalendarStore
 from swing_trading_bot.ledger.codec import ts_from_db
@@ -116,6 +118,7 @@ class GateReason(StrEnum):
     CALENDAR_COVERAGE_INSUFFICIENT = "CALENDAR_COVERAGE_INSUFFICIENT"
     UNRESOLVED_ORDERS = "UNRESOLVED_ORDERS"
     UNEXPLAINED_ACTIVITY = "UNEXPLAINED_ACTIVITY"
+    UNBOOKED_FILLS = "UNBOOKED_FILLS"
     MARKS_STALE_OR_MISSING = "MARKS_STALE_OR_MISSING"
     UNRESOLVED_SETTLEMENT = "UNRESOLVED_SETTLEMENT"
     NEGATIVE_AVAILABLE_CASH = "NEGATIVE_AVAILABLE_CASH"
@@ -641,8 +644,25 @@ class TradingGates:
                     tr, GateReason.UNRESOLVED_ORDERS, "; ".join(f"{r[0]}={r[1]}" for r in rows)
                 )
             )
+        unbooked = s.fetch_all(
+            "SELECT client_order_id, broker_filled_qty, filled_qty FROM orders "
+            "WHERE broker_filled_qty IS NOT NULL ORDER BY client_order_id"
+        )
+        pending = [r for r in unbooked if Decimal(str(r[1])) > Decimal(str(r[2]))]
+        if pending:
+            out.append(
+                GateFinding(
+                    tr,
+                    GateReason.UNBOOKED_FILLS,
+                    "; ".join(f"{r[0]}: broker {r[1]} booked {r[2]}" for r in pending),
+                )
+            )
+        # Unexplained activities block entries until resolved. Only events acknowledged
+        # one by one by an approved rebaseline (unchanged payload) stop blocking; a newly
+        # discovered event blocks whatever its timestamp (§12.19).
         unexplained = s.fetch_all(
-            "SELECT activity_id FROM broker_activities WHERE attribution = ? ORDER BY activity_id",
+            "SELECT activity_id FROM broker_activities WHERE attribution = ? "  # noqa: S608
+            f"AND NOT {ACKNOWLEDGED_ACTIVITY_SQL} ORDER BY activity_id",
             [ActivityAttribution.UNEXPLAINED.value],
         )
         if unexplained:

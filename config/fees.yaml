@@ -1,0 +1,7 @@
+# Fee ESTIMATES for pre-trade sizing (M1 step 11). Not risk parameters; actual fees are
+# booked from broker activities. Quote every decimal. Each component rounds up to $0.01.
+buy_per_order: "0"            # Alpaca equities: commission-free
+buy_per_share: "0"
+sell_taf_per_share: "0.000166"   # FINRA Trading Activity Fee (estimate)
+sell_taf_max_per_order: "8.30"
+sell_sec_per_notional: "0.0000278"  # SEC Section 31 fee per $ sold (estimate)

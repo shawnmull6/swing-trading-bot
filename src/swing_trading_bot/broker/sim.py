@@ -304,15 +304,32 @@ class SimBroker:
 
     def schedule_cash_activity(
         self,
-        activity_type: Literal["FEE", "DIV"],
+        activity_type: Literal["FEE", "DIV", "INT", "CSD", "CSW", "JNLC"],
         amount: Decimal,
         *,
         symbol: str | None = None,
         after: timedelta = timedelta(0),
         activity_delay: timedelta | None = None,
+        order_client_id: str | None = None,
+        qty: Decimal | None = None,
+        per_share_amount: Decimal | None = None,
+        description: str | None = None,
     ) -> None:
+        """``order_client_id`` makes the activity reference that order's broker id
+        (``order_id``), as Alpaca fee activities may."""
         delay = self.config.activity_delay if activity_delay is None else activity_delay
-        self._schedule(after, lambda: self._cash_activity(activity_type, amount, symbol, delay))
+        extra: Raw = {}
+        if order_client_id is not None:
+            extra["order_id"] = self._order_for_script(order_client_id).broker_id
+        if qty is not None:
+            extra["qty"] = _num(qty)
+        if per_share_amount is not None:
+            extra["per_share_amount"] = _num(per_share_amount)
+        if description is not None:
+            extra["description"] = description
+        self._schedule(
+            after, lambda: self._cash_activity(activity_type, amount, symbol, delay, extra)
+        )
 
     # =========================================================== read port
     def get_account(self) -> AccountSnapshot:
@@ -683,10 +700,23 @@ class SimBroker:
         self._finish(broker_id, "rejected")
 
     def _cash_activity(
-        self, activity_type: str, amount: Decimal, symbol: str | None, delay: timedelta
+        self,
+        activity_type: str,
+        amount: Decimal,
+        symbol: str | None,
+        delay: timedelta,
+        extra: Raw | None = None,
     ) -> None:
         now = self._at()
-        self._cash += amount
+        # A non-trade cash movement affects the reported cash balance when it POSTS (an
+        # account with a delayed posting shows neither the activity nor the cash yet).
+        # Fills differ: cash moves at execution while the FILL activity may lag; that
+        # gap is visible through the order's filled_qty.
+        if delay <= timedelta(0):
+            self._cash += amount
+        else:
+            post = _Event(now + delay, next(self._seq), lambda: self._post_cash(amount))
+            heapq.heappush(self._events, post)
         raw: Raw = {
             "id": self._activity_id(now),
             "activity_type": activity_type,
@@ -697,8 +727,12 @@ class SimBroker:
         }
         if symbol is not None:
             raw["symbol"] = symbol
+        raw.update(extra or {})
         self._activities.append(_Activity(raw, now + delay, now))
         self._log(f"{activity_type} {amount}")
+
+    def _post_cash(self, amount: Decimal) -> None:
+        self._cash += amount
 
     def _activity_id(self, at: datetime) -> str:
         return f"{at.astimezone(UTC):%Y%m%d%H%M%S%f}::{UUID(int=next(self._seq))}"

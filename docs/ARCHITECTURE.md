@@ -84,7 +84,9 @@ src/swing_trading_bot/
     resilience.py      # backoff for reads, circuit breaker, SDK-retry awareness
   ledger/      db.py, migrations/0001_init.sql, repository.py, portfolio.py, invariants.py
   risk/        pretrade.py, exposure.py, loss_limits.py, gates.py (startup gate, blocks, halts)
-  oms/         order_manager.py, recovery.py, sync.py, reconciler.py
+  oms/         order_manager.py, execution.py, lifecycle.py, sync.py, recovery.py (step 12);
+               classify.py, reconciler.py (step 13); rebaseline.py (step 13.1)
+  ledger/      … baselines.py, acknowledgements.py (steps 13-13.2)
   observability/ logging.py (JSON + secret redaction)
   app/         runtime.py (lock, startup sequence), cli.py
 ```
@@ -1349,6 +1351,659 @@ change.
   * Weekly-limit and daily-lockout blocks come from the loss monitor, so a resume can
     never bypass them.
   * Observe mode always blocks new entries (`RUNTIME_MODE_NO_EXECUTION`).
+
+### 12.13 Step 10 refinements: activity re-scans and exit readiness (as built)
+
+* **Posting lag is an assumption.** A window that is `complete` (confirmed tail and
+  `until <= now - posting_lag`) is complete *operationally*. The 15-minute lag is
+  unverified. If an activity is posted later than the lag with an earlier timestamp,
+  it lands in a window already marked complete, and forward windows never see it.
+  The durable marker `activities.complete_through` is kept; it is never treated as a
+  permanent guarantee.
+* **Re-scan policy** (`broker/activity_feed.py`):
+  * `RescanPolicy(posting_lag, overlap, periodic_lookback, periodic_every,
+    full_history)` is validated: overlap must be at least the lag, and the periodic
+    lookback must reach further back than the overlap.
+  * The default is a 15-minute lag, a 1-hour overlap, and a 7-day lookback run daily.
+  * `rescans_due(...)` is pure planning. It returns:
+    * OVERLAP, from `complete_through - overlap`;
+    * PERIODIC, when one is due;
+    * FULL_HISTORY, since the active baseline, while reconciling.
+
+    Every window ends at `now - posting_lag`.
+  * Re-scans never move the marker backwards. Activities they find that are older
+    than the marker are ingested idempotently and flagged as late.
+  * Tests show that an activity posted 40 minutes late is missed by forward windows
+    and found only by a historical re-scan. They also show that an overlap shorter
+    than the delay still misses it.
+  * Step 13 reconciliation is not implemented here.
+* **Exit readiness** (`risk/exits.py`) is read-only and separate from entry gating.
+  `ExitReadinessAssessor.assess(symbol)` reads the broker (account, positions, open
+  orders) outside any transaction, then reads one ledger snapshot.
+  * *Entry-only restrictions* are reported but never make an exit unsafe: a
+    persistent halt, a daily lockout, the weekly limit, `TRADING_DISABLED`, and the
+    other loss blockers.
+  * *Fundamental failures* make an exit unsafe:
+    * the broker is unreachable, fails authentication, or returns invalid data;
+    * the account identity is unverified or mismatched, the environment is wrong,
+      or the account is restricted;
+    * ledger integrity or invariant failures;
+    * no ledger position, no broker position, or a quantity mismatch (missing
+      evidence is never "safe");
+    * unresolved local orders for the symbol (working, ambiguous or orphaned), or
+      any open broker order for it.
+  * `execution_available` is always False. Exit execution does not exist in M1.
+
+### 12.14 Step 11: pre-trade risk checks (as built)
+
+`risk/pretrade.py` holds the engine. `domain/fees.py`, `config/fees.py` and
+`config/fees.yaml` hold the fee estimates. `ledger/state_fingerprint.py` holds the
+ledger fingerprint. Nothing here writes, reserves, or submits.
+
+* **Model.** `TradeProposal`:
+  * intent key, symbol, side, order type, time in force;
+  * entry (limit) and stop prices, instrument type, the extended-hours flag;
+  * an optional `requested_qty` (None means "the maximum permitted").
+
+  `PreTradeRiskEngine.evaluate(proposal, gate=, account=, now=)` returns a
+  `RiskDecision`:
+  * `approved`, `approved_qty` (whole shares), `reservation`, `planned_risk`;
+  * sorted `rejections`, each a `RejectionCode` plus detail;
+  * `sizing` (a `SizingPreview`), `evidence` (a `RiskEvidence`), `valid_until`;
+  * a deterministic `decision_id`.
+
+  `preview(...)` returns only the `SizingPreview`: the maximum quantity, every
+  `ConstraintCap` (max_qty, limit, used), and the `binding` constraints.
+* **Sizing.** Each constraint is a monotone cap on whole shares, using E = current
+  virtual equity and B = the gap-stress denominator (baseline equity):
+
+  | Constraint | Condition on q |
+  |---|---|
+  | RISK_BUDGET | q(entry−stop) + buy fee + est. exit fee at stop ≤ 0.5% E |
+  | POSITION_CONCENTRATION | held market value + pending commitment for symbol + q·entry ≤ 20% E |
+  | ORDER_COMMITMENT | reserve(q) = ⌈q·entry + buy fee⌉ ≤ $1,000 |
+  | CAPITAL_CEILING | reserve(q) ≤ $5,000 − (open cost basis + active buy commitments) |
+  | AVAILABLE_CASH | reserve(q) ≤ settled cash − active buy commitments |
+  | GAP_STRESS_POSITION | 15% × (held MV + pending + q·entry) ≤ 3% B |
+  | GAP_STRESS_PORTFOLIO | current stressed loss + 15% × q·entry ≤ 10% B |
+  | BROKER_CASH_BACKSTOP | q·entry + buy fee ≤ max(0, min(broker cash, non-marginable buying power)) |
+
+  * `max_whole_qty` starts from a floor estimate and moves only to verified values.
+    A quantity is never rounded up.
+  * A requested quantity above the maximum is rejected (`QUANTITY_EXCEEDS_LIMIT`),
+    never silently reduced.
+  * The broker's figure is only a backstop: it can lower the size, never raise it.
+    Alpaca's $100k cash and $400k buying power are never capital.
+* **Discrete checks** (all are collected, not first-failure):
+  * Proposal shape:
+    * long only (`NOT_LONG_ENTRY`); limit orders only; no extended hours;
+    * equity or ETF only; symbol and intent-key shape;
+    * a whole-share `requested_qty`; tick-valid prices;
+    * `STOP_NOT_BELOW_ENTRY`; the $10 minimum on entry and on the fresh mark.
+  * Evidence:
+    * gate present, the same mode, ≤ 30 s old, not in the future, allowing new
+      entries;
+    * account snapshot ≤ 120 s old, the recorded account id, the expected
+      environment, not restricted.
+  * Ledger state:
+    * integrity and accounting invariants; no persistent halt;
+    * latest reconciliation `OK` and ≤ 10 min old;
+    * no portfolio entry blockers;
+    * loss-monitor blockers (lockout, weekly limit, missing baselines, unknown
+      equity, calendar);
+    * gap stress available.
+  * Market data: a fresh mark for the symbol, and a valued existing holding.
+  * Portfolio rules:
+    * no working order for the symbol (`DUPLICATE_WORKING_ORDER`);
+    * no reuse of an intent key;
+    * at most 4 symbols held or with pending buy entries (adding to a held symbol
+      uses no new slot);
+    * `POSITION_AT_CONCENTRATION_LIMIT` when existing exposure is already ≥ 20%.
+  * Zero size: `ONE_SHARE_EXCEEDS_RISK_BUDGET` if the risk cap is 0, otherwise
+    `QUANTITY_ZERO`, naming the binding constraints.
+* **Evidence.** A decision records:
+  * the ledger fingerprint, the gate's evaluation time and codes;
+  * the mark (price, as_of, source, feed), the account id and as_of;
+  * equity, the session and week baseline ids, available cash, and capital headroom.
+* **Fingerprint.** `ledger_fingerprint(session)` is a SHA-256 hash over the **full
+  ordered contents of every ledger table** (each value tagged with its SQLite type).
+  Only `schema_migrations` and the immutable `database_identity` are excluded, each
+  with a stated reason. A test fails if a migration adds a table that is neither
+  hashed nor excluded. Revised during step 11 verification: the first version hashed
+  counts and maxima of append-only tables, which missed later updates to mutable
+  columns such as `cash_entries.settles_on`, superseded baselines and rebaseline
+  status. Any ledger write now invalidates an outstanding decision.
+* **Not a reusable authorization.**
+  * `valid_until` is the earliest of:
+    * `now + decision_ttl` (30 s);
+    * the gate's expiry;
+    * the account evidence's expiry;
+    * the mark's in-session age and receipt-age expiry.
+  * `still_valid(now, current_fingerprint)` requires an approval, a time inside
+    [evaluated_at, valid_until], and an unchanged fingerprint.
+  * This is only a cheap pre-check.
+* **Step 12 protocol** (to implement, not implemented here). Before submitting, the
+  OrderManager:
+  1. Re-reads the broker account and evaluates a fresh gate, outside any transaction.
+  2. Opens `BEGIN IMMEDIATE`. That serializes it against every other writer.
+  3. Inside that transaction, re-runs `evaluate` on the same snapshot, with the
+     proposal pinned to the decision's approved quantity. It requires approval and a
+     fingerprint identical to the decision's.
+  4. In the same transaction, inserts the `PENDING_SUBMIT` order (unique intent key)
+     and its cash reservation, then commits.
+  5. Submits after the commit (no network inside the transaction).
+
+  If any piece of evidence changed, the reservation is not made, and the proposal
+  must be evaluated again from scratch. Reservations are what stop two concurrent
+  approvals from both spending the same cash.
+* **Fees** (`config/fees.yaml`) are estimates, not risk parameters:
+  * buys: $0;
+  * sells: FINRA TAF $0.000166/share, capped at $8.30, plus SEC $0.0000278 per
+    dollar sold.
+
+  Each component is rounded up to the cent. Actual fees come from broker activities.
+* **Deviations / decisions:**
+  * The risk budget includes estimated entry and exit fees, which is more
+    conservative than (entry − stop) × qty alone.
+  * Gap-stress caps use the loss monitor's denominator (baseline equity), consistent
+    with §11.3. Concentration and risk use current equity.
+  * Concentration counts pending buy commitments for the same symbol at their
+    reserved amount.
+  * A broker cash backstop was added: max(0, min(cash, non-marginable buying
+    power)). It can only lower a size. Margin `buying_power` is not part of
+    `AccountSnapshot` at all. The backstop never replaces virtual settled cash or the
+    $5,000 ceiling, which are separate caps. Missing or stale account evidence means
+    no sizing and a rejection.
+  * `TimeInForce` has only DAY/GTC, both accepted. Extended hours is rejected
+    outright.
+  * Reconciliation freshness (10 min) mirrors the gate setting.
+
+### 12.15 Step 12: order management and recovery (as built)
+
+The package is `oms/`:
+* `order_manager.py`: submission and cancellation;
+* `lifecycle.py`: applies broker order state;
+* `sync.py`: activities and order refresh;
+* `recovery.py`: the §10.3 protocol and restart recovery.
+
+It runs only against SimBroker. The guard (`check_execution_allowed`) requires a
+simulate-mode ledger and an object implementing `BrokerExecutionPort` whose module
+is not Alpaca's. The read-only Alpaca adapter has no `submit_order`, and a static
+test proves only `broker/sim.py` implements `submit_order` and `cancel_order`.
+No schema changes: every table used already existed in migration 0001. The new
+`ResolutionAttemptsRepository` writes `order_resolution_attempts`.
+
+* **Submission** (`OrderManager.place_entry(decision, now)`). No transaction is open
+  during any broker call.
+  1. Refuse a decision that is not approved (`NOT_APPROVED`) or is outside
+     [evaluated_at, valid_until] (`DECISION_EXPIRED`).
+  2. Read the broker account and evaluate the gates, outside any transaction
+     (`ACCOUNT_UNAVAILABLE` on read failure).
+  3. **tx A** (`BEGIN IMMEDIATE`):
+     * the ledger fingerprint must equal the decision's (`LEDGER_CHANGED`);
+     * `PreTradeRiskEngine.evaluate_in(tx, …)` re-runs every check on this snapshot,
+       with the approved quantity pinned (`REVALIDATION_FAILED`);
+     * then, atomically: insert the `PENDING_SUBMIT` order (new `stb-` UUIDv7 id,
+       UNIQUE `intent_key`), call `reserve_buy`, and write an `INTENT_CREATED` event
+       with both decision ids and the fingerprint.
+
+     Two competing decisions can't both reserve: the first commit changes the
+     fingerprint, so the second is refused and must be re-evaluated against the
+     reduced cash.
+  4. **tx A2**: set the `send_attempted_at` marker (set-once) and a `SEND_ATTEMPT`
+     event. A NULL marker proves the order was never sent.
+  5. `submit_order`, once. Never retried.
+  6. **tx B**, by outcome:
+     * snapshot returned → adopted through the lifecycle;
+     * `OrderRejectedError` → `REJECTED`, reservation released;
+     * `DuplicateClientOrderIdError` → `SUBMIT_AMBIGUOUS`, then an immediate lookup
+       that adopts it (never treated as a rejection);
+     * anything else (429, 5xx, 504, timeout, reset, malformed response, auth) →
+       `SUBMIT_AMBIGUOUS`, reservation held; auth also halts `AUTH`.
+* **Cancellation** (`request_cancel`):
+  * Only for orders with a confirmed broker id (`ACCEPTED`, `PARTIALLY_FILLED`,
+    `PENDING_CANCEL`). Ambiguous orders are refused locally.
+  * `PENDING_CANCEL` and a `CANCEL_REQUESTED` event are committed first; then the
+    broker call is made, and its result is audited (`CANCEL_SENT`,
+    `CANCEL_NOT_CANCELABLE`, `CANCEL_SEND_FAILED`).
+  * The reservation is never released by a request. If the broker never received the
+    cancel, sync moves the order back to `ACCEPTED`.
+* **Applying broker state** (`lifecycle.apply_snapshot`). Every change goes through
+  `transition()` with an `order_events` row. A terminal target closes the reservation
+  in the same transaction (tx D: `FILLED` consumes it; any other terminal status
+  releases it). Fill gating: while booked fills are below the broker's `filled_qty`,
+  a terminal status is held back and the order stays working. So the remainder is
+  released only after a broker-confirmed terminal status *and* the final fill
+  quantity. These all halt and leave the order untouched:
+
+  | Condition | Halt |
+  |---|---|
+  | Identity mismatch (symbol, side, qty, type, limit, ids) | `RECON_ORDER` |
+  | Booked fills above the broker's `filled_qty` | `RECON_ORDER` |
+  | Unmapped status | `UNMAPPED_BROKER_STATUS` |
+  | Unexpected status (`replaced`) | `UNEXPECTED_BROKER_STATUS` |
+  | Inconsistent payload | `BROKER_PAYLOAD` |
+  | Illegal transition | `ILLEGAL_TRANSITION` |
+  | A `CONFIRMED_ABSENT` order appears | adopted, then `RECON_ORDER` |
+
+  Read failures map to halts through `read_error_halt`: auth → `AUTH`; unknown status
+  → `UNMAPPED_BROKER_STATUS`; malformed or float payload → `BROKER_PAYLOAD`. Anything
+  else is transient.
+* **Order-state transitions exercised:**
+  * `PENDING_SUBMIT` → `ACCEPTED` | `REJECTED` | `SUBMIT_AMBIGUOUS`;
+  * `SUBMIT_AMBIGUOUS` → any broker-derived status (adoption) | `CONFIRMED_ABSENT`
+    (operator only);
+  * `ACCEPTED` → `PARTIALLY_FILLED` | `PENDING_CANCEL` | `FILLED` | `CANCELED` |
+    `EXPIRED` | `REJECTED`;
+  * `PARTIALLY_FILLED` → `PENDING_CANCEL` | `FILLED` | `CANCELED`;
+  * `PENDING_CANCEL` → `ACCEPTED` (the cancel never landed) | `FILLED` (the fill won
+    the race) | `CANCELED`;
+  * `CONFIRMED_ABSENT` → broker-derived (with a halt).
+* **Synchronization** (`OrderSync.sync`):
+  1. Activities from `complete_through − 1 h` to now. Each is booked in its own
+     transaction through `VirtualPortfolio` (tx C), in execution-time order:
+     * fills are always recorded first; invariants run after commit;
+     * identical replay → no-op; conflicting replay → `RECON_EXECUTION`;
+     * a fill executed earlier than already-booked fills → booked, then
+       `RECON_EXECUTION`;
+     * FEE/DIV → booked.
+  2. Attribution: a fill for an unadopted ambiguous order adopts it first. An unknown
+     `stb-` id becomes an `ORPHAN` record and halts. A non-bot or unidentifiable
+     order is preserved as an UNEXPLAINED activity and halts. Other activity types
+     are preserved as UNEXPLAINED for step 13; nothing is lost.
+  3. The coverage marker then advances to `now − posting lag`, only if the window's
+     tail was confirmed.
+  4. Working orders are refreshed by client id.
+  5. Post-commit invariants run.
+* **Ambiguous-order protocol** (`AmbiguousOrderRecovery`), unchanged from §10.3 and
+  never resending:
+  * `lookup`: found → adopt. Not found, or an explicit 404 → a `NOT_FOUND` row, and a
+    `PENDING_SUBMIT` order becomes `SUBMIT_AMBIGUOUS`. A read error → an `ERROR` row,
+    which is not evidence.
+  * `list_scan` and `activity_scan` record `order_resolution_attempts` rows.
+  * `confirm_absent(operator)` refuses, and records the refusal, unless all of these
+    hold:
+    * ≥ 3 not-found lookups since the last possible send, the latest ≥ 10 min after
+      it, and nothing ever found;
+    * a clean list scan after that point;
+    * a complete, clean activity scan whose closed end reaches ≥ 10 min past the
+      send;
+    * an `OK` reconciliation run newer than all of that evidence.
+
+    On success it moves the order to `CONFIRMED_ABSENT`, releases the reservation,
+    and stores the evidence.
+  * `escalate`: an order unresolved > 30 min after its last possible send halts
+    `AMBIGUOUS_ORDER_TIMEOUT`, once per order. A later adoption does not clear the
+    halt.
+  * `recover_after_restart` = forced lookups → sync → escalate (§10.1 steps 5–6).
+* **Crash testing:**
+  * `CRASH_POINTS`: `after_intent_commit`, `after_send_marker`, `after_submit`,
+    `after_outcome_commit`, `after_cancel_marker`. Fill-transaction points come from
+    `VirtualPortfolio`'s hook: `after_activity` … `before_commit`.
+  * In-process tests raise a `BaseException` at each point.
+  * Process-level tests spawn an interpreter that runs the real OMS against the
+    ledger file and calls `os._exit` at the boundary. The parent's SimBroker is
+    served over an OS pipe (no sockets), so broker state survives the crash; the
+    parent reopens the ledger and recovers.
+  * Every case ends with at most one broker order per intent, reservations open
+    exactly while orders are working, and clean invariants.
+* **Deviations from §10/§12.4:**
+  1. Activity effects commit one activity per transaction (the existing
+     `VirtualPortfolio` boundary). The coverage marker advances in a later
+     transaction, only after all effects of the window have committed. A crash in
+     between causes an idempotent re-read, never a gap.
+  2. An order whose send marker is NULL (provably never sent) still goes through the
+     full ambiguous protocol (no automatic abandonment, no send). The marker is
+     recorded as evidence.
+  3. Escalation and the absence window are measured from the last possible send (the
+     marker, else creation). Because the activity scan must be closed past
+     send + 10 min, operator confirmation is possible from about 25 minutes after the
+     send.
+  4. When an ambiguous order is adopted while the broker reports fills not yet
+     booked, it is adopted as `ACCEPTED` (working) until the fills arrive.
+  5. *(Superseded by §12.16: the execution boundary is now an explicit
+     simulation-only capability.)*
+  6. Only long limit entries are submitted; there is no exit/sell submission API in
+     M1. FILL activities carry no fees (fees post as FEE activities).
+  7. Lock, preflight, baselines and reconciliation in the startup sequence (§10.1
+     steps 1–4, 7–8) remain step 14 and step 13 work.
+
+### 12.16 Step 12 final safety checks (as built)
+
+* **Durable send marker.** `oms/execution.py` holds the only code in `src/` that calls
+  `submit_order` or `cancel_order`; an AST test proves it.
+  * `SimulationExecution.submit` requires a `CommittedSendMarker`. Only
+    `read_committed_send_marker` can produce one: it asserts no transaction is open,
+    reads in a *new* read transaction (so it sees only committed data), and requires
+    `send_attempted_at` with status `PENDING_SUBMIT`. The marker can't be constructed
+    by hand or reused for another order.
+  * Cancels similarly need a committed `PENDING_CANCEL` (`CommittedCancelMarker`).
+  * Because of this ordering, a NULL marker after a crash *is* proof that this process
+    never sent the order. The recovery protocol still requires the full §10.3
+    evidence and an operator, and nothing is ever resubmitted.
+  * New crash point `send_marker_uncommitted` (inside tx A2). Crashes just before and
+    just after the marker commit are tested in-process and at process level.
+* **Adoption with unbooked fills.** Migration 0005 adds `orders.broker_filled_qty`,
+  the broker-reported filled quantity, stored on every snapshot; a regression halts
+  `RECON_ORDER`. While it exceeds the booked quantity:
+  * the order is never terminal;
+  * the reservation is never released (it still covers the unbooked cost, because
+    fills are at or below the limit);
+  * gates report transient `UNBOOKED_FILLS` and the risk engine rejects every
+    proposal with `UNBOOKED_FILLS`;
+  * no cash, position or settlement effect is inferred.
+
+  Tests cover partially and fully filled broker orders, normal and adopted, whose
+  activities arrive 30–40 minutes late.
+* **Execution boundary.** `SimulationExecution` accepts exactly a `SimBroker` (exact
+  type, so subclasses are refused) or a class registered with
+  `register_simulation_double`. A double must declare `SIMULATION_DOUBLE_PURPOSE`,
+  implement both write methods, and not be Alpaca-named. The process-level crash
+  harness's pipe proxy and one cancel-failure double are the only registrations, both
+  in `tests/`. `OrderManager` accepts only this capability and still requires a
+  simulate-mode ledger. The Alpaca adapter has no write methods and can't be
+  registered.
+
+### 12.17 Step 13: broker reconciliation (as built)
+
+* **Modules:**
+  * `oms/reconciler.py`: `Reconciler.run(now)`.
+  * `oms/classify.py`: activity classification.
+  * `ledger/baselines.py`: active baseline and INIT creation only.
+  * Migration 0005: the append-only `reconciliation_findings` table.
+* **Flow:**
+  1. **Ingest.** Forward sync, then the `RescanPolicy` windows: OVERLAP, PERIODIC
+     (the last complete one is recorded in `activities.last_periodic_rescan`) and
+     FULL_HISTORY since the active baseline. Everything is ingested idempotently
+     *before* judgement, so unexpected events are preserved before any halt.
+  2. **Observe.** Account, account configuration, positions, open orders, and the
+     complete order list since baseline − 5 min. Ambiguous or absent-declared orders
+     that the list shows are adopted. Settlement dates are resolved from the calendar
+     (never weekday arithmetic).
+  3. **Head re-check.** If new activities appeared, repeat (up to
+     `max_snapshot_retries` = 3); otherwise the run is INCONCLUSIVE
+     (`ACTIVITY_HEAD_UNSTABLE`).
+  4. **Judge** on one ledger snapshot.
+  5. **Persist** in one transaction: the run (`OK`/`INCONCLUSIVE`/`MISMATCH`; CLEAN is
+     stored as `OK`), evidence boundaries in `diff_json` (observation time, attempts,
+     baseline, account, order-scan bounds, every window with its completeness, a
+     broker snapshot hash), every finding, and any halt referencing the run.
+* **Outcomes.** Any MISMATCH → MISMATCH. A failed read never hides an independently
+  confirmed difference, and a check whose inputs weren't fully retrieved isn't
+  evaluated. Otherwise any INCONCLUSIVE → INCONCLUSIVE. Otherwise CLEAN. Advisories
+  never block.
+* **Classifications:**
+
+  | Severity | Codes |
+  |---|---|
+  | MISMATCH, account | `ACCOUNT_ID_MISMATCH`, `ENVIRONMENT_MISMATCH`, `CURRENCY_UNSUPPORTED` |
+  | MISMATCH, orders | `DUPLICATE_BROKER_ORDER`, `MULTIPLE_WORKING_ORDERS`, `EXTERNAL_ORDER`, `UNEXPECTED_ORDER`, `MISSING_BROKER_ORDER`, `CONFLICTING_ORDER`, `ABSENT_ORDER_EXISTS`, `TERMINAL_LOCALLY_OPEN_AT_BROKER`, `ORPHAN_ORDER` |
+  | MISMATCH, executions | `UNEXPLAINED_FILL`, `LEDGER_FILL_NOT_AT_BROKER`, `FILL_CONTENT_CONFLICT`, `BOOKED_EXCEEDS_BROKER_FILLS`, `OUT_OF_ORDER_BOOKING`, `OUT_OF_ORDER_FILL`, `ACTIVITY_CONFLICT` |
+  | MISMATCH, cash | `UNEXPLAINED_CASH_ACTIVITY`, `ATTRIBUTABLE_NOT_BOOKED`, `CASH_UNEXPLAINED` (any non-zero residual of broker cash − (baseline cash + Σ net amounts of all activities since the baseline); no tolerance) |
+  | MISMATCH, positions | `POSITION_QTY_MISMATCH`, `POSITION_COST_MISMATCH` (ledger average cost at the broker's 0.0001 precision), `UNSUPPORTED_POSITION` |
+  | MISMATCH, ledger | `LEDGER_INVARIANT` |
+  | INCONCLUSIVE | `READ_FAILED`, `INCOMPLETE_RETRIEVAL`, `SYNC_INCOMPLETE`, `ACTIVITY_WINDOW_INCOMPLETE`, `ACTIVITY_HEAD_UNSTABLE`, `BASELINE_MISSING`, `IDENTITY_UNRECORDED`, `ACCOUNT_RESTRICTED`, `FEES_PENDING`, `FILL_ACTIVITY_LAG` (position and cash differences for those symbols are then also INCONCLUSIVE), `CASH_RESIDUAL_PENDING`, `CASH_NOT_EVALUATED`, `STATUS_NOT_APPLIED`, `SETTLEMENT_DATE_UNKNOWN`, `AMBIGUOUS_ORDER_UNRESOLVED` |
+  | ADVISORY | `ACCOUNT_PROTECTIONS_NOT_SET` (U6) |
+* **Halts.**
+  * A MISMATCH halts with the highest-priority category reason: account → new
+    `RECON_ACCOUNT`; ledger → `LEDGER_INVARIANT`; executions and activities →
+    `RECON_EXECUTION`; orders → `RECON_ORDER`; positions → `RECON_POSITION`; cash or
+    settlement → `RECON_CASH`. The halt references the run.
+  * The 5th consecutive INCONCLUSIVE run halts `RECON_INCONCLUSIVE_REPEAT`, once.
+  * Halts persist across restarts.
+* **Dependent operations:**
+  * `latest_usable_run(now, max_age, after)` returns a run only if it is CLEAN, no
+    older than `max_age` and newer than `after`.
+  * `resume_after_clean_reconciliation` requires such a run taken after the halt,
+    within 10 minutes. Refusals are recorded as `RESUME_REFUSED`.
+  * Gates already require a fresh OK run.
+  * The ambiguous-order protocol accepts a fresh run that is CLEAN, or INCONCLUSIVE
+    *only* because of unresolved submissions with this order marked
+    `absence_consistent`. That flag means everything else is complete and clean and
+    the complete order list does not contain the order (§10.3, "reconcile with the
+    order assumed absent"). It refuses runs older than 10 minutes.
+* **Classification before booking** (`oms/classify.py`, used by sync):
+  * FEE on a bot-execution day and DIV on a symbol the bot held → ATTRIBUTABLE
+    (booked);
+  * INT → EXTERNAL (explained, never booked);
+  * everything else (a fee without an execution, a dividend on an unheld symbol,
+    `CSD`, `CSW`, `JNLC`, unknown types) → UNEXPLAINED. Preserved, never booked;
+    gates block and reconciliation reports a MISMATCH.
+
+  Replays follow the stored attribution.
+* **Deviations and decisions:**
+  1. *(Superseded by §12.18: the rebaseline workflow is implemented. Audited ledger
+     adjustments are still not implemented.)*
+  2. Step 12 sync used to book every FEE/DIV; it now classifies first (above).
+  3. SimBroker now applies a non-fill cash activity to its cash balance when the
+     activity *posts*. Fills still move cash at execution, with the gap visible
+     through `filled_qty`.
+  4. CLEAN while an order is ambiguous is impossible by rule. The operator absence
+     path therefore accepts the absence-consistent INCONCLUSIVE run described above,
+     rather than requiring `OK`.
+  5. A full-history re-scan runs on every reconciliation (`RescanPolicy.full_history`).
+     A baseline younger than the posting lag yields an empty, closed history window.
+     The head window is then only tail-confirmed, which is recorded in the evidence.
+  6. An account restriction is INCONCLUSIVE (gates block it independently), not a
+     MISMATCH. An unknown settlement date is INCONCLUSIVE, not a halt.
+  7. The cost-basis check is skipped for symbols with capitalized fees, which are
+     zero for Alpaca equities.
+
+### 12.18 Step 13.1: reconciliation hardening (as built)
+
+**1. Rebaseline workflow** (`oms/rebaseline.py`, migration 0006 `rebaseline_events`).
+* **Propose** (`Rebaseliner.propose(actor, reason)`):
+  1. Refused unless a persistent halt is active.
+  2. Runs a fresh reconciliation, then refuses unless all of these hold:
+     * no INCONCLUSIVE finding (complete evidence);
+     * no position difference;
+     * no working or unresolved ledger order and no open broker order;
+     * every MISMATCH is acknowledgeable (`CASH_UNEXPLAINED`,
+       `UNEXPLAINED_CASH_ACTIVITY`, `UNEXPLAINED_FILL`, `EXTERNAL_ORDER`);
+     * there is something to acknowledge.
+  3. Stores an immutable `PROPOSED` request containing:
+     * the diff, the run id and the observation time;
+     * the broker-state hash (account, positions, orders);
+     * a fingerprint of the economic ledger tables;
+     * every unexplained activity;
+     * the **unexplained amount** = broker cash − baseline cash − Σ(attributable +
+       external activity since the baseline), i.e. the residual plus all unexplained
+       activity.
+* **Confirm** (`confirm(request_id, acknowledged, actor, reason)`):
+  1. Request state:
+     * `APPROVED` with the same amount → `DUPLICATE` (idempotent; same baseline
+       returned, event recorded);
+     * a different amount on an `APPROVED` request → refused;
+     * `EXPIRED` or `REJECTED` → refused.
+  2. Older than 15 minutes → `EXPIRED`.
+  3. A typed amount not exactly equal (as a Decimal) → refused. The request stays
+     `PROPOSED`, so a typo can be corrected.
+  4. No longer halted → `EXPIRED`.
+  5. A second fresh reconciliation; if the broker-state hash, the economic ledger
+     fingerprint, the unexplained amount, the active baseline or any precondition
+     changed → `EXPIRED`.
+  6. Otherwise, in one transaction:
+     * the old baseline is superseded (kept);
+     * a new `REBASELINE` baseline is inserted, linked to the request (cash = observed
+       broker cash, taken at the observation time, equity = cash + broker position
+       cost);
+     * the request becomes `APPROVED` with the acknowledged amount;
+     * the halt is re-recorded as `REBASELINE` (still halted);
+     * an `APPROVED` event is written.
+* **Never changed:** virtual cash, cost basis, positions, fills and cash entries.
+  Resuming still needs a later CLEAN run and the operator resume (§12.17).
+  `cumulative_acknowledged()` sums every approved acknowledgement.
+* **Follow-on changes:**
+  * Gates block on UNEXPLAINED activity only after the active baseline. Earlier
+    activity was acknowledged by the approved rebaseline.
+  * Reconciliation no longer reports external orders closed before the active
+    baseline.
+  * The broker snapshot hash now covers account, positions and orders only.
+    Activities are bound through ledger ingestion; the closed history window grows
+    over time, so including it made every preview look stale.
+* **Conflicts with or additions to §8.5, identified before implementing:**
+  1. §8.5 says approval "writes a `halt_events` entry", but `halt_events.action` only
+     allows HALT/RESUME/RESUME_REFUSED. Approval is therefore recorded as a HALT with
+     reason `REBASELINE` (consistent with "the halt remains"). Proposals, refusals,
+     expiries and duplicates go to the new `rebaseline_events`.
+  2. Additions §8.5 doesn't state: the economic-ledger binding, a second fresh
+     reconciliation at confirmation, idempotent duplicate confirmation, and keeping a
+     request PROPOSED after a mistyped amount.
+  3. The "unexplained cash residual" is interpreted as residual + unexplained activity.
+     A deposit recorded as an activity has a zero cash residual, but is still
+     unexplained to the bot.
+  4. §8.5's separate, audited ledger `ADJUSTMENT` command (for position differences)
+     is **not implemented**. Rebaseline refuses whenever positions differ.
+
+**2. Activity attribution** (`oms/classify.py`). Timing alone is never evidence.
+* **FEE** is ATTRIBUTABLE only when all of these hold:
+  * it references (`order_id`) a bot order with booked executions;
+  * it is a charge;
+  * that order's fills carry no fee of their own (no double booking);
+  * no attributable fee for that order already has the same amount and description
+    (a second representation is UNEXPLAINED).
+* **DIV** is ATTRIBUTABLE only when all of these hold:
+  * symbol, `qty` and `per_share_amount` are present, and amount = qty × per-share to
+    the cent;
+  * the ledger held exactly `qty` at payment;
+  * the ledger held at least `qty` continuously for 30 days before payment.
+* **INT** is EXTERNAL. Everything else, and any uncertainty, is UNEXPLAINED: always
+  preserved, never booked, gates block, reconciliation reports a MISMATCH.
+* **Unresolved assumptions and Alpaca fields to verify before M2** (contract-test
+  items):
+  * whether FEE activities carry `order_id`, plus a fee sub-type/`description` (REG,
+    TAF) and quantity;
+  * whether fees are ever reported on fills (only `fees = 0` is assumed today);
+  * whether DIV activities carry `qty` and `per_share_amount`, and whether an
+    ex-/record date is available (from the activity or a corporate-actions source).
+    Without it, entitlement uses the 30-day continuous-holding assumption, and a
+    dividend paid after a position closed is UNEXPLAINED.
+  * the descriptions or sub-types for INT and other external cash movements.
+
+**3. Ambiguous-order absence confirmation.**
+* **Evidence required by `confirm_absent`** (operator only):
+  * status `SUBMIT_AMBIGUOUS`;
+  * nothing ever found;
+  * ≥ 3 not-found lookups whose latest is ≥ send + 10 min, and **spanning ≥ 10 min**
+    (failed lookups are not evidence; a 404 is evidence, not proof);
+  * a clean, complete order-list scan after the window;
+  * a complete, clean activity scan whose closed end is ≥ send + 10 min;
+  * a reconciliation run no older than 10 minutes and newer than all of that evidence.
+* **What that run must look like:** INCONCLUSIVE, with **exactly one** non-advisory
+  finding, namely this order's `AMBIGUOUS_ORDER_UNRESOLVED`, marked
+  `absence_consistent`.
+* **What `absence_consistent` requires:** every other dimension clean, the order list
+  complete and without the order, a complete history window whose closed end is
+  ≥ send + 10 min (mature coverage), and no other unresolved submission.
+* **Not accepted:** a CLEAN (`OK`) run, synthetic or not, any unrelated INCONCLUSIVE
+  or MISMATCH finding, or another ambiguous order.
+* **Unchanged:** late adoption still halts `RECON_ORDER`.
+
+**4. Inconclusive escalation.** §8.3 says a run is "re-checked on the next cycle" and
+"5 consecutive INCONCLUSIVE results escalate". The halt therefore counts distinct
+**reconciliation cycles**, not raw runs:
+* INCONCLUSIVE runs less than 60 s after the last counted run (`inconclusive_cycle_interval`)
+  belong to the same cycle;
+* any CLEAN or MISMATCH run ends the streak;
+* the 5th cycle halts `RECON_INCONCLUSIVE_REPEAT` once;
+* each run records `inconclusive_cycle` in its evidence.
+
+Justification: an immediate retry repeats the same observation rather than showing
+that the condition persists. Fail-closed is not weakened: every INCONCLUSIVE run
+already blocks new entries through the transient `RECONCILIATION_INCONCLUSIVE` gate,
+so a burst of retries can only delay a persistent halt during which no new risk can be
+taken. Cycles at the normal cadence (≤ 120 s sync age) escalate exactly as before.
+
+### 12.19 Step 13.2: rebaseline accounting corrections (as built)
+
+Supersedes the following parts of §12.18:
+* the dividend rule;
+* the unexplained-amount formula;
+* the "everything before the active baseline is acknowledged" behaviour, which is
+  removed.
+
+**1. Dividends.** The 30-day holding heuristic is gone. Every `DIV` activity is
+preserved with attribution UNEXPLAINED ("entitlement unverified"):
+* it is never booked;
+* gates block (`UNEXPLAINED_ACTIVITY`);
+* reconciliation reports MISMATCH `DIVIDEND_ENTITLEMENT_UNVERIFIED`;
+* an operator may acknowledge it through a rebaseline as *not the bot's*, and it is
+  still never booked.
+
+Holdings on the payment date are never used. Required before M2 (contract or data
+items):
+* the DIV activity's `symbol`, `qty` and `per_share_amount`;
+* a **verified ex-dividend (or record) date** for the symbol, from the activity or a
+  corporate-actions source;
+* the **eligible quantity** at that date (from the ledger's fill history, which would
+  then be checked against it);
+* the payment date, and how Alpaca represents reinvestment, foreign withholding and
+  corrections or reversals.
+
+The schema's attribution set (ATTRIBUTABLE/EXTERNAL/UNEXPLAINED) is unchanged:
+"unresolved" is stored as UNEXPLAINED and distinguished by the finding code.
+
+**2. Event-specific acknowledgement** (migration 0007, `rebaseline_acknowledgements`;
+`ledger/acknowledgements.py`).
+* **What an approved rebaseline records:** one row per acknowledged broker activity
+  (by activity id) and per acknowledged external broker order (by client order id),
+  with a verbatim copy of the payload: the raw activity JSON, or a canonical order
+  record (ids, symbol, side, qty, filled qty, status). The amount and the
+  `in_baseline` flag are recorded too.
+* **When an event counts as acknowledged:** only if it is listed for an APPROVED
+  request *and* its stored payload is byte-identical.
+* **No time-range suppression:**
+  * gates and reconciliation evaluate every UNEXPLAINED activity, whatever its
+    timestamp, minus acknowledged ones;
+  * the full-history re-scan always starts at the **first** (INIT) baseline;
+  * an external order is skipped only when that exact closed order was acknowledged.
+* **Newly discovered events** (e.g. fills posted after a rebaseline but timestamped
+  before it) are flagged, and block, like any other.
+* **Changed payloads:** a replay with different content is an `ACTIVITY_CONFLICT`
+  MISMATCH (fail closed) for *every* activity type. Step 13.1 surfaced only fill
+  conflicts; preserved and cash activities now also reach the findings. The stored
+  row and its acknowledgement are never rewritten.
+* **Binding:** the preview stores the exact list (ids, payloads, amounts, flags). At
+  confirmation the freshly recomputed list must be identical; otherwise `EXPIRED`.
+
+**3. The cash equation.** B is the active baseline (cash `B.cash`, observed at
+`B.taken_at`). An activity is "since B" when it was **first ingested** after
+`B.taken_at`. The rebaseline observation follows a complete activity read, so
+anything ingested by then is already reflected in `B.cash`.
+
+```
+movements M = Σ net(activities ingested after B.taken_at)        (every attribution)
+residual  R = broker_cash − (B.cash + M)    cash that moved with NO activity at all
+counted   U = Σ net(UNEXPLAINED, unacknowledged activities ingested after B.taken_at)
+net       N = R + U                         the amount the operator types
+```
+
+* An activity's amount is never in R, because it is inside M; so it is counted once,
+  as its own item.
+* Unexplained activities ingested *before* B (`in_baseline`) are listed for
+  acknowledgement, but their cash is already in `B.cash`, so they are not in N.
+* Reconciliation uses the same R (`CASH_UNEXPLAINED` when R ≠ 0, no tolerance).
+* The preview shows R, each activity and order with its amount, and N. Confirmation
+  requires the exact Decimal value of N; zero must be typed when N = 0.
+* Examples:
+
+  | Case | R | Items | N |
+  |---|---|---|---|
+  | $200 deposit with no activity | 200 | — | 200 |
+  | $200 deposit reported as `CSD` | 0 | 200 | 200 (not 400) |
+  | +100 and −100 deposits | 0 | +100, −100 | 0 (both still acknowledged) |
+  | Silent −100 plus a +100 activity | −100 | +100 | 0 |
+
+* Using the ingestion time rather than the activity timestamp means a late-posted,
+  back-dated activity is counted when first seen. If its cash was in fact already
+  part of an earlier acknowledged residual, R becomes non-zero and the system halts.
+  It is never absorbed silently.
+
+**4. Position safety (operational limitation).** Rebaseline still refuses whenever
+broker and ledger positions differ. The audited `ADJUSTMENT` command of §8.5 is **not
+implemented** in M1. A position difference therefore stays a persistent halt that only
+a code-level remedy (a future audited adjustment command) can clear. Operators must
+not attempt to fix it by rebaselining or by editing the ledger.
 ---
 
 ## 13. Configuration & secrets

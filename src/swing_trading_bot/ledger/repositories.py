@@ -163,6 +163,15 @@ class OrderRecord:
     order_role: OrderRole | None = None
     send_attempted_at: datetime | None = None
     last_synced_at: datetime | None = None
+    broker_filled_qty: Decimal | None = None
+    """Filled quantity the broker last reported; above ``filled_qty`` means fills whose
+    activities are not booked yet (accounting incomplete)."""
+
+    @property
+    def unbooked_fill_qty(self) -> Decimal:
+        if self.broker_filled_qty is None:
+            return Decimal(0)
+        return max(Decimal(0), self.broker_filled_qty - self.filled_qty)
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,14 +190,14 @@ class OrdersRepository:
         "client_order_id, broker_order_id, portfolio_id, intent_key, symbol, side, order_type, "
         "time_in_force, purpose, qty, limit_price, planned_stop, status, filled_qty, "
         "avg_fill_price, last_broker_status, reject_reason, trade_plan_id, order_role, "
-        "created_at, send_attempted_at, updated_at, last_synced_at"
+        "created_at, send_attempted_at, updated_at, last_synced_at, broker_filled_qty"
     )
 
     def insert(self, tx: Tx, rec: OrderRecord) -> None:
         if rec.trade_plan_id is not None or rec.order_role is not None:
             raise PersistenceError("trade_plan_id/order_role are reserved for RTH-01 (NULL in M1)")
         tx.execute(
-            f"INSERT INTO orders ({self._COLS}) VALUES ({', '.join('?' * 23)})",
+            f"INSERT INTO orders ({self._COLS}) VALUES ({', '.join('?' * 24)})",
             (
                 rec.client_order_id,
                 rec.broker_order_id,
@@ -213,6 +222,7 @@ class OrdersRepository:
                 opt_ts_to_db(rec.send_attempted_at),
                 ts_to_db(rec.updated_at),
                 opt_ts_to_db(rec.last_synced_at),
+                opt_dec_to_db(rec.broker_filled_qty),
             ),
         )
 
@@ -277,6 +287,27 @@ class OrdersRepository:
         )
         if n != 1:
             raise RecordNotFoundError(f"order {client_order_id} not found")
+
+    def record_broker_progress(
+        self, tx: Tx, client_order_id: str, *, broker_filled_qty: Decimal, at: datetime
+    ) -> None:
+        """Store the broker-reported filled quantity (never decreases)."""
+        n = tx.execute(
+            "UPDATE orders SET broker_filled_qty = ?, updated_at = ? WHERE client_order_id = ?",
+            (dec_to_db(broker_filled_qty), ts_to_db(at), client_order_id),
+        )
+        if n != 1:
+            raise RecordNotFoundError(f"order {client_order_id} not found")
+
+    def list_with_unbooked_fills(self, s: Session) -> list[OrderRecord]:
+        return [o for o in self._all(s) if o.unbooked_fill_qty > 0]
+
+    def _all(self, s: Session) -> list[OrderRecord]:
+        rows = s.fetch_all(f"SELECT {self._COLS} FROM orders ORDER BY created_at, client_order_id")
+        return [self._from_row(r) for r in rows]
+
+    def list_all(self, s: Session) -> list[OrderRecord]:
+        return self._all(s)
 
     def set_broker_order_id(
         self, tx: Tx, client_order_id: str, broker_order_id: str, at: datetime
@@ -354,6 +385,7 @@ class OrdersRepository:
             send_attempted_at=opt_ts_from_db(row[20]),
             updated_at=ts_from_db(row[21]),
             last_synced_at=opt_ts_from_db(row[22]),
+            broker_filled_qty=opt_dec_from_db(row[23]),
         )
 
 
@@ -395,6 +427,61 @@ class OrderEventsRepository:
                 from_status=None if r[2] is None else OrderStatus(str_from_db(r[2])),
                 to_status=None if r[3] is None else OrderStatus(str_from_db(r[3])),
                 source=str_from_db(r[4]),
+                detail=None if r[5] is None else json.loads(str_from_db(r[5])),
+            )
+            for r in rows
+        ]
+
+
+# ------------------------------------------------------- order resolution attempts
+
+
+class ResolutionMethod(StrEnum):
+    BY_CLIENT_ID = "BY_CLIENT_ID"
+    LIST_SCAN = "LIST_SCAN"
+    ACTIVITY_SCAN = "ACTIVITY_SCAN"
+    OPERATOR = "OPERATOR"
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionAttempt:
+    client_order_id: str
+    ts: datetime
+    method: ResolutionMethod
+    result: str
+    detail: dict[str, Any] | None = None
+    id: int | None = None
+
+
+class ResolutionAttemptsRepository:
+    """Append-only evidence trail of the ambiguous-order protocol (ARCHITECTURE §10.3)."""
+
+    def append(self, tx: Tx, attempt: ResolutionAttempt) -> int:
+        return tx.insert(
+            "INSERT INTO order_resolution_attempts (client_order_id, ts, method, result, "
+            "detail_json) VALUES (?, ?, ?, ?, ?)",
+            (
+                attempt.client_order_id,
+                ts_to_db(attempt.ts),
+                attempt.method.value,
+                attempt.result,
+                None if attempt.detail is None else canonical_json(attempt.detail),
+            ),
+        )
+
+    def list_for_order(self, s: Session, client_order_id: str) -> list[ResolutionAttempt]:
+        rows = s.fetch_all(
+            "SELECT id, client_order_id, ts, method, result, detail_json "
+            "FROM order_resolution_attempts WHERE client_order_id = ? ORDER BY id",
+            (client_order_id,),
+        )
+        return [
+            ResolutionAttempt(
+                id=int_from_db(r[0]),
+                client_order_id=str_from_db(r[1]),
+                ts=ts_from_db(r[2]),
+                method=ResolutionMethod(str_from_db(r[3])),
+                result=str_from_db(r[4]),
                 detail=None if r[5] is None else json.loads(str_from_db(r[5])),
             )
             for r in rows
@@ -997,6 +1084,13 @@ class TradingStateRepository:
             at=at,
             run_id=reconciliation_run_id,
         )
+
+    def refuse_resume(
+        self, tx: Tx, *, reason_code: str, detail: str, actor: str, at: datetime
+    ) -> None:
+        """Record a refused resume (the halt flag is untouched)."""
+        self._event(tx, action="RESUME_REFUSED", reason_code=reason_code, detail=detail,
+                    actor=actor, at=at, run_id=None)  # fmt: skip
 
     def resume(
         self,

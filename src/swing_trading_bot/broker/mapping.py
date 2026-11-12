@@ -246,6 +246,10 @@ def activity_from_raw(raw: Raw) -> BrokerActivity:
         raw_json=raw_json(raw),
         symbol=opt_text(raw, "symbol"),
         net_amount=decimal(raw, "net_amount"),
+        order_id=opt_text(raw, "order_id"),
+        qty=opt_decimal(raw, "qty"),
+        per_share_amount=opt_decimal(raw, "per_share_amount"),
+        description=opt_text(raw, "description"),
     )
 
 

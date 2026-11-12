@@ -14,6 +14,14 @@ until]`` is *complete* only when both hold:
    with earlier timestamps (fees, dividends, corrections), so a window that has not
    aged past the posting lag can still change.
 
+"Complete" is an **operational** statement, not a permanent guarantee. The posting
+lag (assumed 15 minutes, unverified) is an assumption about typical broker behaviour:
+a correction, fee or dividend posted *later* than the lag, with an earlier timestamp,
+falls inside a window already marked complete and is invisible to the next forward
+window. Only a later historical re-scan that reaches back over it can find it. Hence
+:class:`RescanPolicy` and :func:`rescans_due`, and reconciliation over the whole period
+since the active baseline wherever practical.
+
 A cursor that simply advanced proves nothing about coverage. Any read failure,
 non-advancing cursor, conflicting duplicate or page cap raises
 :class:`IncompleteRetrievalError` carrying the activities read so far — they may be
@@ -26,8 +34,10 @@ Synchronization (steps 12-13) therefore:
 * ingests each window's activities and advances the durable coverage marker
   (``activities.complete_through``) in the **same** ledger transaction, and only for a
   complete window (``ledger.activity_coverage``);
-* re-scans from the start of the previous session daily and, in reconciliation, the
-  whole period since the active baseline.
+* runs the historical re-scans of :class:`RescanPolicy` (configurable overlap, periodic
+  longer lookbacks) and, in reconciliation, the whole period since the active
+  baseline. Re-scans never move the coverage marker backwards; anything they find
+  that is older than the marker is ingested as a late activity and flagged.
 """
 
 from __future__ import annotations
@@ -174,3 +184,73 @@ def collect_activities(
             raise InvalidBrokerDataError("activity pagination cursor did not advance")
         token = next_token
     raise InvalidBrokerDataError(f"activity window exceeded {max_pages} pages")
+
+
+# ---------------------------------------------------------------- historical re-scans
+
+
+@dataclass(frozen=True, slots=True)
+class RescanPolicy:
+    """How far back synchronization re-reads already-covered history.
+
+    * ``overlap`` — every forward window reaches back this far (>= posting lag);
+    * ``periodic_lookback`` / ``periodic_every`` — a longer re-scan run on a schedule
+      (e.g. 5 trading days, daily) to catch postings later than the lag;
+    * ``full_history`` — re-read everything since the active broker baseline during
+      reconciliation, when practical (bounded by broker retention and rate limits).
+
+    Values are operational choices to be tuned with contract-test evidence; none of them
+    makes coverage permanent.
+    """
+
+    posting_lag: timedelta
+    overlap: timedelta
+    periodic_lookback: timedelta
+    periodic_every: timedelta
+    full_history: bool = True
+
+    def __post_init__(self) -> None:
+        if self.posting_lag < timedelta(0):
+            raise ValueError("posting_lag must not be negative")
+        if self.overlap < self.posting_lag:
+            raise ValueError("overlap must be at least the posting lag")
+        if self.periodic_lookback <= self.overlap:
+            raise ValueError("periodic lookback must reach further back than the overlap")
+        if self.periodic_every <= timedelta(0):
+            raise ValueError("periodic_every must be positive")
+
+
+DEFAULT_RESCAN_POLICY = RescanPolicy(
+    posting_lag=timedelta(minutes=15),
+    overlap=timedelta(hours=1),
+    periodic_lookback=timedelta(days=7),
+    periodic_every=timedelta(days=1),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RescanWindow:
+    kind: str  # "OVERLAP" | "PERIODIC" | "FULL_HISTORY"
+    after: datetime | None
+    until: datetime
+
+
+def rescans_due(
+    policy: RescanPolicy,
+    *,
+    now: datetime,
+    complete_through: datetime | None,
+    last_periodic_rescan: datetime | None,
+    baseline_at: datetime | None,
+    reconciling: bool = False,
+) -> list[RescanWindow]:
+    """Windows synchronization should (re-)read now. Pure planning; reads nothing."""
+    until = now - policy.posting_lag
+    windows: list[RescanWindow] = []
+    if complete_through is not None:
+        windows.append(RescanWindow("OVERLAP", complete_through - policy.overlap, until))
+    if last_periodic_rescan is None or now - last_periodic_rescan >= policy.periodic_every:
+        windows.append(RescanWindow("PERIODIC", now - policy.periodic_lookback, until))
+    if reconciling and policy.full_history:
+        windows.append(RescanWindow("FULL_HISTORY", baseline_at, until))
+    return windows
