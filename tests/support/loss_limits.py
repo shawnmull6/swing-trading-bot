@@ -41,7 +41,7 @@ def hold(db: Database, pf: VirtualPortfolio, symbol: str, qty: str, price: str, 
 
 def close(mon: LossLimitMonitor, symbol: str, day: date, price: str) -> None:
     mon.record_session_close(
-        SessionClose(symbol, day, D(price), CloseSource.SESSION_CLOSE_BAR,
+        SessionClose(symbol, day, D(price), CloseSource.SIM,
                      as_of=et(day, 16, 0), received_at=et(day, 16, 5))
     )  # fmt: skip
 

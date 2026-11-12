@@ -175,9 +175,11 @@ def position_from_raw(raw: Raw) -> BrokerPosition:
         ) from None
 
 
-def account_from_raw(raw: Raw, *, as_of: datetime) -> AccountSnapshot:
+def account_from_raw(raw: Raw, *, as_of: datetime, environment: str) -> AccountSnapshot:
     return AccountSnapshot(
         as_of=as_of,
+        account_id=text(raw, "id"),
+        environment=environment,
         status=text(raw, "status"),
         currency=text(raw, "currency"),
         cash=decimal(raw, "cash"),

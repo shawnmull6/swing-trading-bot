@@ -72,6 +72,7 @@ from swing_trading_bot.domain.money import DECIMAL_CONTEXT, PRICE_QUANTUM, ZERO
 Raw = dict[str, Any]
 Mutator = Callable[[Raw], Raw]
 
+ENVIRONMENT = "sim"
 TERMINAL = frozenset({"filled", "canceled", "expired", "rejected"})
 
 
@@ -165,6 +166,10 @@ class SimConfig:
     pdt_check: str = "entry"
     dtbp_check: str = "entry"
     currency: str = "USD"
+    account_id: str = "sim-account-0001"
+    account_status: str = "ACTIVE"
+    trading_blocked: bool = False
+    suspend_trade: bool = False
 
 
 # ---------------------------------------------------------------- internal state
@@ -313,19 +318,22 @@ class SimBroker:
     def get_account(self) -> AccountSnapshot:
         self._enter("get_account")
         raw = {
-            "status": "ACTIVE",
+            "id": self.config.account_id,
+            "status": self.config.account_status,
             "currency": self.config.currency,
             "cash": _num(self._cash),
             "non_marginable_buying_power": _num(max(ZERO, self._cash)),
             "buying_power": _num(self._cash * self.config.margin_multiplier),  # never read
             "multiplier": _num(self.config.margin_multiplier),
             "pattern_day_trader": False,
-            "trading_blocked": False,
+            "trading_blocked": self.config.trading_blocked,
             "account_blocked": False,
             "accrued_fees": "0",
             "pending_reg_taf_fees": "0",
         }
-        return account_from_raw(self._mutate("get_account", raw), as_of=self.clock.now())
+        return account_from_raw(
+            self._mutate("get_account", raw), as_of=self.clock.now(), environment=ENVIRONMENT
+        )
 
     def get_account_config(self) -> AccountConfigSnapshot:
         self._enter("get_account_config")
@@ -334,7 +342,7 @@ class SimBroker:
             "max_margin_multiplier": _num(self.config.max_margin_multiplier),
             "pdt_check": self.config.pdt_check,
             "dtbp_check": self.config.dtbp_check,
-            "suspend_trade": False,
+            "suspend_trade": self.config.suspend_trade,
             "fractional_trading": False,
         }
         return account_config_from_raw(self._mutate("get_account_config", raw))

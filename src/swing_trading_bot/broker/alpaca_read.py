@@ -48,7 +48,12 @@ from swing_trading_bot.broker.alpaca_http import (
     real_sleep,
     with_read_retries,
 )
-from swing_trading_bot.broker.errors import InvalidBrokerDataError, OrderNotFoundError
+from swing_trading_bot.broker.errors import (
+    IncompleteRetrievalError,
+    InvalidBrokerDataError,
+    OrderNotFoundError,
+    UnsupportedBrokerOperationError,
+)
 from swing_trading_bot.broker.mapping import (
     account_config_from_raw,
     account_from_raw,
@@ -67,7 +72,7 @@ from swing_trading_bot.broker.models import (
     AccountConfigSnapshot,
     AccountSnapshot,
     ActivityPage,
-    BrokerSessionClose,
+    DailyBarClose,
     MarketClock,
 )
 from swing_trading_bot.broker.ports import MAX_ACTIVITY_PAGE_SIZE
@@ -81,6 +86,7 @@ MAX_ORDER_PAGES: Final = 50
 MAX_BAR_PAGES: Final = 20
 FEEDS: Final = frozenset({"iex", "sip", "delayed_sip"})
 SOURCE: Final = "alpaca"
+ENVIRONMENT: Final = "paper"
 
 
 def _utc_now() -> datetime:
@@ -150,7 +156,7 @@ class AlpacaPaperReadAdapter:
     # ------------------------------------------------------------- account
     def get_account(self) -> AccountSnapshot:
         raw = _as_object(self._get("account", "trading", "/account", {}), "account")
-        return account_from_raw(raw, as_of=self._clock())
+        return account_from_raw(raw, as_of=self._clock(), environment=ENVIRONMENT)
 
     def get_account_config(self) -> AccountConfigSnapshot:
         raw = self._get("account_config", "trading", "/account/configurations", {})
@@ -202,9 +208,18 @@ class AlpacaPaperReadAdapter:
     def _orders(
         self, status: str, *, after: datetime | None, until: datetime | None
     ) -> list[BrokerOrderSnapshot]:
-        """Page by submission time (``direction=asc``, ``limit=500``). The next page
-        starts at the last submitted_at (inclusive, then deduplicated by id) so orders
-        sharing a timestamp at a page boundary are not skipped."""
+        """Exhaustive order retrieval, or an error — never a silently truncated list.
+
+        ``GET /v2/orders`` has no page token: the only way to page is by submission time
+        (``direction=asc``, ``limit<=500``, ``after`` exclusive). Each next request starts
+        1 µs before the last page's newest ``submitted_at`` (so orders sharing that
+        timestamp are re-read) and results are deduplicated by order id.
+
+        Completeness is impossible when a full page contains only one timestamp: 500+
+        orders share it and the API returns an unspecified 500 of them. That, a response
+        not sorted by submission time, a missing ``submitted_at``, a non-advancing cursor
+        or the page cap all raise :class:`IncompleteRetrievalError` (fail closed).
+        """
         collected: dict[str, BrokerOrderSnapshot] = {}
         cursor = after
         for _ in range(MAX_ORDER_PAGES):
@@ -215,20 +230,43 @@ class AlpacaPaperReadAdapter:
             if until is not None:
                 params["until"] = iso_param(until)
             rows = _as_list(self._get("orders", "trading", "/orders", params), "orders")
+            if len(rows) > ORDERS_PAGE_LIMIT:
+                raise InvalidBrokerDataError("orders: page larger than the requested limit")
             page = [order_from_raw(r) for r in rows]
-            new = [o for o in page if o.broker_order_id not in collected]
+            stamps: list[datetime] = []
             for o in page:
+                if o.submitted_at is None:
+                    raise IncompleteRetrievalError(
+                        f"order {o.broker_order_id} has no submitted_at: cannot page safely",
+                        partial=tuple(collected.values()),
+                    )
+                stamps.append(o.submitted_at)
                 existing = collected.get(o.broker_order_id)
                 if existing is not None and existing.client_order_id != o.client_order_id:
                     raise InvalidBrokerDataError(f"order id {o.broker_order_id} changed identity")
-                collected[o.broker_order_id] = o
+            if stamps != sorted(stamps):
+                raise IncompleteRetrievalError(
+                    "orders: response not sorted by submitted_at; paging would be unsafe",
+                    partial=tuple(collected.values()),
+                )
+            new = [o for o in page if o.broker_order_id not in collected]
+            collected.update((o.broker_order_id, o) for o in page)
             if len(rows) < ORDERS_PAGE_LIMIT:
-                return list(collected.values())
+                return list(collected.values())  # short page: provably the tail
+            if stamps[0] == stamps[-1]:
+                raise IncompleteRetrievalError(
+                    f"orders: {ORDERS_PAGE_LIMIT}+ orders share submitted_at {stamps[0]}; "
+                    "the endpoint cannot enumerate them exhaustively",
+                    partial=tuple(collected.values()),
+                )
             if not new:
-                raise InvalidBrokerDataError("orders pagination made no progress")
-            last = page[-1].submitted_at or page[-1].updated_at
-            cursor = last - timedelta(microseconds=1)
-        raise InvalidBrokerDataError(f"orders exceeded {MAX_ORDER_PAGES} pages")
+                raise IncompleteRetrievalError(
+                    "orders: pagination cursor did not advance", partial=tuple(collected.values())
+                )
+            cursor = stamps[-1] - timedelta(microseconds=1)
+        raise IncompleteRetrievalError(
+            f"orders exceeded {MAX_ORDER_PAGES} pages", partial=tuple(collected.values())
+        )
 
     def get_order_by_client_id(self, client_order_id: str) -> BrokerOrderSnapshot | None:
         """None on 404 — which is NOT proof that the order does not exist (§10.3)."""
@@ -304,12 +342,24 @@ class AlpacaPaperReadAdapter:
             )  # fmt: skip
         return marks
 
-    def get_session_closes(
+    def get_official_closes(
         self, symbols: Sequence[str], session_date: date
-    ) -> dict[str, BrokerSessionClose]:
-        """Daily-bar close for ``session_date`` per symbol (missing symbols are absent)."""
+    ) -> dict[str, DailyBarClose]:
+        """Official consolidated closing prices: NOT SUPPORTED. No verified official-close
+        source is integrated (required before M2 execution). Fails closed rather than
+        substituting daily-bar observations."""
+        del symbols, session_date
+        raise UnsupportedBrokerOperationError(
+            "no verified official-close source; daily-bar closes are observations only"
+        )
+
+    def get_daily_bar_closes(
+        self, symbols: Sequence[str], session_date: date
+    ) -> dict[str, DailyBarClose]:
+        """Daily-bar close observations for ``session_date`` (missing symbols are absent).
+        Each carries its feed; for IEX this is IEX's last trade, not an official close."""
         wanted = self._symbols(symbols)
-        closes: dict[str, BrokerSessionClose] = {}
+        closes: dict[str, DailyBarClose] = {}
         if not wanted:
             return closes
         token: str | None = None
@@ -332,7 +382,7 @@ class AlpacaPaperReadAdapter:
                         continue
                     if symbol in closes:
                         raise InvalidBrokerDataError(f"bars: two daily bars for {symbol}")
-                    closes[symbol] = BrokerSessionClose(
+                    closes[symbol] = DailyBarClose(
                         symbol, session_date, json_number(bar, "c"), as_of, received, self._feed
                     )
             next_token = payload.get("next_page_token")

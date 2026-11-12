@@ -15,11 +15,13 @@ from swing_trading_bot.broker.alpaca_read import AlpacaPaperReadAdapter, iso_par
 from swing_trading_bot.broker.errors import (
     AuthenticationError,
     BrokerRequestError,
+    IncompleteRetrievalError,
     InvalidBrokerDataError,
     OrderNotFoundError,
     RateLimitedError,
     ServiceUnavailableError,
     UnknownBrokerStatusError,
+    UnsupportedBrokerOperationError,
 )
 from swing_trading_bot.broker.models import ActivityPage, BrokerActivity
 from swing_trading_bot.broker.ports import BrokerExecutionPort, BrokerReadPort, PriceMarkSource
@@ -211,8 +213,54 @@ def test_orders_pagination_with_boundary_overlap() -> None:
     # last order of page 1 was submitted at 15:00:49 -> next page starts 1 µs earlier
     assert t.calls[-1][2]["after"] == "2026-11-09T15:00:48.999999Z"
     t.respond("trading", "/orders", js(first), js(first))
-    with pytest.raises(InvalidBrokerDataError, match="no progress"):
+    with pytest.raises(IncompleteRetrievalError, match="did not advance") as info:
         adapter.get_orders(after=T_NOW - timedelta(hours=1))
+    assert len(info.value.partial) == 500  # what was read is attached, never "complete"
+
+
+SAME_TS = "2026-11-09T15:00:00.123456Z"
+
+
+@pytest.mark.parametrize("group", [500, 501, 750])
+def test_orders_sharing_one_timestamp_fail_closed(group: int) -> None:
+    """GET /orders has no page token: 500+ orders at one submitted_at cannot be enumerated
+    exhaustively (the API returns an unspecified 500). Never report that as complete."""
+    adapter, t, _ = make()
+    rows = [order(f"stb-{i}", submitted=SAME_TS) for i in range(group)]
+    t.respond("trading", "/orders", js(rows[:500]))
+    with pytest.raises(IncompleteRetrievalError, match="share submitted_at"):
+        adapter.get_orders(after=T_NOW - timedelta(hours=1))
+
+
+def test_saturated_boundary_group_detected_on_the_next_page() -> None:
+    adapter, t, _ = make()
+    early = [order(f"e{i}", submitted="2026-11-09T14:00:00.000000Z") for i in range(10)]
+    group = [order(f"g{i}", submitted=SAME_TS) for i in range(600)]
+    t.respond("trading", "/orders", js(early + group[:490]), js(group[:500]))
+    with pytest.raises(IncompleteRetrievalError, match="share submitted_at") as info:
+        adapter.get_orders(after=T_NOW - timedelta(hours=2))
+    assert len(info.value.partial) == 510
+
+
+def test_exactly_full_last_page_needs_a_confirming_short_page() -> None:
+    adapter, t, _ = make()
+    rows = [order(f"o{i}", submitted=f"2026-11-09T15:00:{i // 10:02d}.000000Z") for i in range(500)]
+    t.respond("trading", "/orders", js(rows), js(rows[-10:]))  # tail re-read, short page
+    assert len(adapter.get_orders(after=T_NOW - timedelta(hours=1))) == 500
+    assert len(t.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [([order("a", submitted="2026-11-09T15:00:02Z"), order("b", submitted="2026-11-09T15:00:01Z")],
+      "not sorted"),
+     ([{**order("a"), "submitted_at": None}], "no submitted_at")],
+)  # fmt: skip
+def test_unpageable_order_responses_fail_closed(rows: list[dict[str, Any]], message: str) -> None:
+    adapter, t, _ = make()
+    t.respond("trading", "/orders", rows)
+    with pytest.raises(IncompleteRetrievalError, match=message):
+        adapter.get_open_orders()
 
 
 @pytest.mark.parametrize(
@@ -477,7 +525,7 @@ def test_stale_and_invalid_market_prices() -> None:
         adapter.get_marks(["aapl"])
 
 
-def test_session_closes_from_daily_bars_with_pagination() -> None:
+def test_daily_bar_closes_with_pagination() -> None:
     adapter, t, _ = make(feed="sip")
     page1 = ('{"bars": {"AAPL": [{"t": "2026-11-09T05:00:00Z", "o": 150, "h": 152.5, '
              '"l": 149.75, "c": 151.1234, "v": 1000}]}, "next_page_token": "tok-1"}')  # fmt: skip
@@ -485,7 +533,7 @@ def test_session_closes_from_daily_bars_with_pagination() -> None:
                                   {"t": "2026-11-10T05:00:00Z", "c": "999"}]},
                 "next_page_token": None})  # fmt: skip
     t.respond("data", "/stocks/bars", page1, page2)
-    closes = adapter.get_session_closes(["AAPL", "MSFT", "SPY"], date(2026, 11, 9))
+    closes = adapter.get_daily_bar_closes(["AAPL", "MSFT", "SPY"], date(2026, 11, 9))
     assert {k: v.close for k, v in closes.items()} == {"AAPL": D("151.1234"), "MSFT": D("410.00")}
     assert closes["AAPL"].as_of.astimezone(MARKET_TZ).date() == date(2026, 11, 9)
     assert closes["AAPL"].feed == "sip"
@@ -495,7 +543,7 @@ def test_session_closes_from_daily_bars_with_pagination() -> None:
         {"t": "2026-11-09T05:00:00Z", "c": "1"}, {"t": "2026-11-09T05:00:00Z", "c": "2"}]},
         "next_page_token": None}))  # fmt: skip
     with pytest.raises(InvalidBrokerDataError, match="two daily bars"):
-        adapter.get_session_closes(["AAPL"], date(2026, 11, 9))
+        adapter.get_daily_bar_closes(["AAPL"], date(2026, 11, 9))
 
 
 def test_iso_param() -> None:
@@ -536,3 +584,10 @@ def test_collector_edge_cases() -> None:
     conflicting = ScriptedPort((_act("d", "-1"), _act("d", "-2")))
     with pytest.raises(InvalidBrokerDataError, match="different content"):
         collect_activities(conflicting, after=None, until=None)  # type: ignore[arg-type]
+
+
+def test_official_closes_are_unsupported_and_fail_closed() -> None:
+    adapter, t, _ = make(feed="sip")
+    with pytest.raises(UnsupportedBrokerOperationError, match="no verified official-close"):
+        adapter.get_official_closes(["AAPL"], date(2026, 11, 9))
+    assert t.calls == []  # nothing substituted, no request made

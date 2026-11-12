@@ -25,6 +25,9 @@ def _aware(value: datetime, name: str) -> datetime:
 @dataclass(frozen=True, slots=True)
 class AccountSnapshot:
     as_of: datetime
+    account_id: str
+    environment: str
+    """Which broker environment produced the snapshot: ``paper`` (Alpaca) or ``sim``."""
     status: str
     currency: str
     cash: Decimal
@@ -132,9 +135,10 @@ class SubmitOrderRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class BrokerSessionClose:
-    """A symbol's daily-bar close for one session, as reported by market data. Whether
-    it equals the official (consolidated) close depends on the feed (see §12.10)."""
+class DailyBarClose:
+    """The close of a market-data daily bar for one session: an OBSERVATION from the
+    named feed, never an official closing price. With ``feed="iex"`` it is IEX's own
+    last trade, not the consolidated close (§12.10)."""
 
     symbol: str
     session_date: date

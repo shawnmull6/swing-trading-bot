@@ -1239,6 +1239,116 @@ and defines no submit/replace/cancel method.
   it for M2.
 * Whether the trading API ever sends a monetary field as a JSON number. That would be
   rejected (fail closed), not converted.
+
+### 12.11 Step 9 integration refinements (before step 10)
+
+1. **Order-list pagination.**
+   * **What the API offers:** alpaca-py's `get_orders` makes a single
+     `GET /v2/orders` call. The endpoint has no page token and caps `limit` at 500.
+     Paging is only possible by submission time (`direction=asc`, `after` exclusive),
+     so timestamp overlap is the only strategy.
+   * **What it can't guarantee:** complete retrieval when 500 or more orders share
+     one `submitted_at`. The API returns an unspecified 500 of them, and nothing can
+     reach the rest.
+   * **What the adapter does:**
+     * a full page that contains only one timestamp, a response not sorted by
+       submission time, a missing `submitted_at`, a non-advancing cursor, or the
+       page cap each raise `IncompleteRetrievalError`, with the orders read so far
+       attached as `partial`;
+     * a short page is the only proof of completeness, so an exactly full last page
+       always triggers one more request;
+     * an incomplete scan is never returned as a list.
+2. **Activity coverage.** `broker/activity_feed.collect_window` returns an
+   `ActivityWindow` whose `complete` flag requires both:
+   * **tail confirmed:** pagination ended on an empty or short page;
+   * **closed:** `until ≤ now − posting_lag`, because activities can be posted late.
+
+   A cursor that simply advanced never establishes coverage, and a window that is
+   fully paginated but not yet closed is not complete. Interrupted pagination or the
+   page cap raise `IncompleteRetrievalError` with the partial activities, which can be
+   ingested idempotently. The durable marker `activities.complete_through`
+   (`ledger/activity_coverage.py`, stored in `sync_state`, no schema change) only moves
+   forward, only for a complete window, and never across a gap. It is to be written
+   in the same transaction that ingests the window. Future synchronization (steps
+   12–13) reads overlapping windows (each `after` reaching back at least the posting
+   lag) and re-scans the previous session daily; reconciliation re-scans since the
+   baseline. The posting lag (assumed 15 minutes) is a contract-test item; activities
+   posted later than that are still caught by the overlap re-scan.
+3. **Official closes.**
+   * Migration 0004 rebuilds `session_closes` with explicit provenance:
+     * `OFFICIAL`: a verified official close (no source implemented in M1);
+     * `DAILY_BAR`: a feed observation, which requires `feed ∈ {iex, sip, delayed_sip}`;
+     * `SIM`.
+
+     The primary key is now (symbol, session, source). Unclassifiable legacy
+     `SESSION_CLOSE_BAR` rows abort the migration.
+   * Baselines accept only `OFFICIAL` or `SIM` closes (`LossLimitConfig.baseline_close_sources`
+     refuses `DAILY_BAR`). With only a daily-bar observation the baseline is missing,
+     and the problem text names the observation (`DAILY_BAR/iex`); nothing is
+     substituted.
+   * The adapter returns `DailyBarClose` observations (labelled with their feed) via
+     `get_daily_bar_closes`. `get_official_closes` raises
+     `UnsupportedBrokerOperationError` without making a request.
+   * **A verified official-close source is required before M2 execution.**
+
+### 12.12 Step 10: startup readiness and trading gates (as built)
+
+Code: `risk/gates.py` (`TradingGates`, `StartupGate`, `GateStatus`), `ledger/sync_keys.py`.
+`AccountSnapshot` gained `account_id` and `environment` (`paper` or `sim`). No schema
+change.
+
+* **Layers.** All three are evaluated on every call, and every one must be clear for a
+  new entry.
+  * **STARTUP prerequisites:**
+    * ledger mode equals the configured mode;
+    * SQLite integrity and all data and accounting invariants pass;
+    * the portfolio exists;
+    * the broker account ID and environment were recorded at initialization (`sync_state`);
+    * the connected account and environment match them;
+    * the account configuration is supported (no `suspend_trade`, no fractional
+      trading);
+    * a clean reconciliation run within `reconciliation_max_age` exists.
+
+    `StartupGate` is in memory and blocked at process start (`STARTUP_INCOMPLETE`).
+    `run_startup` clears it only when every prerequisite passes, and clearing it
+    removes `STARTUP_INCOMPLETE` and nothing else.
+  * **PERSISTENT:** the stored halt (`PERSISTENT_HALT`, with its reason). Never cleared
+    by gates; an operator resume backed by an OK reconciliation is the only way.
+  * **TRANSIENT, re-derived each call:**
+    * runtime mode (observe has no execution) and the `TRADING_ENABLED` switch;
+    * broker read failures (unavailable / auth / invalid data), account restricted,
+      market closed;
+    * broker sync older than `max_sync_age`;
+    * activity coverage older than `posting_lag + max_sync_age`;
+    * reconciliation inconclusive, mismatched or stale;
+    * calendar unavailable, or insufficient fresh future coverage;
+    * unresolved orders (`PENDING_SUBMIT`, `SUBMIT_AMBIGUOUS`, `ORPHAN`) and unexplained
+      broker activities;
+    * every portfolio entry blocker (marks, settlement, capital) and loss-limit
+      blocker (baselines, equity, daily lockout, weekly limit, gap stress).
+
+    Unknown upstream codes become `UNMAPPED_BLOCKER`.
+  * **ADVISORY, non-blocking:** `ACCOUNT_PROTECTIONS_NOT_SET` (U6: report-only in M1;
+    blocking when `require_m2_account_protections`) and `CALENDAR_HORIZON_SHORT`.
+* **Read-only, fail closed.** Broker reads (account, configuration, clock) happen first,
+  guarded by `assert_no_transaction`. Then one read-only ledger snapshot is taken.
+  Evaluation never writes. Missing, stale, contradictory or unavailable inputs block.
+* **Exits vs new entries.** `GateStatus.exits` reports risk-reducing exits as permitted
+  in principle unless a condition would make any broker action unsafe:
+  * ledger mode or integrity failure, or a missing portfolio;
+  * broker identity, environment, availability, auth or data failure.
+
+  Persistent halts and loss limits never forbid exits. `execution_available` is False
+  in M1.
+* **Reporting.** Findings are de-duplicated and sorted by (layer, reason, detail).
+  `GateStatus.reason_codes`, `to_dict()` (deterministic and JSON-friendly) and
+  `render()` give the operator view.
+* **Deviations from §7:**
+  * Startup readiness here covers stored and broker-read prerequisites only. Running
+    the sync, recovery and reconciliation that produce that state is steps 12–14.
+  * Weekly-limit and daily-lockout blocks come from the loss monitor, so a resume can
+    never bypass them.
+  * Observe mode always blocks new entries (`RUNTIME_MODE_NO_EXECUTION`).
 ---
 
 ## 13. Configuration & secrets

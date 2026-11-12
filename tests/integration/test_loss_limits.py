@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -390,13 +391,32 @@ def test_report_is_read_only(holding: Setup) -> None:
 
 def test_session_closes_are_immutable(setup: Setup) -> None:
     _, _, mon = setup
-    c = SessionClose("AAPL", MON, D("100.00"), CloseSource.SESSION_CLOSE_BAR,
+    c = SessionClose("AAPL", MON, D("100.00"), CloseSource.SIM,
                      as_of=et(MON, 16), received_at=et(MON, 16, 5))  # fmt: skip
     assert mon.record_session_close(c) is IngestResult.INSERTED
     assert mon.record_session_close(c) is IngestResult.DUPLICATE
-    changed = SessionClose("AAPL", MON, D("100.01"), CloseSource.SESSION_CLOSE_BAR,
+    changed = SessionClose("AAPL", MON, D("100.01"), CloseSource.SIM,
                            as_of=et(MON, 16), received_at=et(MON, 16, 5))  # fmt: skip
     assert mon.record_session_close(changed) is IngestResult.CONFLICT
+
+
+def test_iex_daily_bar_is_never_used_as_an_official_close(holding: Setup) -> None:
+    db, pf, mon = holding
+    with pytest.raises(ValueError, match="must name its feed"):
+        SessionClose("AAPL", MON, D("99"), CloseSource.DAILY_BAR, as_of=et(MON, 0),
+                     received_at=et(MON, 17))  # fmt: skip
+    iex = SessionClose("AAPL", MON, D("99.00"), CloseSource.DAILY_BAR, as_of=et(MON, 0),
+                       received_at=et(MON, 17), feed="iex")  # fmt: skip
+    assert mon.record_session_close(iex) is IngestResult.INSERTED
+    r = evaluate_at(db, pf, mon, et(TUE, 10), {"AAPL": "99.00"})
+    assert LossBlocker.SESSION_BASELINE_MISSING in r.blockers  # fails closed, no substitution
+    assert any("only non-official observations: ['DAILY_BAR/iex']" in p for p in r.problems)
+    close(mon, "AAPL", MON, "99.50")  # SIM close for the same session coexists
+    r = evaluate_at(db, pf, mon, et(TUE, 10, 1), {"AAPL": "99.00"})
+    assert r.daily_baseline is not None and r.daily_baseline.equity == D("4990.00")
+    assert r.daily_baseline.marks[0]["source"] == "SIM"
+    with pytest.raises(ValueError, match="cannot value baselines"):
+        replace(CONFIG, baseline_close_sources=(CloseSource.DAILY_BAR,))
 
 
 # ------------------------------------------------------------------ gap stress

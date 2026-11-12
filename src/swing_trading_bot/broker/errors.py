@@ -116,6 +116,22 @@ class OrderNotFoundError(BrokerError):
     """A lookup found nothing. NOT proof that an order does not exist (§10.3)."""
 
 
+class IncompleteRetrievalError(BrokerError):
+    """A multi-request read could not be proven complete (saturated page at a single
+    timestamp, interrupted pagination, page cap reached, unclosed window). Whatever was
+    read is attached as ``partial`` (safe to ingest idempotently) but must never be
+    reported or recorded as complete."""
+
+    def __init__(self, message: str, *, partial: tuple[object, ...] = ()) -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
+class UnsupportedBrokerOperationError(BrokerError):
+    """The requested read has no verified source (e.g. official closing prices). Fails
+    closed instead of substituting a different kind of data."""
+
+
 def submit_failure_state(error: BaseException) -> OrderState:
     """What a failed submit proves about the order. Only an explicit broker rejection
     proves non-acceptance; anything unexpected is UNKNOWN."""

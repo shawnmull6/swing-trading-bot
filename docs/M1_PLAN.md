@@ -1,8 +1,8 @@
 # Milestone M1 — Core Infrastructure & Portfolio Accounting
 
-Status: **Revision 3 — architecture approved; all decisions final. Steps 1–8 approved;
-step 9 (read-only Alpaca adapter, plus broker-contract refinements) implemented and
-awaiting review (see ARCHITECTURE §12.10). Live read-only contract checks not run.
+Status: **Revision 3 — architecture approved; all decisions final. Steps 1–9 approved
+(step 9 with integration refinements, §12.11); step 10 (startup readiness & trading gates)
+implemented and awaiting review (§12.12). Live read-only contract checks not run.
 No order submission; no commits until reviewed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
@@ -267,7 +267,9 @@ M1 is complete when all of the following are demonstrated:
 | Paper account is 4× margin; broker won't stop leverage | Verified | virtual gate + broker cash backstop; operator settings (D15); U6 |
 | Fee reported both on a fill and as a FEE activity (double count) | Adapter contract | Alpaca adapter sets fill fees to 0; regulatory fees only via FEE activities (§12.8); CT confirms fill activities carry no fees |
 | Late activity executed before booked fills (average-cost order) | Detected | Booked then halt `OUT_OF_ORDER`; restatement procedure required before M2 |
-| IEX daily-bar close used as session close | Assumption / limitation | Not the consolidated official close; SIP or official-close source required before M2 baselines rely on it (§12.10) |
+| No verified official-close source | Limitation (M2 blocker) | Daily-bar observations (IEX/SIP) are never accepted as official; baselines need an OFFICIAL source before M2 execution (§12.11) |
+| 500+ orders sharing one submitted_at | Detected | `/orders` cannot enumerate them; fails closed with IncompleteRetrievalError (§12.11) |
+| Activity posting lag (assumed 15 min) | Assumption | Window closure + overlap re-scan; CT confirms actual lag |
 | Alpaca activities cursor / window semantics | Assumption | Opaque-ID collector + overlapping windows + idempotent ingestion regardless; CT confirms |
 | Paper fills are optimistic | Known | out of M1 scope; slippage tracking in M2 |
 | PDT/settlement regulation changes | Regulatory | rules in configurable account profiles, not hard-coded |

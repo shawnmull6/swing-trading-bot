@@ -28,8 +28,19 @@ from swing_trading_bot.ledger.repositories import IngestResult, canonical_json
 
 
 class CloseSource(StrEnum):
-    SESSION_CLOSE_BAR = "SESSION_CLOSE_BAR"
+    """Provenance of a stored session close (migration 0004).
+
+    Only ``OFFICIAL`` (a verified official closing price) and ``SIM`` (simulation) may
+    value a baseline. ``DAILY_BAR`` is a market-data observation — for the IEX feed a
+    single-venue last trade — and is never presented as an official close.
+    """
+
+    OFFICIAL = "OFFICIAL"
+    DAILY_BAR = "DAILY_BAR"
     SIM = "SIM"
+
+
+DAILY_BAR_FEEDS = frozenset({"iex", "sip", "delayed_sip"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,17 +53,22 @@ class SessionClose:
     received_at: datetime
     feed: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.close_price <= 0:
+            raise ValueError("close price must be positive")
+        if self.source is CloseSource.DAILY_BAR and self.feed not in DAILY_BAR_FEEDS:
+            raise ValueError("a DAILY_BAR close must name its feed (iex, sip, delayed_sip)")
+
 
 class SessionClosesRepository:
     _COLS = "symbol, session_date, close_price, source, as_of, received_at, feed"
 
     def record(self, tx: Tx, close: SessionClose) -> IngestResult:
-        """Insert once; an identical re-record is DUPLICATE, a different price CONFLICT."""
-        if close.close_price <= 0:
-            raise ValueError("close price must be positive")
-        existing = self.get(tx, close.symbol, close.session_date)
+        """Insert once per (symbol, session, source); an identical re-record is
+        DUPLICATE, a different price CONFLICT (never overwritten)."""
+        existing = self.get(tx, close.symbol, close.session_date, close.source)
         if existing is not None:
-            same = (existing.close_price, existing.source) == (close.close_price, close.source)
+            same = (existing.close_price, existing.feed) == (close.close_price, close.feed)
             return IngestResult.DUPLICATE if same else IngestResult.CONFLICT
         tx.execute(
             f"INSERT INTO session_closes ({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -68,13 +84,26 @@ class SessionClosesRepository:
         )
         return IngestResult.INSERTED
 
-    def get(self, s: Session, symbol: str, session_date: date) -> SessionClose | None:
+    def get(
+        self, s: Session, symbol: str, session_date: date, source: CloseSource
+    ) -> SessionClose | None:
         row = s.fetch_one(
-            f"SELECT {self._COLS} FROM session_closes WHERE symbol = ? AND session_date = ?",
+            f"SELECT {self._COLS} FROM session_closes "
+            "WHERE symbol = ? AND session_date = ? AND source = ?",
+            (symbol, date_to_db(session_date), source.value),
+        )
+        return None if row is None else self._from_row(row)
+
+    def list_for(self, s: Session, symbol: str, session_date: date) -> list[SessionClose]:
+        rows = s.fetch_all(
+            f"SELECT {self._COLS} FROM session_closes WHERE symbol = ? AND session_date = ? "
+            "ORDER BY source",
             (symbol, date_to_db(session_date)),
         )
-        if row is None:
-            return None
+        return [self._from_row(r) for r in rows]
+
+    @staticmethod
+    def _from_row(row: tuple[Any, ...]) -> SessionClose:
         return SessionClose(
             symbol=str_from_db(row[0]),
             session_date=date_from_db(row[1]),

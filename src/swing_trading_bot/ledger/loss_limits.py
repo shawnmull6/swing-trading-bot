@@ -58,6 +58,7 @@ from swing_trading_bot.ledger.codec import dec_from_db, str_from_db, ts_to_db
 from swing_trading_bot.ledger.db import Database, Session, Tx
 from swing_trading_bot.ledger.loss_limit_store import (
     BaselineBasis,
+    CloseSource,
     EquitySnapshot,
     EquitySnapshotsRepository,
     LossEvent,
@@ -83,6 +84,13 @@ class LossLimitConfig:
     gap_position_pct: Decimal
     gap_portfolio_pct: Decimal
     calendar_max_age: timedelta
+    baseline_close_sources: tuple[CloseSource, ...] = (CloseSource.OFFICIAL, CloseSource.SIM)
+    """Close sources allowed to value a baseline, in preference order. DAILY_BAR
+    observations (e.g. IEX) are never substituted for an official close."""
+
+    def __post_init__(self) -> None:
+        if CloseSource.DAILY_BAR in self.baseline_close_sources:
+            raise ValueError("daily-bar observations cannot value baselines")
 
     @classmethod
     def from_risk_limits(cls, r: RiskLimits, *, calendar_max_age: timedelta) -> LossLimitConfig:
@@ -235,14 +243,27 @@ class LossLimitMonitor:
         for sym in sorted(qty):
             if qty[sym] == ZERO:
                 continue
-            close = self._closes.get(s, sym, ref.session_date)
+            close = next(
+                (
+                    c
+                    for src in self._config.baseline_close_sources
+                    if (c := self._closes.get(s, sym, ref.session_date, src)) is not None
+                ),
+                None,
+            )
             if close is None:
-                missing.append(f"no official close for {sym} on {ref.session_date}")
+                observed = [
+                    f"{c.source.value}/{c.feed}"
+                    for c in self._closes.list_for(s, sym, ref.session_date)
+                ]
+                suffix = f" (only non-official observations: {observed})" if observed else ""
+                missing.append(f"no official close for {sym} on {ref.session_date}{suffix}")
                 continue
             market_value += qty[sym] * close.close_price
             marks.append(
                 {"symbol": sym, "qty": qty[sym], "close": close.close_price,
-                 "source": close.source.value, "as_of": close.as_of.isoformat()}
+                 "source": close.source.value, "feed": close.feed,
+                 "as_of": close.as_of.isoformat()}
             )  # fmt: skip
         if missing:
             return None, missing
