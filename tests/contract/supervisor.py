@@ -10,29 +10,35 @@ Shared supervision for the live read-only contract run (Step 15A.1: R1, R2, R5, 
   is refused before it is sent.
 * :class:`BudgetedSession` — a GET-only, allowlisted ``requests`` session wrapper. Each
   attempt is counted *before* it is sent; connect/read timeouts are cut to the remaining
-  deadline; response metadata is reduced to an allowlist of rate-limit headers; raw
-  bodies are kept only for the local evidence directory, with secret values redacted.
+  deadline; response metadata is reduced to an allowlist of rate-limit headers; the
+  original body is kept **in memory only** (never logged, never in ``repr``).
 * :func:`bounded_sleep` — retry backoff that never sleeps past the deadline.
 * :class:`EvidenceWriter` — 0700 directories, 0600 files, no symlinks, no pre-existing
   destinations, and (by default) only inside the Git-ignored ``contract-evidence/``.
+* Evidence sanitization (Step 15B.5C) — :func:`sanitize_body` parses JSON bodies into a
+  structure (exact ``Decimal`` numbers, ``null``/booleans/arrays/objects preserved),
+  redacts by an explicit key/value policy, serializes canonically and verifies the result;
+  non-JSON text gets exact-value replacement only. Every failure is a fixed-code
+  :class:`SanitizationError` raised **before** anything is written.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final
 from urllib.parse import urlsplit
 
 from swing_trading_bot.broker.alpaca_http import ALLOWED_ORIGINS
-from swing_trading_bot.observability.logging import SecretRedactor
 
 REPO: Final = Path(__file__).resolve().parents[2]
 EVIDENCE_ROOT: Final = REPO / "contract-evidence"
@@ -125,16 +131,16 @@ class Exchange:
     path: str
     status: int
     rate_headers: dict[str, str]
-    body: str = field(repr=False)
+    body: str = field(repr=False)  # the ORIGINAL response text: in memory only, never
+    # logged; persisted solely through sanitize_body() (Step 15B.5C)
 
 
 class BudgetedSession:
     """GET-only, allowlisted, budgeted. Wraps any object with ``get(url, **kw)``."""
 
-    def __init__(self, inner: Any, budget: RequestBudget, redactor: SecretRedactor) -> None:
+    def __init__(self, inner: Any, budget: RequestBudget) -> None:
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "budget", budget)
-        object.__setattr__(self, "_redactor", redactor)
         object.__setattr__(self, "exchanges", [])
 
     def __getattr__(self, name: str) -> Any:
@@ -164,7 +170,7 @@ class BudgetedSession:
         kept = {h: str(headers[h]) for h in RATE_HEADERS if h in headers}
         self.exchanges.append(Exchange("GET", parts.netloc, parts.path,
                                        int(response.status_code), kept,
-                                       self._redactor.redact(response.text)))  # fmt: skip
+                                       response.text))  # fmt: skip
         self.budget.check_time()
         return response
 
@@ -223,18 +229,224 @@ def rate_limit_evidence(exchanges: Iterable[Exchange]) -> dict[str, Any]:
     return out
 
 
-# ============================================================ evidence (R5)
+# ============================================================ evidence (R5, 15B.5C)
 class EvidenceError(RuntimeError):
     pass
 
 
+class SanitizationError(Exception):
+    """Evidence could not be proven sanitized. ``code`` is a fixed diagnostic; the message
+    never contains response content, a value or an index into one."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+REDACTED: Final = "***REDACTED***"
+#: Keys whose string/number values are always hidden (a credential could sit there).
+#: ``null`` and booleans under them carry nothing and are kept (``next_page_token: null``).
+CREDENTIAL_KEY: Final = re.compile(
+    r"(?i)(api[_-]?key|secret|token|password|passwd|authorization|apca-api-key-id|"
+    r"apca-api-secret-key|credential)"
+)
+#: Account identifiers: hidden by key anywhere, and their values everywhere (exact match).
+ACCOUNT_ID_KEYS: Final = frozenset({"account_number", "account_id"})
+#: Responses whose top-level ``id`` is the account identifier.
+ACCOUNT_PATHS: Final = frozenset({"/v2/account"})
+#: Summary-only sensitive keys (any depth): never in ``summary.json``; private raw
+#: evidence may keep them (balances, positions, activity/order ids).
+SENSITIVE_KEYS: Final = (
+    "id", "account_number", "cash", "equity", "buying_power", "non_marginable_buying_power",
+    "portfolio_value", "last_equity", "symbol", "qty", "market_value", "order_id",
+    "client_order_id",
+)  # fmt: skip
+_NOT_JSON: Final = object()
+#: Deepest nesting accepted in evidence (Alpaca payloads are a few levels deep); deeper is
+#: refused explicitly instead of risking recursion limits in the redactor.
+MAX_EVIDENCE_DEPTH: Final = 64
+
+
+def _reject_constant(_name: str) -> object:
+    raise ValueError("non-JSON constant")
+
+
+def _expects_json(ex: Exchange) -> bool:
+    return 200 <= ex.status < 300
+
+
+def parse_body(ex: Exchange) -> object:
+    """The body as JSON (``Decimal`` for fractions/exponents; ``NaN``/``Infinity``
+    rejected), or ``_NOT_JSON``. A successful response is expected to be JSON: if it is
+    not, that is :class:`SanitizationError` — it is never skipped silently."""
+    if not ex.body:
+        return _NOT_JSON
+    try:
+        doc = json.loads(ex.body, parse_float=Decimal, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        if _expects_json(ex):
+            raise SanitizationError("EVIDENCE_JSON_MALFORMED") from None
+        return _NOT_JSON
+    _check_depth(doc)
+    return doc
+
+
+def _check_depth(doc: object) -> None:
+    stack: list[tuple[object, int]] = [(doc, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if isinstance(value, (dict, list)):
+            if depth > MAX_EVIDENCE_DEPTH:
+                raise SanitizationError("EVIDENCE_TOO_DEEP")
+            items = value.values() if isinstance(value, dict) else value
+            stack.extend((item, depth + 1) for item in items)
+
+
+def _pairs(value: object) -> Iterable[tuple[str, object]]:
+    if isinstance(value, dict):
+        for k, v in value.items():
+            yield k, v
+            yield from _pairs(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _pairs(v)
+
+
+def identity_values(exchanges: Iterable[Exchange], secrets: Iterable[str]) -> list[str]:
+    """Values that must never be persisted anywhere: the credentials plus every account
+    identifier (``account_number``/``account_id`` at any depth, the account ``id``)."""
+    values: set[str] = {s for s in secrets if s}
+    for ex in exchanges:
+        doc = parse_body(ex)
+        if doc is _NOT_JSON:
+            continue
+        values.update(v for k, v in _pairs(doc)
+                      if k in ACCOUNT_ID_KEYS and isinstance(v, str) and v)  # fmt: skip
+        if ex.path in ACCOUNT_PATHS and isinstance(doc, dict):
+            account_id = doc.get("id")
+            if isinstance(account_id, str) and account_id:
+                values.add(account_id)
+    return sorted(values, key=lambda v: (-len(v), v))  # longest first: overlaps fully masked
+
+
+def _summary_value(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, Decimal)) and not isinstance(value, bool):
+        return str(value)
+    return None
+
+
+def forbidden_values(exchanges: Iterable[Exchange], secrets: Iterable[str]) -> list[str]:
+    """Values that must never appear in a sanitized summary, collected from the
+    **original** bodies: the identity values plus every value of a :data:`SENSITIVE_KEYS`
+    key at any depth (balances, positions, activity ids, ...). Malformed expected-JSON
+    evidence raises :class:`SanitizationError` instead of being skipped."""
+    items = list(exchanges)
+    values = set(identity_values(items, secrets))
+    for ex in items:
+        doc = parse_body(ex)
+        if doc is _NOT_JSON:
+            continue
+        for key, raw in _pairs(doc):
+            value = _summary_value(raw) if key in SENSITIVE_KEYS else None
+            if value is not None and len(value) >= 4:
+                values.add(value)
+    return sorted(values)
+
+
+def _scrub(text: str, identities: Sequence[str]) -> str:
+    for value in identities:
+        text = text.replace(value, REDACTED)
+    return text
+
+
+def _redact(value: object, identities: Sequence[str], hide: bool) -> object:
+    if isinstance(value, dict):
+        out: dict[str, object] = {}
+        for key, item in value.items():
+            new_key = _scrub(key, identities)
+            if new_key in out:
+                raise SanitizationError("EVIDENCE_KEY_COLLISION")
+            sensitive = hide or bool(CREDENTIAL_KEY.search(key)) or key in ACCOUNT_ID_KEYS
+            out[new_key] = _redact(item, identities, sensitive)
+        return out
+    if isinstance(value, list):
+        return [_redact(item, identities, hide) for item in value]
+    if value is None or isinstance(value, bool):
+        return value
+    if hide and isinstance(value, (str, int, Decimal)):
+        return REDACTED
+    if isinstance(value, str):
+        return _scrub(value, identities)
+    return value
+
+
+def canonical_json(value: object) -> str:
+    """Deterministic JSON text: sorted keys, compact separators, exact ``Decimal``
+    numbers. NaN/Infinity and any type JSON cannot represent raise
+    :class:`SanitizationError` — nothing is coerced (no ``default=str``)."""
+    parts: list[str] = []
+    _encode(value, parts)
+    return "".join(parts)
+
+
+def _encode(value: object, out: list[str]) -> None:
+    if isinstance(value, dict):
+        if not all(isinstance(k, str) for k in value):
+            raise SanitizationError("EVIDENCE_UNSUPPORTED_TYPE")
+        out.append("{")
+        for n, key in enumerate(sorted(value)):
+            out.append("," if n else "")
+            out.append(json.dumps(key) + ":")
+            _encode(value[key], out)
+        out.append("}")
+    elif isinstance(value, list):
+        out.append("[")
+        for n, item in enumerate(value):
+            out.append("," if n else "")
+            _encode(item, out)
+        out.append("]")
+    elif isinstance(value, Decimal):
+        if not value.is_finite():
+            raise SanitizationError("EVIDENCE_NON_FINITE_NUMBER")
+        out.append(str(value))
+    elif value is None or isinstance(value, (str, int)):  # bool is an int
+        out.append(json.dumps(value))
+    else:  # float (never produced by parse_body), objects, sets, bytes, ...
+        raise SanitizationError("EVIDENCE_UNSUPPORTED_TYPE")
+
+
+def _verify_absent(text: str, identities: Iterable[str]) -> None:
+    for value in identities:
+        if value in text or json.dumps(value)[1:-1] in text:
+            raise SanitizationError("EVIDENCE_FORBIDDEN_VALUE")
+
+
+def sanitize_body(ex: Exchange, identities: Sequence[str]) -> str:
+    """The persisted form of one exchange: ``{"body": <text>, "status": <int>}`` where a
+    JSON body is the canonical, redacted JSON text (still valid JSON) and a non-JSON body
+    has every identity value replaced exactly. Verified: no identity value — raw or
+    JSON-escaped — survives."""
+    doc = parse_body(ex)
+    if doc is _NOT_JSON:
+        body = _scrub(ex.body, identities)
+    else:
+        body = canonical_json(_redact(doc, identities, hide=False))
+    text = json.dumps({"status": ex.status, "body": body})
+    _verify_absent(body, identities)
+    _verify_absent(text, identities)
+    return text
+
+
 def assert_sanitized(summary: Mapping[str, Any], forbidden: Iterable[str]) -> str:
     """Serialize ``summary``; refuse if any forbidden value appears in it."""
-    text = json.dumps(summary, indent=2, sort_keys=True)
-    leaked = [i for i, value in enumerate(forbidden) if value and len(value) >= 4
-              and value in text]  # fmt: skip
-    if leaked:
-        raise AssertionError(f"sanitized summary contains forbidden value(s) #{leaked}")
+    try:
+        text = json.dumps(summary, indent=2, sort_keys=True)
+    except (TypeError, ValueError):
+        raise SanitizationError("SUMMARY_UNSERIALIZABLE") from None
+    if any(value and len(value) >= 4 and value in text for value in forbidden):
+        raise SanitizationError("SUMMARY_FORBIDDEN_VALUE")
     return text
 
 
@@ -289,38 +501,16 @@ class EvidenceWriter:
         os.chmod(path, 0o600)
 
     def write(self, exchanges: Iterable[Exchange], summary: Mapping[str, Any],
-              forbidden: Iterable[str]) -> Path:  # fmt: skip
+              forbidden: Iterable[str], *, secrets: Iterable[str] = ()) -> Path:  # fmt: skip
+        """Everything is sanitized and verified first; a :class:`SanitizationError`
+        leaves nothing on disk."""
+        items = list(exchanges)
         text = assert_sanitized(summary, list(forbidden))
+        identities = identity_values(items, secrets)
+        raw = [(f"{n:03d}-{ex.host.split('.')[0]}{ex.path.replace('/', '_')}.json",
+                sanitize_body(ex, identities)) for n, ex in enumerate(items)]  # fmt: skip
         target = self._prepare()
-        for n, ex in enumerate(exchanges):
-            name = f"{n:03d}-{ex.host.split('.')[0]}{ex.path.replace('/', '_')}.json"
-            self._write(target / "raw" / name, json.dumps({"status": ex.status, "body": ex.body}))
+        for name, body in raw:
+            self._write(target / "raw" / name, body)
         self._write(target / "summary.json", text)
         return target / "summary.json"
-
-
-SENSITIVE_KEYS: Final = (
-    "id", "account_number", "cash", "equity", "buying_power", "non_marginable_buying_power",
-    "portfolio_value", "last_equity", "symbol", "qty", "market_value", "order_id",
-    "client_order_id",
-)  # fmt: skip
-
-
-def forbidden_values(exchanges: Iterable[Exchange], secrets: Iterable[str]) -> list[str]:
-    """Values that must never appear in a sanitized summary: the secrets plus every
-    account identifier, account number, balance, position and activity id the run saw."""
-    values: set[str] = {s for s in secrets if s}
-    for ex in exchanges:
-        try:
-            body = json.loads(ex.body) if ex.body else None
-        except ValueError:
-            continue
-        rows = body if isinstance(body, list) else [body]
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            for key in SENSITIVE_KEYS:
-                value = row.get(key)
-                if isinstance(value, str) and len(value) >= 4:
-                    values.add(value)
-    return sorted(values)

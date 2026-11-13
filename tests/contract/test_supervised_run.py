@@ -21,7 +21,6 @@ import pytest
 import requests
 
 from swing_trading_bot.broker.errors import AuthenticationError, ServiceUnavailableError
-from swing_trading_bot.observability.logging import SecretRedactor
 from tests.contract import checks as contract_checks
 from tests.contract.live_run import fail_if_not_ok, render, run_supervised
 from tests.contract.supervisor import (
@@ -205,7 +204,7 @@ def test_timeouts_are_cut_to_the_remaining_deadline() -> None:
     clock = FakeTime()
     inner = HarnessSession(clock)
     budget = RequestBudget(monotonic=clock, deadline_s=3)
-    spy = BudgetedSession(inner, budget, SecretRedactor())
+    spy = BudgetedSession(inner, budget)
     spy.get("https://paper-api.alpaca.markets/v2/clock", params={}, headers={},
             timeout=(5, 20), allow_redirects=False)  # fmt: skip
     assert inner.timeouts[0] == (3.0, 3.0)

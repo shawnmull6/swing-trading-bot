@@ -10,8 +10,9 @@ stopped in setup on missing configuration fields; step 15B.4 (configuration payl
 compatibility, §12.25) committed; live run #3 completed with C4 FAILED on a settlement
 calendar mapping error; step 15B.5A (settlement calendar mapping correction, §12.26)
 committed; step 15B.5B (activity description compatibility and wrapped payload errors,
-§12.27) committed; step 15B.5B.1 (activity raw-JSON serialization, §12.28) implemented
-offline and awaiting review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
+§12.27) committed; step 15B.5B.1 (activity raw-JSON serialization, §12.28) committed;
+step 15B.5C (live contract evidence sanitization, §12.29) implemented offline and
+awaiting review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -2371,7 +2372,9 @@ module `test_alpaca_paper_read.py` is a thin wrapper):
   checked against every secret and every identifier, account number, balance, position and
   order/activity id seen in the raw bodies before anything is written.
 * **R6 redaction.** The redacting logger is installed before credentials are loaded; the
-  loaded values are registered with it and redacted from raw bodies, summaries and output.
+  loaded values are registered with it and redacted from logs and output. *Since Step
+  15B.5C (§12.29) raw bodies are no longer passed through the log redactor: they are
+  structurally sanitized at write time.*
 
 ### 12.24 Step 15B: first supervised read-only run, account payload compatibility and exit-code consistency (15B–15B.3)
 
@@ -2754,7 +2757,7 @@ as exact `Decimal`s; `merge_activities` compares the text exactly). Not changed 
 code). (b) Nesting deep enough to exhaust Python recursion (~1000 levels) raises
 `RecursionError` (exit 1), as the decoder and the old `json.dumps` also would.
 (c) Other broker payloads (account, orders, positions, clock, calendar) are mapped to
-typed models and never re-serialized; the evidence writer's redaction is 15B.5C.
+typed models and never re-serialized; the evidence writer's redaction is §12.29 (15B.5C).
 
 **5. Tests.** `tests/unit/test_activity_raw_json.py` — byte identity with the previous
 encoding (Hypothesis), tuples, exact round trip and canonical fixed point through
@@ -2769,6 +2772,96 @@ streak, coverage and booked rows unchanged), existing halt → 4, reconcile exit
 CLEAN, `init-ledger` exit 10 with no ledger / initializes with valid numbers, FEE twins
 with `""` and stored rows byte-identical to the old encoding, C7 VERIFIED / FAILED /
 INCONCLUSIVE ×2.
+
+### 12.29 Live contract evidence sanitization (15B.5C)
+
+Offline implementation, confined to the contract harness (`tests/contract/supervisor.py`,
+`tests/contract/live_run.py`). **No `src/` change:** the log redactor
+(`observability/logging.py`), broker transport and retries, activity mapping, the
+settlement calendar, ledger, reconciliation, OMS, gates and risk are unchanged. C1–C13
+criteria and outcome classification are unchanged.
+
+**1. Defect (live run #3).** `BudgetedSession.get` passed every raw body through
+`SecretRedactor.redact`, whose `_KEY_VALUE` regex (built for log lines) masks the token
+after any credential-looking key. On JSON that turned an unquoted value into bare text:
+`"next_page_token": null` → `"next_page_token": ***REDACTED***` (likewise numbers,
+booleans and the first token of arrays/objects) — persisted evidence was invalid JSON.
+`forbidden_values()` then parsed those **already-redacted** bodies, `continue`d on any
+`ValueError`, and inspected only top-level keys of each row: identifiers and balances
+from a corrupted or nested body were silently never checked against `summary.json`. In
+addition, raw files kept the account `id` and `account_number`, and a JSON-escaped secret
+(`\u0050…`) would not have matched the text redactor.
+
+**2. Pipeline (after).** HTTP response → `BudgetedSession` keeps the **original** text
+in `Exchange.body` (in memory only; `repr=False`; never logged) → after the run,
+`forbidden_values()` and `identity_values()` read the original bodies →
+`EvidenceWriter.write` checks the summary, sanitizes and verifies **every** raw body, and
+only then creates the directory and writes (0700/0600, `O_EXCL | O_NOFOLLOW`,
+Git-ignored root). Any `SanitizationError` leaves nothing on disk.
+
+**3. Policy** (`supervisor.py`):
+
+* *Parsing:* `json.loads(parse_float=Decimal)`; `NaN`/`Infinity` rejected; nesting deeper
+  than `MAX_EVIDENCE_DEPTH` (64) refused. A 2xx body is expected to be JSON; a non-2xx
+  body that is not JSON is treated as text.
+* *Identity values* (never persisted anywhere): the loaded credentials, every
+  `account_number`/`account_id` value at any depth, and the top-level `id` of
+  `/v2/account`.
+* *JSON bodies:* keys matching `CREDENTIAL_KEY` (`api_key`, `secret`, `token`, `password`,
+  `authorization`, `credential`, the APCA headers) or `ACCOUNT_ID_KEYS` hide their string
+  and number values — recursively for nested objects/arrays — as `"***REDACTED***"`;
+  `null` and booleans are kept (`"next_page_token":null` stays valid). Every other string
+  (and every key) has identity values replaced exactly. Everything else — `null`,
+  booleans, integers, exact `Decimal`s, arrays, objects — is preserved. Output is
+  canonical (`canonical_json`: sorted keys, compact separators, `str(Decimal)`; byte-equal
+  to `json.dumps(sort_keys=True, separators=(",", ":"))` for float-free JSON); no
+  `default=str`, unsupported types fail.
+* *Non-JSON bodies:* exact replacement of identity values only — no regex.
+* *Verification:* after sanitization neither the body nor the persisted record may
+  contain any identity value, raw or JSON-escaped.
+* *Summary:* `forbidden_values()` = identity values + every value (string, or integer /
+  `Decimal` as text, ≥ 4 characters) of a `SENSITIVE_KEYS` key at **any depth** of the
+  original bodies; `assert_sanitized` refuses a summary containing one.
+* *Unchanged:* the raw file layout `{"body": <text>, "status": <int>}`; balances,
+  positions and activity/order ids remain in private raw evidence (they are only
+  forbidden in the summary).
+
+**4. Failure behavior.** `SanitizationError` carries a fixed code
+(`EVIDENCE_JSON_MALFORMED`, `EVIDENCE_TOO_DEEP`, `EVIDENCE_UNSUPPORTED_TYPE`,
+`EVIDENCE_NON_FINITE_NUMBER`, `EVIDENCE_KEY_COLLISION`, `EVIDENCE_FORBIDDEN_VALUE`,
+`SUMMARY_UNSERIALIZABLE`, `SUMMARY_FORBIDDEN_VALUE`); its message is the code (no content,
+value or index; causes suppressed). `run_supervised` then returns only
+`{"execution": {"status": "STOPPED", "stop_code": "SUMMARY_SANITIZATION_FAILED"},
+"evidence": {"written": false, "code": <code>}}` — no rows, so nothing can be VERIFIED;
+the pytest verdict and `main()` fail. Before, only a summary leak was caught
+(`AssertionError`); malformed bodies passed silently.
+
+**5. Remaining limitations.** (a) Non-JSON text gets exact replacement only: an unknown
+credential-like value in HTML/plain text (`token=…` that is not a loaded secret or
+account identifier) is not masked; such bodies are rare (proxies, 5xx pages) and stay in
+private, Git-ignored evidence. (b) A malformed 2xx body (e.g. truncated) now stops the
+whole run's evidence as `SUMMARY_SANITIZATION_FAILED` instead of just failing its check —
+deliberately fail-closed. (c) Summary matching ignores values shorter than 4 characters
+(unchanged), and a short or common sensitive value can cause a false-positive
+`SUMMARY_FORBIDDEN_VALUE` (fails closed). (d) Raw evidence still holds balances,
+positions and activity/order ids by design: never share it. (e) Credential-like key
+matching is by name; a credential under an innocuous key is masked only if it is a known
+loaded secret.
+
+**6. Tests.** `tests/contract/test_evidence_sanitization.py`: the original regex defect
+(documented), `next_page_token: null`, every JSON type incl. exact decimals, determinism
+and canonical form (Hypothesis), embedded secrets anywhere stay leak-free and valid
+(Hypothesis), credential keys (strings/numbers hidden, `null`/booleans kept, nested),
+account identifiers at any depth and inside other strings, secrets in values / keys /
+JSON-escaped form, exact-only non-JSON replacement, structurally sanitized error bodies,
+malformed expected JSON (incl. `NaN`, `Infinity`, unbalanced, very deep) → fixed code,
+excessive nesting, nested and numeric sensitive values collected, unsupported types
+never coerced, an identifier surviving as a number detected after sanitization, key
+collision, nothing written on failure, original body in memory only; offline supervised
+runs: valid leak-free raw evidence with unchanged rows, echoed error bodies scrubbed,
+malformed evidence → `SUMMARY_SANITIZATION_FAILED` with nothing persisted and nothing
+VERIFIED, a leaking summary → `SUMMARY_FORBIDDEN_VALUE`, permissions 0700/0600, the
+evidence root Git-ignored and untracked.
 
 ---
 

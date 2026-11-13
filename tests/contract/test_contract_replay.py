@@ -28,7 +28,6 @@ from swing_trading_bot.broker.errors import (
     UnknownBrokerStatusError,
     UnsupportedBrokerOperationError,
 )
-from swing_trading_bot.observability.logging import SecretRedactor
 from swing_trading_bot.oms.lifecycle import read_error_halt, read_error_outage_category
 from tests.contract import checks as contract_checks
 from tests.contract.checks import CHECKS, ContractContext
@@ -37,6 +36,7 @@ from tests.contract.supervisor import (
     BudgetedSession,
     EvidenceWriter,
     RequestBudget,
+    SanitizationError,
     WriteAttemptError,
     assert_sanitized,
 )
@@ -73,7 +73,7 @@ def synthetic_account() -> FakeAlpacaAccount:
 
 
 def wire(acct: FakeAlpacaAccount) -> tuple[ContractContext, BudgetedSession]:
-    spy = BudgetedSession(AccountSession(acct), RequestBudget(), SecretRedactor(SECRETS))
+    spy = BudgetedSession(AccountSession(acct), RequestBudget())
     transport = AlpacaReadTransport(load_credentials(ENV).settings, session=spy)  # type: ignore[arg-type]
     adapter = AlpacaPaperReadAdapter(transport, clock=acct.clock, sleep=lambda _d: None)
     return ContractContext(adapter, transport, now=START), spy
@@ -213,7 +213,7 @@ def test_official_closes_are_unsupported() -> None:
 
 # ============================================================ harness integrity
 def test_spy_refuses_writes_and_foreign_hosts() -> None:
-    spy = BudgetedSession(AccountSession(synthetic_account()), RequestBudget(), SecretRedactor())
+    spy = BudgetedSession(AccountSession(synthetic_account()), RequestBudget())
     for verb in ("post", "put", "patch", "delete", "request", "send"):
         with pytest.raises(WriteAttemptError):
             getattr(spy, verb)
@@ -227,7 +227,7 @@ def test_spy_refuses_writes_and_foreign_hosts() -> None:
 
 
 def test_evidence_writer_refuses_unsanitized_summaries(tmp_path: Path) -> None:
-    with pytest.raises(AssertionError, match="forbidden"):
+    with pytest.raises(SanitizationError, match="SUMMARY_FORBIDDEN_VALUE"):
         EvidenceWriter(tmp_path, run="leak", require_git_ignored=False).write(
             [], {"id": ACCOUNT_ID}, [ACCOUNT_ID]
         )

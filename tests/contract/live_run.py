@@ -10,7 +10,10 @@ The supervised live read-only contract run (Step 15B, prepared in Step 15A.1).
 3. ``setup`` phase: the real CLI ``broker-check`` through the budgeted session;
 4. ``contract`` phase: every check in :data:`checks.CHECKS`, each sanitized;
 5. classify C1-C13, summarize rate-limit evidence, write raw evidence (local, Git-ignored)
-   and a sanitized summary.
+   and a sanitized summary. Raw bodies are structurally sanitized (Step 15B.5C); if any
+   evidence cannot be proven sanitized, nothing is written and the summary is reduced to
+   ``STOPPED`` / ``SUMMARY_SANITIZATION_FAILED`` with a fixed reason code (no rows, so
+   nothing can be VERIFIED).
 
 The run stops — and every later check is ``NOT_RUN`` — on budget or deadline exhaustion,
 a write attempt, an authentication failure, persisting rate limiting, or an invalid account
@@ -59,6 +62,7 @@ from tests.contract.supervisor import (
     EvidenceError,
     EvidenceWriter,
     RequestBudget,
+    SanitizationError,
     WriteAttemptError,
     bounded_sleep,
     forbidden_values,
@@ -92,7 +96,6 @@ def run_supervised(  # noqa: PLR0915 - injectable dependencies; one linear scrip
     results: dict[str, CheckResult] = {name: CheckResult(CheckStatus.NOT_RUN, "NOT_RUN")
                                        for name in CHECKS}  # fmt: skip
     secrets: tuple[str, ...] = ()
-    redactor = SecretRedactor()
     session: BudgetedSession | None = None
     setup: dict[str, Any] = {"broker_check_exit": None}
 
@@ -103,13 +106,12 @@ def run_supervised(  # noqa: PLR0915 - injectable dependencies; one linear scrip
         loaded = load_credentials(environ)
         secrets = loaded.settings.secret_values()
         register_secrets(secrets)
-        redactor.add(secrets)
         execution["credential_source"] = loaded.source
     except CredentialSourceError:
         stop("CREDENTIALS_UNAVAILABLE")
     if execution["status"] == "COMPLETED":
         budget.start()
-        session = BudgetedSession(session_factory(), budget, redactor)
+        session = BudgetedSession(session_factory(), budget)
         wait = bounded_sleep(budget, *(() if sleep is None else (sleep,)))
         try:
             budget.phase = "setup"
@@ -153,10 +155,12 @@ def run_supervised(  # noqa: PLR0915 - injectable dependencies; one linear scrip
     }
     writer = evidence or EvidenceWriter(EVIDENCE_ROOT)
     try:
-        path = writer.write(exchanges, summary, forbidden_values(exchanges, secrets))
+        forbidden = forbidden_values(exchanges, secrets)
+        path = writer.write(exchanges, summary, forbidden, secrets=secrets)
         summary["evidence"] = {"written": True, "summary": path.name}
-    except AssertionError:
-        summary = {"execution": {"status": "STOPPED", "stop_code": "SUMMARY_SANITIZATION_FAILED"}}
+    except SanitizationError as exc:  # fail closed: no rows, nothing written
+        summary = {"execution": {"status": "STOPPED", "stop_code": "SUMMARY_SANITIZATION_FAILED"},
+                   "evidence": {"written": False, "code": exc.code}}  # fmt: skip
     except EvidenceError as exc:
         summary["evidence"] = {"written": False, "code": str(exc)}
     logging.getLogger(__name__).info("contract run finished",

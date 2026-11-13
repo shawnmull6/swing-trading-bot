@@ -76,8 +76,15 @@ One process and one budget (120 requests, 300 s) for the broker-check and every 
 check; it stops on authentication failure, persisting rate limiting, uncertain identity or
 budget exhaustion. It prints only the execution status and the C1–C13 outcomes. Raw
 responses stay in the Git-ignored `contract-evidence/<run>/raw/` (0600); `summary.json` is
-sanitized. Never commit either without review. The raw files contain the account id,
-account number and balances (only credentials are redacted): never paste or share them.
+sanitized. Never commit either without review. Since Step 15B.5C (A§12.29) raw JSON
+bodies are structurally sanitized and remain valid JSON: credentials, credential-like
+keys, the account id and the account number are `***REDACTED***`, everything else
+(including `null`, numbers and balances) is kept. The raw files still contain balances,
+positions and activity/order ids: never paste or share them. If the run prints
+`stop: SUMMARY_SANITIZATION_FAILED`, **nothing** was written and no row is verified; the
+`evidence.code` names the fixed reason (e.g. `EVIDENCE_JSON_MALFORMED` for a non-JSON
+successful response, `SUMMARY_FORBIDDEN_VALUE` for a summary leak). Do not re-run to
+"get past" it: report the code and stop.
 
 Status (2026-11-12): the first authorized run stopped safely in setup after one
 `GET /v2/account` because the response omitted `pattern_day_trader` (then a required
@@ -90,7 +97,8 @@ optional (A§12.25). Run #3 (2026-11-12) completed: C1, C2, C3, C6, C8 verified;
 failed because the settlement calendar was read from the wrong field (corrected in Step
 15B.5A, A§12.26); C7 inconclusive (an activity with an empty `description`; accepted
 since Step 15B.5B, A§12.27 — C7 is still expected INCONCLUSIVE with too few activities);
-C5/C9 inconclusive on a flat account. **Run #4 needs separate, explicit operator
+C5/C9 inconclusive on a flat account; the redactor corrupted `"next_page_token":null` in
+the raw evidence (fixed in Step 15B.5C, A§12.29). **Run #4 needs separate, explicit operator
 authorization**; do not re-run on the strength of an earlier approval. Run it well away
 from the market open and close.
 
