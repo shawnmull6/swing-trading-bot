@@ -287,6 +287,46 @@ def test_activity_id_with_different_content_is_conflict(
         assert activities.get(s, "act-1") == a  # stored content never overwritten
 
 
+@pytest.mark.parametrize(
+    ("stored", "replay", "expected"),
+    [('{"fee_rate":0.1}', '{"fee_rate":0.1}', IngestResult.DUPLICATE),
+     ('{"fee_rate":0.1,"x":2}', '{"x":2,"fee_rate":0.1}', IngestResult.DUPLICATE),
+     ('{"fee_rate":1.10}', '{"fee_rate":1.1}', IngestResult.DUPLICATE),
+     ('{"fee_rate":1.0}', '{"fee_rate":1}', IngestResult.DUPLICATE),
+     ('{"fee_rate":0.10000000000000000001}', '{"fee_rate":0.1}', IngestResult.CONFLICT),
+     ('{"fee_rate":1E+400}', '{"fee_rate":2E+400}', IngestResult.CONFLICT),
+     ('{"n":123456789012345678901234567890}', '{"n":123456789012345678901234567891}',
+      IngestResult.CONFLICT),
+     ('{"n":{"a":[0.10000000000000000001]}}', '{"n":{"a":[0.1]}}', IngestResult.CONFLICT),
+     ('{"fee_rate":"0.1"}', '{"fee_rate":0.1}', IngestResult.CONFLICT),
+     ('{"fee_rate":"0.1"}', '{"fee_rate":"0.10"}', IngestResult.CONFLICT),
+     # Step 15B.6C.1: JSON booleans are never numbers
+     ('{"flag":true}', '{"flag":true}', IngestResult.DUPLICATE),
+     ('{"flag":false}', '{"flag":false}', IngestResult.DUPLICATE),
+     ('{"flag":true}', '{"flag":1}', IngestResult.CONFLICT),
+     ('{"flag":false}', '{"flag":0}', IngestResult.CONFLICT),
+     ('{"flag":1.0}', '{"flag":true}', IngestResult.CONFLICT),
+     ('{"n":{"a":[false]}}', '{"n":{"a":[0.0]}}', IngestResult.CONFLICT),
+     ('{"flag":null}', '{"flag":false}', IngestResult.CONFLICT)],
+)  # fmt: skip
+def test_replayed_unmapped_numbers_are_compared_exactly(
+    db: Database, make_order: OrderFactory, stored: str, replay: str, expected: IngestResult
+) -> None:
+    """Step 15B.6C/15B.6C.1: DUPLICATE only when the raw payload is the same JSON value
+    exactly (exact numbers; booleans distinct from numbers)."""
+    rec = make_order()
+    a = _activity("act-n", rec.client_order_id, raw_json=stored)
+    with db.transaction() as tx:
+        assert activities.record(tx, a) is IngestResult.INSERTED
+    for _ in range(2):  # repeated replays give the same answer and never write
+        with db.transaction() as tx:
+            got = activities.record(tx, replace(a, raw_json=replay, ingested_at=at(9)))
+        assert got is expected
+    with db.read() as s:
+        assert activities.count(s) == 1
+        assert activities.get(s, "act-n") == a  # stored text never rewritten (append-only)
+
+
 def test_fill_ingestion_is_idempotent(db: Database, make_order: OrderFactory) -> None:
     rec = make_order()
     with db.transaction() as tx:

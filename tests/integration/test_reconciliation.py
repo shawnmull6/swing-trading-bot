@@ -244,6 +244,35 @@ def test_duplicate_and_conflicting_activities(r: ReconEnv) -> None:
     assert price is not None and Decimal(str(price[0])) == D(50)
 
 
+def _fill_raw(r: ReconEnv) -> dict[str, Any]:
+    (act,) = [a for a in r.o.sim._activities if a.raw["activity_type"] == "FILL"]
+    assert isinstance(act.raw, dict)
+    return act.raw
+
+
+def test_activity_replayed_below_float_precision_is_a_conflict(r: ReconEnv) -> None:
+    """Step 15B.6C, end to end: the broker re-serves a booked fill whose unmapped number
+    changed below binary-float precision -> ACTIVITY_CONFLICT and RECON_EXECUTION."""
+    filled(r)
+    r.o.clock.advance(QUIET)
+    r.o.sim.get_clock()  # the scheduled fill posts its activity
+    _fill_raw(r)["fee_rate"] = D("0.10000000000000000001")
+    assert r.run(MIN).outcome is Outcome.CLEAN
+    _fill_raw(r)["fee_rate"] = D("0.100000000000000000010")  # same value, new spelling
+    assert r.run(MIN).outcome is Outcome.CLEAN
+    cash = r.o.balances().cash
+    _fill_raw(r)["fee_rate"] = D("0.1")
+    rep = r.run(MIN)
+    assert rep.outcome is Outcome.MISMATCH and "ACTIVITY_CONFLICT" in rep.codes()
+    assert halted(r) == "RECON_EXECUTION"
+    assert r.o.balances().cash == cash
+    with r.o.db.read() as s:
+        assert s.fetch_one("SELECT count(*) FROM fills") == (1,)
+        assert s.fetch_one("SELECT count(*) FROM broker_activities") == (1,)
+        (text,) = s.fetch_one("SELECT raw_json FROM broker_activities") or ("",)
+    assert '"fee_rate":0.10000000000000000001' in str(text)  # stored payload unchanged
+
+
 def test_out_of_order_fill(r: ReconEnv) -> None:
     coid = placed(r)
     r.o.sim.schedule_fill(coid, D(5), D(50), after=timedelta(seconds=5),

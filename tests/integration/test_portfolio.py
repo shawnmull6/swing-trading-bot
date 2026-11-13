@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -399,6 +400,58 @@ def test_dividends_and_fees_are_auditable_cash_entries(ledger: Ledger) -> None:
     result = pf.process_cash_activity(changed, now=NOW)
     assert result.outcome is FillOutcome.CONFLICT and result.halted
     assert snap(db, pf).balances.cash == D("4002.38")
+
+
+def test_replay_changed_below_float_precision_halts_without_booking(ledger: Ledger) -> None:
+    """Step 15B.6C: a replayed cash activity whose unmapped number changed by less than
+    binary-float precision is a CONFLICT (reconciliation halt), never a silent DUPLICATE."""
+    db, pf = ledger
+    base = cash_activity(CashActivityKind.FEE, "-0.02", activity_id="fee-p")
+    fee = replace(base, raw_json='{"fee_rate":0.10000000000000000001,"id":"fee-p",'
+                                 '"net_amount":"-0.02"}')  # fmt: skip
+    assert pf.process_cash_activity(fee, now=NOW).outcome is FillOutcome.APPLIED
+    with db.read() as s:
+        journal = CashEntriesRepository().list_for_portfolio(s, 1)
+        stored = ActivitiesRepository().get(s, "fee-p")
+    before = (counts(db), snap(db, pf).balances, halted(db))
+    respelled = replace(fee, raw_json='{"net_amount":"-0.02","id":"fee-p",'
+                                      '"fee_rate":0.100000000000000000010}')  # fmt: skip
+    assert pf.process_cash_activity(respelled, now=NOW).outcome is FillOutcome.DUPLICATE
+    assert (counts(db), snap(db, pf).balances, halted(db)) == before
+    changed = replace(fee, raw_json='{"fee_rate":0.1,"id":"fee-p","net_amount":"-0.02"}')
+    result = pf.process_cash_activity(changed, now=NOW)
+    assert result.outcome is FillOutcome.CONFLICT and result.halted
+    assert HaltReason.RECON_EXECUTION in result.halt_reasons
+    assert halted(db) == (True, "RECON_EXECUTION")
+    assert (counts(db), snap(db, pf).balances) == before[:2]  # no second booking
+    with db.read() as s:
+        assert CashEntriesRepository().list_for_portfolio(s, 1) == journal  # unchanged
+        assert ActivitiesRepository().get(s, "fee-p") == stored  # never rewritten
+
+
+def test_replay_changed_boolean_to_number_halts_without_booking(ledger: Ledger) -> None:
+    """Step 15B.6C.1: a replayed cash activity whose unmapped ``true`` became ``1`` is a
+    CONFLICT (reconciliation halt), never a silent DUPLICATE."""
+    db, pf = ledger
+    base = cash_activity(CashActivityKind.FEE, "-0.02", activity_id="fee-b")
+    fee = replace(base, raw_json='{"id":"fee-b","net_amount":"-0.02","waived":true}')
+    assert pf.process_cash_activity(fee, now=NOW).outcome is FillOutcome.APPLIED
+    with db.read() as s:
+        journal = CashEntriesRepository().list_for_portfolio(s, 1)
+        stored = ActivitiesRepository().get(s, "fee-b")
+    before = (counts(db), snap(db, pf).balances, halted(db))
+    same = replace(fee, raw_json='{"waived":true,"net_amount":"-0.02","id":"fee-b"}')
+    assert pf.process_cash_activity(same, now=NOW).outcome is FillOutcome.DUPLICATE
+    assert (counts(db), snap(db, pf).balances, halted(db)) == before
+    changed = replace(fee, raw_json='{"id":"fee-b","net_amount":"-0.02","waived":1}')
+    result = pf.process_cash_activity(changed, now=NOW)
+    assert result.outcome is FillOutcome.CONFLICT and result.halted
+    assert HaltReason.RECON_EXECUTION in result.halt_reasons
+    assert halted(db) == (True, "RECON_EXECUTION")
+    assert (counts(db), snap(db, pf).balances) == before[:2]  # no second booking
+    with db.read() as s:
+        assert CashEntriesRepository().list_for_portfolio(s, 1) == journal  # unchanged
+        assert ActivitiesRepository().get(s, "fee-b") == stored  # never rewritten
 
 
 # ------------------------------------------------------ duplicates/conflicts

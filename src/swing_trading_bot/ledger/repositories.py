@@ -563,6 +563,24 @@ class ReservationsRepository:
 # ------------------------------------------------------------- broker activities
 
 
+def _typed_json(value: object) -> object:
+    """Decoded JSON with booleans made distinct from numbers (Step 15B.6C.1).
+
+    Python's ``bool`` is an ``int`` subclass, so ``True == 1 == Decimal("1.0")`` and
+    ``False == 0``; JSON ``true``/``false`` are not numbers. Each boolean is replaced by
+    the tuple ``(bool, value)``, which equals only the same boolean (``json.loads`` never
+    produces tuples). Everything else compares as before: ``int``/``Decimal`` by exact
+    value, objects regardless of key order, arrays in order. Depth is bounded by
+    ``MAX_PAYLOAD_DEPTH`` at ingestion, so recursion is shallow."""
+    if isinstance(value, bool):
+        return (bool, value)
+    if isinstance(value, dict):
+        return {key: _typed_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_typed_json(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ActivityRecord:
     activity_id: str
@@ -580,7 +598,14 @@ class ActivityRecord:
     client_order_id: str | None = None
 
     def content_key(self) -> tuple[object, ...]:
-        """Fields that identify the broker event (excludes ingestion metadata)."""
+        """Fields that identify the broker event (excludes ingestion metadata).
+
+        The raw payload is compared by JSON *value* with exact numbers (Step 15B.6C):
+        fractions/exponents parse as :class:`~decimal.Decimal`, integers as ``int`` (both
+        exact at any size), so a numeric change below binary-float precision is a
+        CONFLICT, while key order and numerically equal spellings (``1.10``/``1.1``,
+        ``1.0``/``1``) stay DUPLICATE. Strings never equal numbers, and (Step 15B.6C.1)
+        booleans never equal numbers either: see :func:`_typed_json`."""
         return (
             self.activity_id,
             self.activity_type,
@@ -592,7 +617,7 @@ class ActivityRecord:
             self.side,
             self.broker_order_id,
             self.client_order_id,
-            json.loads(self.raw_json),
+            _typed_json(json.loads(self.raw_json, parse_float=Decimal)),
         )
 
 
