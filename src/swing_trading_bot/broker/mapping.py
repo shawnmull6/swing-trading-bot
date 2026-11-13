@@ -13,6 +13,7 @@ The broker's ``buying_power`` field is deliberately never read.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
@@ -47,7 +48,61 @@ _TIFS: Final = {"day": TimeInForce.DAY, "gtc": TimeInForce.GTC}
 
 
 def raw_json(raw: Raw) -> str:
-    return json.dumps(raw, sort_keys=True, separators=(",", ":"))
+    """Canonical, deterministic JSON text of a raw broker payload (Step 15B.5B.1).
+
+    Byte-identical to ``json.dumps(raw, sort_keys=True, separators=(",", ":"))`` for
+    every value that call accepts and that is valid JSON. In addition:
+
+    * a finite :class:`~decimal.Decimal` — what ``decode_json(parse_float=Decimal)``
+      yields for a JSON number with a fraction or exponent — is written as that exact
+      JSON number (``str(value)``, e.g. ``1.50``, ``1E+5``), never via ``float`` and
+      never as a string. Whether a *mapped* field may be a number is decided by its own
+      validator (money fields require strings), not here;
+    * a value that is not valid JSON — NaN or ±Infinity, as ``float`` (the decoder's
+      ``parse_constant`` default) or ``Decimal`` — is a malformed broker payload:
+      :class:`InvalidBrokerDataError`.
+
+    Anything the JSON decoder cannot produce (non-string keys, sets, bytes, arbitrary
+    objects) still raises ``TypeError``: that is a programming defect, not a broker
+    payload, and is deliberately not reclassified.
+    """
+    parts: list[str] = []
+    _encode(raw, parts)
+    return "".join(parts)
+
+
+def _encode(value: object, out: list[str]) -> None:
+    if isinstance(value, Mapping):
+        if not all(isinstance(k, str) for k in value):
+            raise TypeError("raw broker payload keys must be strings")
+        out.append("{")
+        for n, key in enumerate(sorted(value)):
+            if n:
+                out.append(",")
+            out.append(json.dumps(key))
+            out.append(":")
+            _encode(value[key], out)
+        out.append("}")
+        return
+    if isinstance(value, (list, tuple)):
+        out.append("[")
+        for n, item in enumerate(value):
+            if n:
+                out.append(",")
+            _encode(item, out)
+        out.append("]")
+        return
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise InvalidBrokerDataError("raw payload contains a non-finite number")
+        out.append(str(value))
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise InvalidBrokerDataError("raw payload contains a non-finite number")
+    if value is None or isinstance(value, (str, int, float)):  # bool is an int
+        out.append(json.dumps(value))
+        return
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _require(raw: Raw, key: str) -> object:
@@ -299,8 +354,8 @@ def activity_from_raw(raw: Raw) -> BrokerActivity:
             order_status=text(raw, "order_status"),
             fill_type=text(raw, "type"),
         )
-    description = _activity_description(raw)  # before raw_json: a JSON-float description
-    return BrokerActivity(  # must be a payload error, not a serialization TypeError
+    description = _activity_description(raw)
+    return BrokerActivity(
         activity_id=activity_id,
         activity_type=activity_type,
         activity_date=calendar_date(raw, "date"),

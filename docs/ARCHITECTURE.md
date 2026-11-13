@@ -10,8 +10,8 @@ stopped in setup on missing configuration fields; step 15B.4 (configuration payl
 compatibility, §12.25) committed; live run #3 completed with C4 FAILED on a settlement
 calendar mapping error; step 15B.5A (settlement calendar mapping correction, §12.26)
 committed; step 15B.5B (activity description compatibility and wrapped payload errors,
-§12.27) implemented offline and awaiting review. Live run #4 needs separate
-authorization.** Decision log: `docs/M1_PLAN.md` §2.
+§12.27) committed; step 15B.5B.1 (activity raw-JSON serialization, §12.28) implemented
+offline and awaiting review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -2670,13 +2670,10 @@ activity, so after this fix C7 is expected to be INCONCLUSIVE
 page-size independence and window partition are then actually exercised, multi-page
 pagination is not.
 
-**6. Open finding (not fixed; needs a separate decision).** A JSON float anywhere in a
+**6. Finding (resolved in Step 15B.5B.1, §12.28).** A JSON float anywhere in a
 non-trade activity other than `description` (e.g. `net_amount`, `qty`, or an unmapped
-field) is decoded as `Decimal` and makes `raw_json()` raise `TypeError` before field
-validation. That still fails closed (the command ends with exit 1 `INTERNAL`, `init-ledger`
-creates nothing, coverage does not advance), but it is not classified as a payload error
-and raises no `BROKER_PAYLOAD` halt (verified offline). A fix would make
-activity raw serialization report non-JSON values as `InvalidBrokerDataError`.
+field) was decoded as `Decimal` and made `raw_json()` raise `TypeError` before field
+validation: exit 1 `INTERNAL`, no `BROKER_PAYLOAD` halt.
 
 **7. Tests.** Description matrix (missing, `null`, `""`, non-empty, boolean, number,
 JSON-float `Decimal`, array, object); other text fields still strict; global helpers
@@ -2689,6 +2686,89 @@ blocked by the persistent halt; `init-ledger` accepting `""` and refusing malfor
 activities with exit 10 and no ledger (a timeout still exits 8); FEE twins with `""`;
 C7 VERIFIED with empty descriptions, FAILED on a malformed later page, INCONCLUSIVE on a
 genuine interruption and on too few activities.
+
+### 12.28 Activity raw-JSON serialization (15B.5B.1)
+
+Offline implementation. **No schema change, no migration;** field validation, the
+description rule (§12.27), `payload_cause`, the settlement calendar (§12.26), runtime,
+reconciliation, gates, OMS, risk limits, the evidence sanitizer and broker-write
+behavior are unchanged.
+
+**1. Root cause.** `decode_json` (`alpaca_http.py`) decodes with `parse_float=Decimal`, so
+a JSON number with a fraction or exponent becomes `Decimal`, and the stdlib decoder also
+accepts the non-JSON constants `NaN`/`Infinity`/`-Infinity` (as `float`). The only place
+broker JSON is re-serialized is `mapping.raw_json()`, called by `activity_from_raw` for
+both FILL and non-trade activities (`alpaca_read.get_activities`, `SimBroker`). It used
+plain `json.dumps`, which raises `TypeError` on `Decimal` (before the money fields were
+validated) and writes `NaN`/`Infinity` as invalid JSON. Offline, before the fix:
+
+| Activity content | `sync` | `init-ledger` |
+|---|---|---|
+| numeric money field (`"net_amount": 10.5`) | exit 1, 1 — no halt | exit 1, nothing created |
+| valid number in an unmapped field | exit 1, 1 — no halt | exit 1, nothing created |
+| `NaN` in an unmapped field | exit 9 (the ledger's `json_valid(raw_json)` CHECK) | **exit 0 — ledger created** |
+
+**2. Correction.** `raw_json()` is now a small canonical encoder (`mapping._encode`):
+
+* Output is **byte-identical** to `json.dumps(raw, sort_keys=True, separators=(",", ":"))`
+  for every payload that call accepted as valid JSON (property-tested), so stored
+  `raw_json`, the `merge_activities` text comparison and idempotent re-ingestion are
+  unaffected.
+* A finite `Decimal` is written as its exact JSON number, `str(value)` (`1.50` stays
+  `1.50`; `1e5` is written `1E+5` — numerically exact, canonical, not textually
+  verbatim). Never via `float`, never as a string; no `default=str` coercion.
+* NaN/±Infinity (`float` or `Decimal`), at any depth → `InvalidBrokerDataError`
+  ("non-finite number").
+* Values the decoder cannot produce (non-string keys, sets, bytes, arbitrary objects)
+  still raise `TypeError`: a programming defect, deliberately **not** reclassified
+  (exit 1). No broad exception handling was added.
+
+Field validation is unchanged: money fields (`net_amount`, `qty`, `per_share_amount`,
+FILL `qty`/`price`/`cum_qty`/`leaves_qty`) still require strings, so a numeric money
+field is now an `InvalidBrokerDataError` from its own validator. A valid number in an
+unmapped field is stored exactly (as integers already were). Valid string money keeps
+exact `Decimal` processing; `""` vs `null` descriptions and FEE twin detection are
+unchanged.
+
+**3. Result.** Every such payload error takes the existing paths (§12.24, §12.27):
+
+| Activity content | `sync` | `init-ledger` | C7 |
+|---|---|---|---|
+| numeric money field | exit 10, then 4; `BROKER_PAYLOAD` halt | exit 10 `BROKER_PAYLOAD`, nothing created | FAILED `BROKER_PAYLOAD_CONTRACT_BROKEN` |
+| NaN/±Infinity anywhere | exit 10, then 4; halt | exit 10, nothing created | FAILED |
+| valid number in an unmapped field | stored exactly; no halt | initializes | VERIFIED |
+
+An existing persistent halt still governs (exit 4). Payload errors do not count toward
+the outage breaker; a failed first or later page is never complete, never advances the
+coverage marker, and the malformed row is never booked (earlier good pages are ingested
+idempotently, unchanged); reconciliation is never CLEAN. Genuine interruptions stay
+exit 8 / C7 INCONCLUSIVE, and too few activities stays C7 INCONCLUSIVE
+`TOO_FEW_ACTIVITIES_TO_EXERCISE_PAGINATION`. Contract thresholds, pagination and tail
+confirmation are unchanged.
+
+**4. Remaining serialization notes.** (a) `ActivityRecord.content_key()` parses stored
+`raw_json` with plain `json.loads`, so an *unmapped* non-integer number is compared as a
+`float` there: two deliveries of one activity id differing only beyond float precision in
+an unmapped field would be treated as the same content (mapped money fields are compared
+as exact `Decimal`s; `merge_activities` compares the text exactly). Not changed (ledger
+code). (b) Nesting deep enough to exhaust Python recursion (~1000 levels) raises
+`RecursionError` (exit 1), as the decoder and the old `json.dumps` also would.
+(c) Other broker payloads (account, orders, positions, clock, calendar) are mapped to
+typed models and never re-serialized; the evidence writer's redaction is 15B.5C.
+
+**5. Tests.** `tests/unit/test_activity_raw_json.py` — byte identity with the previous
+encoding (Hypothesis), tuples, exact round trip and canonical fixed point through
+`decode_json` (Hypothesis), exact Decimal literals, non-finite values (top-level, in
+lists, nested; float and Decimal; from the production decoder), programming defects
+remaining `TypeError`/exit 1, unmapped numbers kept exactly, numeric money fields
+rejected (non-trade and FILL), string money exact, description rule unchanged, direct and
+wrapped exit 10. `tests/integration/test_activity_raw_json_paths.py` — collector
+(valid numbers, malformed first and later pages, genuine timeout), runtime (no halt for
+valid numbers, readable by SQLite `json_extract`; payload halt 10 then 4 with outage
+streak, coverage and booked rows unchanged), existing halt → 4, reconcile exit 10 and not
+CLEAN, `init-ledger` exit 10 with no ledger / initializes with valid numbers, FEE twins
+with `""` and stored rows byte-identical to the old encoding, C7 VERIFIED / FAILED /
+INCONCLUSIVE ×2.
 
 ---
 
