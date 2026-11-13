@@ -1,4 +1,5 @@
 .env
+paper.env
 .env.*
 !.env.example
 alpaca.txt
