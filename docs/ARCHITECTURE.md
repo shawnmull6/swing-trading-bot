@@ -7,8 +7,9 @@ reconciliation retry safety, §12.23) committed; the first supervised live read-
 (phase B, 2026-11-12) stopped in setup on a missing account field; steps 15B.1–15B.3
 (account payload compatibility and exit-code consistency, §12.24) committed; live run #2
 stopped in setup on missing configuration fields; step 15B.4 (configuration payload
-compatibility, §12.25) implemented offline and awaiting review. Contract rows C1–C9
-remain unverified; live run #3 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
+compatibility, §12.25) committed; live run #3 completed with C4 FAILED on a settlement
+calendar mapping error; step 15B.5A (settlement calendar mapping correction, §12.26)
+implemented offline and awaiting review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -64,7 +65,7 @@ These facts come from reading the installed SDK, not from live calls. Items mark
 | V5 | `get_order_by_client_id` → `GET /v2/orders:by_client_order_id`. | Primary lookup for ambiguous orders. **CT**: exact error type/status for an unknown ID (expected 404) and visibility latency for a just-submitted order. |
 | V6 | Order statuses in SDK: `new, partially_filled, filled, done_for_day, canceled, expired, replaced, pending_cancel, pending_replace, pending_review (deprecated), accepted, pending_new, accepted_for_bidding, stopped, rejected, suspended, calculated, held`. | Exhaustive explicit mapping in `domain/broker_status.py`; an unmapped status → persistent halt. A unit test enumerates the SDK enum so a new SDK value fails the build. |
 | V10 | `Position` has `current_price` but **no timestamp**. Market-data `Trade` (latest trade) has `timestamp`, but types `price` as float. | `Position.current_price` is never a mark (U7); used only as a cross-check. Marks come from the latest-trade / latest-bar endpoints parsed raw into `Decimal` with their exchange timestamp (§6.6). **CT**: feed (IEX vs SIP) available to this account and timestamp semantics. |
-| V7 | `get_calendar(GetCalendarRequest(date_type=SETTLEMENT|TRADING))`; `Calendar` has `settlement_date`; docstring says data covers 1970–2029. | Settlement dates come from Alpaca's calendar, cached locally. **CT**: paper returns `settlement_date` populated; behavior on bank holidays when markets are open (e.g. Veterans Day). Missing calendar data → proceeds stay unsettled (fail closed). Calendar horizon (2029) noted as a future risk. |
+| V7 | `get_calendar(GetCalendarRequest(date_type=SETTLEMENT|TRADING))`; `Calendar` has `settlement_date`; docstring says data covers 1970–2029. *Observed 2026-11-12 (§12.26):* `date_type=SETTLEMENT` returns **trade-date** rows (`date` = session, `settlement_date` = its settlement) selected by `settlement_date` in range; settlement days are the `settlement_date` values. | Settlement dates come from Alpaca's calendar, cached locally. **CT**: paper returns `settlement_date` populated; behavior on bank holidays when markets are open (e.g. Veterans Day). Missing calendar data → proceeds stay unsettled (fail closed). Calendar horizon (2029) noted as a future risk. |
 | V8 | `AccountConfiguration` exposes `no_shorting`, `max_margin_multiplier` ("1"–"4"), `pdt_check`, `dtbp_check`, `suspend_trade`, `fractional_trading`. `TradeAccount` (the SDK model) exposes `cash`, `non_marginable_buying_power`, `multiplier`, `pattern_day_trader`, `daytrade_count`, `trading_blocked`, `account_blocked`, `accrued_fees`, `pending_reg_taf_fees`. *Observed 2026-11-12 (§12.24, §12.25):* the real paper `/v2/account` response omitted `pattern_day_trader` and `daytrade_count`; `/account/configurations` omitted `pdt_check` and `dtbp_check` and returned 8 fields. *Note:* the installed alpaca-py 0.45.0 itself marks `pattern_day_trader`, `daytrade_count`, `daytrading_buying_power`, `pdt_check` and `dtbp_check` deprecated ("removed from Alpaca responses on 2026-07-06", FINRA intraday-margin migration) — the original V-table inspection missed those markers. | Startup preflight reads (never writes) these and reports them (U6: report-only in M1; `no_shorting=true` and `max_margin_multiplier="1"` become **required** before M2 paper execution); `trading_blocked`/`account_blocked` → block. `pending_reg_taf_fees`/`accrued_fees` feed cash explainability (§8.3). **CT**: whether paper simulates regulatory fees at all. |
 | V9 | `Position.qty_available` exists (shares not held by open sell orders). | Relevant to future protective stops/partial exits (§9). |
 
@@ -2527,6 +2528,83 @@ is an **M2 blocker** (not implemented in 15B.4).
 explicit authorization**. A mismatch inside a contract check is recorded as a FAILED row
 and later checks still run; one in setup (`/clock` during `broker-check`) stops the run.
 `init-ledger` against the real account stays blocked until C1–C9 are reviewed.
+
+### 12.26 Step 15B live run #3 and the settlement calendar mapping correction (15B.5A)
+
+Offline implementation after one authorized run. **No schema change, no migration;**
+the TRADING mapping, the HTTP transport, risk limits, restrictions and execution
+boundaries are unchanged.
+
+**1. Live run #3 (2026-11-12, 22:06 ET, market closed).** Completed: 23 GETs of 120
+(setup 3, contract 20), 4.0 s of 300 s, no retries, hosts `paper-api.alpaca.markets` and
+`data.alpaca.markets` only. C1 identity, C2 restrictions, C3 clock, C6 unknown
+client-order-id (real 404) and C8 IEX market data **VERIFIED**; **C4 FAILED**
+(`CALENDAR_INCONSISTENT`); C5 and C9 INCONCLUSIVE (flat account); C7 INCONCLUSIVE
+(`BROKER_INCOMPLETE_RETRIEVAL`: an activity's `description` is an empty string, which the
+mapper rejects — not fixed in 15B.5A); C10–C13 DEFERRED. Rate-limit headers: data host
+limit 200 (3 responses); trading host `LIMIT_INCONSISTENT` (20 responses). The stored copy
+of one market-data body was made invalid JSON by the evidence redactor (not fixed in
+15B.5A). Account settings observed: `fractional_trading` true, `no_shorting` false,
+`max_margin_multiplier` ≠ 1 (U6 protections not in place).
+
+**2. Observed SETTLEMENT response** (public market calendar; fields `date`, `open`,
+`close`, `session_open`, `session_close`, `settlement_date`, all strings). With
+`date_type=SETTLEMENT` and range 2026-11-02..2026-12-31, Alpaca returned 42 rows: one per
+**trade date**, selected by `settlement_date` falling in the range. 0 rows had
+`date == settlement_date`; 41 were identical to TRADING rows; the earliest `date`
+(2026-10-30) preceded the range; every `settlement_date` was inside it; 2026-11-10 and
+2026-11-11 (Veterans Day) both settled 2026-11-12. The TRADING and SETTLEMENT responses
+agreed on every shared trade date.
+
+**3. The defect.** The adapter used each row's `date` as a settlement day, producing
+2026-10-30 (out of range — the C4 failure), 2026-11-11 (a bank holiday, not a settlement
+day) and missing 2026-12-31. **It failed closed:** every real SETTLEMENT fetch was rejected
+(the earliest trade date always precedes the range), so settlement coverage was missing,
+`init-ledger` refused ("calendar rejected") and proceeds could settle only from a
+session's own `settlement_date`. Even an accepted wrong fetch could not settle early: the
+session value (Nov 10 → Nov 12) and the derived first settlement day (Nov 11) would
+disagree → `ContradictoryCalendarError` → unresolved → unsettled.
+
+**4. The correction.** `broker.mapping.settlement_days_from_raw`, used only by the
+adapter's SETTLEMENT branch: every row needs a valid `date` and `settlement_date`
+(missing, `null` or malformed → `InvalidBrokerDataError`, exit 10) with
+`date < settlement_date <= date + MAX_SETTLEMENT_LAG_DAYS`; settlement days are the
+sorted, de-duplicated `settlement_date` values; the trade `date` is validated but never
+used as a settlement day. Unchanged and still enforced: `CalendarFetch` range and weekend
+checks (an out-of-range or weekend `settlement_date` rejects the fetch), `CalendarStore`
+conflict detection for repeated fetches, the cross-calendar audit (a session's
+`settlement_date` must be a settlement day and equal the first settlement day after the
+trade), staleness and coverage rules, `UNRESOLVED_SETTLEMENT`, and conservative cash
+settlement (`settles_on` null or in the future → unsettled).
+
+**5. Meaning and completeness limits.** A stored settlement day now means "a day on which
+some trade settles" (domain docstring updated). A settlement-eligible date on which no
+trading session settles (e.g. a bank day following an exchange-only holiday) is not
+listed. Within covered dates this can only make a *derived* settlement date later, never
+earlier: under T+1, any listed day strictly between a trade and its true settlement would
+have to be the settlement of an earlier trade — which cannot fall after this trade's date
+without being this trade's own settlement day. A derived date must also equal the
+session's own `settlement_date` when present. Trades near the end of a SETTLEMENT range
+settle beyond it (e.g. 2026-12-31 → 2027-01-04): with no settlement coverage for those
+days the session's own value is used, exactly as before 15B.5A, and proceeds remain
+unsettled until that date; with no session value either, the settlement is unresolved.
+The remaining trust is in Alpaca's own `settlement_date` values (both calendars come from
+the same provider and must agree).
+
+**6. Tests.** Mapper matrix (valid, duplicates, ordering, missing/`null`/malformed `date`
+and `settlement_date`, non-increasing dates, lag limit, range boundaries, weekend);
+adapter, store and cash paths with real-shaped responses (Veterans Day, Thanksgiving,
+Christmas, New Year; year-end settlement into January without January coverage — never
+settled before 2027-01-04, and unresolved when the session value is also absent;
+out-of-range and weekend rejection; conflicting repeat fetches; provider disagreement in
+both directions; T+1 cash over Veterans Day); `init-ledger` accepting the real-shaped
+calendar; the C4 contract check passing on it. The test fake's SETTLEMENT response now has
+the observed shape (synthetic values).
+
+**7. Next.** Live run #4 requires separate, explicit authorization. Expected: C4 VERIFIED;
+C7 still inconclusive until the activity `description` fix (15B.5B); C5/C9 INCONCLUSIVE
+on a flat account. `init-ledger` against the real account stays blocked until C4 and C7
+are verified live and the flat-account INCONCLUSIVE rows are accepted on review.
 
 ---
 

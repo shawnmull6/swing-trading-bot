@@ -5,8 +5,14 @@ Pure logic, no I/O. Two calendars are kept apart:
 * **Trading sessions** — days the exchange is open, with open/close times (early
   closes included) and, when the provider supplies it, the authoritative
   per-session ``settlement_date``.
-* **Settlement days** — settlement-eligible dates. Bank holidays can be trading days
-  and exchange holidays can be settlement days.
+* **Settlement days** — dates on which trades settle. For Alpaca these are the distinct
+  ``settlement_date`` values of the SETTLEMENT calendar, whose rows are trade dates
+  selected by settlement date (Step 15B.5A, ARCHITECTURE §12.26); a trade date is never
+  a settlement day by itself. Bank holidays can be trading days (Veterans Day) and are
+  then not settlement days. A settlement-eligible date on which no trade settles (e.g.
+  a bank day after an exchange-only holiday) is not listed; within covered dates that
+  can only make a *derived* settlement date later — and it must still agree with the
+  session's own value — never earlier.
 
 Coverage is explicit: a date is *known* for a calendar kind only if an accepted
 fetch's requested range contains it. Inside covered ranges, a missing session is a

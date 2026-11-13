@@ -58,13 +58,13 @@ from swing_trading_bot.broker.mapping import (
     account_config_from_raw,
     account_from_raw,
     activity_from_raw,
-    calendar_date,
     clock_from_raw,
     json_number,
     opt_decimal,
     order_from_raw,
     position_from_raw,
     session_from_raw,
+    settlement_days_from_raw,
     text,
     timestamp,
 )
@@ -178,7 +178,9 @@ class AlpacaPaperReadAdapter:
         if kind is CalendarKind.TRADING:
             sessions = tuple(session_from_raw(r) for r in rows)
             return CalendarFetch(kind, start, end, fetched_at, SOURCE, sessions=sessions)
-        days = tuple(calendar_date(r, "date") for r in rows)
+        # SETTLEMENT rows are trade-date rows selected by settlement_date (§12.26): the
+        # settlement days are their settlement_date values, never the trade dates.
+        days = settlement_days_from_raw(rows)
         return CalendarFetch(kind, start, end, fetched_at, SOURCE, settlement_days=days)
 
     # ----------------------------------------------------------- positions

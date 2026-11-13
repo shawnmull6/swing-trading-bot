@@ -16,9 +16,9 @@ from typing import Any
 
 from swing_trading_bot.broker.alpaca_read import AlpacaPaperReadAdapter
 from swing_trading_bot.broker.errors import BrokerError, OrderNotFoundError
-from swing_trading_bot.domain.calendar import MARKET_TZ
+from swing_trading_bot.domain.calendar import MARKET_TZ, MAX_SETTLEMENT_LAG_DAYS, TradingSession
 from tests.support.alpaca_fake import ACCOUNT, CONFIG, FakeTransport
-from tests.support.calendar_fixture import fixture_sessions, fixture_settlement_days
+from tests.support.calendar_fixture import fixture_sessions
 
 # Monday 2026-11-09 10:00 ET, inside a regular session of the fixture calendar.
 START = datetime(2026, 11, 9, 15, 0, tzinfo=UTC)
@@ -54,6 +54,17 @@ class Clock:
 def _parse(params: Mapping[str, str], key: str) -> datetime | None:
     raw = params.get(key)
     return None if raw is None else datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+
+def _calendar_row(s: TradingSession) -> dict[str, Any]:
+    return {
+        "date": s.session_date.isoformat(),
+        "open": s.open_at.astimezone(MARKET_TZ).strftime("%H:%M"),
+        "close": s.close_at.astimezone(MARKET_TZ).strftime("%H:%M"),
+        "session_open": "0400",  # synthetic; extended-hours fields are not mapped
+        "session_close": "2000",
+        "settlement_date": None if s.settlement_date is None else s.settlement_date.isoformat(),
+    }
 
 
 @dataclass
@@ -153,20 +164,19 @@ class FakeAlpacaAccount:
         }  # fmt: skip
 
     def _calendar(self, p: Mapping[str, str]) -> list[dict[str, Any]]:
+        """The observed Alpaca shape (Step 15B live run #3): TRADING returns one row per
+        session in range; SETTLEMENT returns the same trade-date rows, selected by their
+        ``settlement_date`` falling in range (so early rows predate ``start`` and several
+        rows can share one settlement date). Values are synthetic fixture data."""
         start, end = date.fromisoformat(p["start"]), date.fromisoformat(p["end"])
         if p["date_type"] == "SETTLEMENT":
-            return [{"date": d.isoformat()} for d in fixture_settlement_days(start, end)]
-        return [
-            {
-                "date": s.session_date.isoformat(),
-                "open": s.open_at.astimezone(MARKET_TZ).strftime("%H:%M"),
-                "close": s.close_at.astimezone(MARKET_TZ).strftime("%H:%M"),
-                "settlement_date": None
-                if s.settlement_date is None
-                else s.settlement_date.isoformat(),
-            }
-            for s in fixture_sessions(start, end)
-        ]
+            lookback = start - timedelta(days=MAX_SETTLEMENT_LAG_DAYS)
+            return [
+                _calendar_row(s)
+                for s in fixture_sessions(lookback, end)
+                if s.settlement_date is not None and start <= s.settlement_date <= end
+            ]
+        return [_calendar_row(s) for s in fixture_sessions(start, end)]
 
     def _orders(self, p: Mapping[str, str]) -> list[dict[str, Any]]:
         return list(self.open_orders) if p["status"] in {"open", "all"} else []

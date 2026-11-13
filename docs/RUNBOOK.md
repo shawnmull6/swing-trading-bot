@@ -86,9 +86,18 @@ C1–C9 remain unverified and `/account/configurations` was never reached. The m
 made compatible in Step 15B.2 (A§12.24). Run #2 (2026-11-12) parsed the account, then
 stopped in setup after 2 requests (`BROKER_CHECK_EXIT_10`) because
 `/account/configurations` omitted `pdt_check`/`dtbp_check`; Step 15B.4 made those
-optional (A§12.25). C1–C9 are still unverified. **Run #3 needs separate, explicit
-operator authorization**; do not re-run on the strength of an earlier approval. Run it
-well away from the market open and close.
+optional (A§12.25). Run #3 (2026-11-12) completed: C1, C2, C3, C6, C8 verified; C4
+failed because the settlement calendar was read from the wrong field (corrected in Step
+15B.5A, A§12.26); C7 inconclusive (an activity with an empty `description`; open);
+C5/C9 inconclusive on a flat account. **Run #4 needs separate, explicit operator
+authorization**; do not re-run on the strength of an earlier approval. Run it well away
+from the market open and close.
+
+Settlement calendar: Alpaca's SETTLEMENT calendar lists trade dates with their
+`settlement_date`; the bot stores the `settlement_date` values as settlement days. Sale
+proceeds settle only on a date both calendars agree on (or the session's own date when
+no settlement data covers it); otherwise they stay unsettled and new entries are blocked
+(`UNRESOLVED_SETTLEMENT`). A rejected calendar fetch is recorded in `audit`.
 
 ## 4. Ledger initialization (account-backed observe ledger)
 

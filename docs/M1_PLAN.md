@@ -13,8 +13,11 @@ account payload omitted `pattern_day_trader`; steps 15B.1–15B.3 (account paylo
 compatibility, exit code 10, exit-code consistency; A§12.24) implemented offline and
 committed (5a6226b). Live run #2 stopped in setup after two requests because
 `/account/configurations` omitted `pdt_check`/`dtbp_check`; step 15B.4 (configuration
-payload compatibility; A§12.25) implemented offline and awaiting review. Contract rows
-C1–C9 remain unverified; live run #3 needs separate authorization. Position
+payload compatibility; A§12.25) committed. Live run #3 completed: C1–C3, C6, C8 verified;
+C4 failed (settlement calendar read from the wrong field); step 15B.5A (settlement
+calendar mapping correction; A§12.26) implemented offline and awaiting review. C7
+(empty activity description) and the evidence redaction fix remain open; live run #4
+needs separate authorization. Position
 adjustments are not implemented (operational limitation). No Alpaca order submission.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
@@ -98,7 +101,7 @@ Each step lands with its tests; quality gates (§5.5) must pass at every step.
 | 13 | Reconciler | baselines, execution/order/position/cash checks, consistent-snapshot loop, INCONCLUSIVE escalation, two-step rebaseline workflow and audited adjustments (A§8.5) |
 | 14 | Runtime & CLI | lock, startup sequence, commands (§4.1) |
 | 14.1 | Broker-outage breaker | §10.5 escalation: ≥ 3 failed sync cycles ≥ 60 s apart spanning ≥ 30 min → `BROKER_OUTAGE`; durable streak; reset on a complete sync; gate `BROKER_OUTAGE_ACTIVE` (A§12.21) |
-| 15 | Hardening | **A (done, offline):** explicit credential loading, production read-only factory, `broker-check`, `verify-ledger`, contract replay suite + matrix, fault-injection suite, benchmarks, runbook, docs. **A.1 (done, offline):** shared 120-request/300 s budget, rate-limit evidence, sanitized outcomes C1–C13, evidence permissions, head-check retry fix (O2). **B (run 1, 2026-11-12):** stopped in setup after 1 GET (`/v2/account` omitted `pattern_day_trader`); no check ran. **B.1–B.3 (offline):** `pattern_day_trader` optional/informational (`None` = unknown), exit 10 `BROKER_PAYLOAD`, payload-halt exit-code consistency, docs (A§12.24). **B run 2 (2026-11-12):** stopped in setup after 2 GETs (`/account/configurations` omitted `pdt_check`/`dtbp_check`). **B.4 (offline):** both optional (`None` = not reported; JSON `null` in new baselines; historical baselines unchanged), fixture matches the observed 8-field configuration (A§12.25). **Next:** live run #3 — needs separate authorization |
+| 15 | Hardening | **A (done, offline):** explicit credential loading, production read-only factory, `broker-check`, `verify-ledger`, contract replay suite + matrix, fault-injection suite, benchmarks, runbook, docs. **A.1 (done, offline):** shared 120-request/300 s budget, rate-limit evidence, sanitized outcomes C1–C13, evidence permissions, head-check retry fix (O2). **B (run 1, 2026-11-12):** stopped in setup after 1 GET (`/v2/account` omitted `pattern_day_trader`); no check ran. **B.1–B.3 (offline):** `pattern_day_trader` optional/informational (`None` = unknown), exit 10 `BROKER_PAYLOAD`, payload-halt exit-code consistency, docs (A§12.24). **B run 2 (2026-11-12):** stopped in setup after 2 GETs (`/account/configurations` omitted `pdt_check`/`dtbp_check`). **B.4 (offline):** both optional (`None` = not reported; JSON `null` in new baselines; historical baselines unchanged), fixture matches the observed 8-field configuration (A§12.25). **B run 3 (2026-11-12):** completed, 23 GETs; C1–C3, C6, C8 VERIFIED, C4 FAILED (settlement days read from trade `date`), C7 INCONCLUSIVE (empty activity `description`), C5/C9 INCONCLUSIVE (flat). **B.5A (offline):** settlement days from `settlement_date` (A§12.26). **Open:** B.5B activity description + payload classification, B.5C evidence redaction. **Next:** live run #4 — needs separate authorization |
 
 ### 4.1 CLI (M1)
 ```
@@ -225,7 +228,9 @@ M1 (read-only, runnable now):
    `pdt_check`/`dtbp_check`, now optional and audit-only (A§12.25); values not yet checked
    by C2.
 3. Calendar: `TRADING` and `SETTLEMENT` date types; `settlement_date` populated; known
-   bank-holiday dates; horizon end.
+   bank-holiday dates; horizon end. *Run 3 (2026-11-12):* SETTLEMENT rows are trade dates
+   selected by `settlement_date`; settlement days are now taken from `settlement_date`
+   (A§12.26); Veterans Day is a trading day but not a settlement day.
 4. `get_order_by_client_id` for a random unknown id → exact error class/status (404?).
 5. `GET /v2/account/activities` raw shape: id format, ordering, `page_token`, numeric
    fields as strings; non-trade activity types present on this account.
@@ -308,6 +313,7 @@ M1 is complete when all of the following are demonstrated:
 | SQLite loss/corruption | Operational | WAL + FULL sync, backups, startup invariants |
 | `alpaca.txt` plaintext credentials | Operational | operator cleanup (D15) |
 | Account payload differs from the SDK model (`pattern_day_trader`, `daytrade_count` absent in run 1) | Observed (one sample) | PDT optional/informational; every other field strict; malformed payload → exit 10 + persistent `BROKER_PAYLOAD` halt (A§12.24) |
+| SETTLEMENT calendar semantics | Observed (run 3); mapping corrected (A§12.26) | settlement days = `settlement_date` values; cross-checked against each session's own `settlement_date`; an eligible day on which nothing settles is not listed (can only delay a derived date) |
 | `/account/configurations` shape | Observed (one sample, run 2) | 8 fields; `pdt_check`/`dtbp_check` absent → optional, audit-only; installed alpaca-py 0.45.0 marks them removed 2026-07-06 (SDK statement, not independently verified) (A§12.25) |
 | `trade_suspended_by_user`, `closing_transactions_only`, `transfers_blocked` not mapped; `suspend_trade` not checked by reconciliation, `init-ledger` or exit readiness (it **is** recomputed on every gate evaluation and blocks entries) | Open question (**M2 blocker**) | verify semantics (`closing_transactions_only` is absent from the SDK) and enforce trading suspension / closing-only at every entry decision before any real order execution (A§12.25 ¶5) |
 

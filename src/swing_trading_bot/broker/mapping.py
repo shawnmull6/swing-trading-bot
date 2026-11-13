@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Final
@@ -29,7 +29,7 @@ from swing_trading_bot.broker.models import (
     MarketClock,
 )
 from swing_trading_bot.domain.broker_status import BROKER_STATUS_RULES
-from swing_trading_bot.domain.calendar import MARKET_TZ, TradingSession
+from swing_trading_bot.domain.calendar import MARKET_TZ, MAX_SETTLEMENT_LAG_DAYS, TradingSession
 from swing_trading_bot.domain.enums import OrderType, Side, TimeInForce
 from swing_trading_bot.domain.models import BrokerOrderSnapshot, BrokerPosition
 from swing_trading_bot.domain.money import MoneyError, parse_broker_decimal
@@ -115,6 +115,41 @@ def timestamp(raw: Raw, key: str) -> datetime:
     if parsed.utcoffset() is None:
         raise InvalidBrokerDataError(f"field {key!r} has no UTC offset")
     return parsed
+
+
+def settlement_days_from_raw(rows: Sequence[Raw]) -> tuple[date, ...]:
+    """Settlement days from Alpaca ``GET /v2/calendar?date_type=SETTLEMENT`` rows.
+
+    Observed shape (Step 15B live run #3, public market calendar): one row per **trade
+    date** — ``date`` is the trading session, ``settlement_date`` is when that session's
+    trades settle — and the rows are selected by ``settlement_date`` falling inside the
+    requested range (so the earliest ``date`` precedes ``start``). The settlement days are
+    therefore the distinct ``settlement_date`` values; the trade ``date`` is never used as
+    a settlement day.
+
+    Every row needs a valid ``date`` and ``settlement_date`` with
+    ``date < settlement_date <= date + MAX_SETTLEMENT_LAG_DAYS``; anything else raises
+    :class:`InvalidBrokerDataError`. Several trade dates may share one settlement date
+    (e.g. around a bank holiday), so the result is de-duplicated and sorted. Range,
+    weekend and conflict checks happen when the fetch is recorded (``CalendarFetch`` /
+    ``CalendarStore``).
+    """
+    days: set[date] = set()
+    for raw in rows:
+        trade = calendar_date(raw, "date")
+        settles = calendar_date(raw, "settlement_date")
+        if settles <= trade:
+            raise InvalidBrokerDataError(
+                f"settlement calendar row {trade}: settlement_date {settles} is not after "
+                "the trade date"
+            )
+        if (settles - trade).days > MAX_SETTLEMENT_LAG_DAYS:
+            raise InvalidBrokerDataError(
+                f"settlement calendar row {trade}: settlement_date {settles} exceeds the "
+                f"{MAX_SETTLEMENT_LAG_DAYS}-day settlement lag"
+            )
+        days.add(settles)
+    return tuple(sorted(days))
 
 
 def opt_timestamp(raw: Raw, key: str) -> datetime | None:

@@ -137,7 +137,12 @@ def test_trading_and_settlement_calendars() -> None:
     assert fri.settlement_date == date(2026, 11, 30)
     assert fetch.fetched_at == T_NOW and fetch.source == "alpaca"
     assert fetch.problems() == []
-    t.respond("trading", "/calendar", js([{"date": "2026-11-24"}, {"date": "2026-11-25"}]))
+    # SETTLEMENT rows are trade-date rows selected by settlement_date (Step 15B.5A): the
+    # settlement days are the settlement_date values, never the trade dates.
+    t.respond("trading", "/calendar", js([
+        {"date": "2026-11-23", "settlement_date": "2026-11-24"},
+        {"date": "2026-11-24", "settlement_date": "2026-11-25"},
+    ]))  # fmt: skip
     s = adapter.get_calendar(CalendarKind.SETTLEMENT, date(2026, 11, 24), date(2026, 11, 25))
     assert s.settlement_days == (date(2026, 11, 24), date(2026, 11, 25))
     assert t.calls[-1][2]["date_type"] == "SETTLEMENT"
