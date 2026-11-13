@@ -34,7 +34,7 @@ from swing_trading_bot.broker.errors import (
     InvalidBrokerDataError,
     payload_cause,
 )
-from swing_trading_bot.broker.mapping import activity_from_raw, raw_json
+from swing_trading_bot.broker.mapping import MAX_PAYLOAD_DEPTH, activity_from_raw, raw_json
 
 D = Decimal
 NON_FINITE: list[object] = [math.nan, math.inf, -math.inf, D("NaN"), D("Infinity"),
@@ -240,3 +240,54 @@ def test_serialization_payload_errors_classify_as_exit_10_direct_and_wrapped() -
     assert exit_code_for(wrapped(info.value)) is ExitCode.BROKER_PAYLOAD
     assert exit_code_for(wrapped(TypeError("defect"))) is ExitCode.BROKER_UNAVAILABLE
     assert exit_code_for(TypeError("defect")) is ExitCode.INTERNAL
+
+
+# ============================================================ nesting depth (15B.6B)
+def nested(depth: int, leaf: object = 1, kind: str = "list") -> object:
+    """``depth`` containers around ``leaf`` (the outermost container is depth 1)."""
+    value = leaf
+    for n in range(depth):
+        if kind == "list" or (kind == "mixed" and n % 2 == 0):
+            value = [value]
+        elif kind == "tuple":
+            value = (value,)
+        else:
+            value = {"k": value}
+    return value
+
+
+@pytest.mark.parametrize("kind", ["list", "dict", "mixed"])
+def test_depth_64_encodes_byte_identically(kind: str) -> None:
+    raw = {"x": nested(MAX_PAYLOAD_DEPTH - 1, kind=kind)}  # the outer object is depth 1
+    assert raw_json(raw) == legacy(raw)
+
+
+@pytest.mark.parametrize("kind", ["list", "dict", "mixed", "tuple"])
+def test_depth_65_is_a_payload_error(kind: str) -> None:
+    with pytest.raises(InvalidBrokerDataError, match="nesting exceeds 64 levels"):
+        raw_json({"x": nested(MAX_PAYLOAD_DEPTH, kind=kind)})
+    with pytest.raises(InvalidBrokerDataError, match="nesting exceeds 64 levels"):
+        raw_json(nested(65, kind="dict"))  # type: ignore[arg-type]
+
+
+def test_encoding_never_approaches_the_recursion_limit() -> None:
+    with pytest.raises(InvalidBrokerDataError):
+        raw_json({"x": nested(50_000)})
+
+
+def test_decimal_and_non_finite_rules_hold_at_the_limit() -> None:
+    exact = {"x": nested(63, leaf=D("1.50"))}
+    assert raw_json(exact) == '{"x":' + "[" * 63 + "1.50" + "]" * 63 + "}"
+    for bad in (math.nan, D("Infinity")):
+        with pytest.raises(InvalidBrokerDataError, match="non-finite"):
+            raw_json({"x": nested(63, leaf=bad)})
+
+
+@pytest.mark.parametrize("base", [CASH, FILL], ids=["cash", "fill"])
+def test_deeply_nested_activity_is_a_payload_error_exit_10(base: dict[str, Any]) -> None:
+    activity_from_raw({**base, "x": nested(63)})  # depth 64 overall: still maps
+    with pytest.raises(InvalidBrokerDataError) as info:
+        activity_from_raw({**base, "x": nested(64)})
+    assert exit_code_for(info.value) is ExitCode.BROKER_PAYLOAD
+    assert exit_code_for(wrapped(info.value)) is ExitCode.BROKER_PAYLOAD
+    assert payload_cause(wrapped(info.value)) is info.value

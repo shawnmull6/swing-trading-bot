@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Final
@@ -46,6 +46,30 @@ _ORDER_TYPES: Final = {
 }
 _TIFS: Final = {"day": TimeInForce.DAY, "gtc": TimeInForce.GTC}
 
+MAX_PAYLOAD_DEPTH: Final = 64
+"""Deepest container nesting accepted in broker JSON (Step 15B.6B). Convention: the
+outermost array/object is depth 1, each nested array/object adds 1, scalars add nothing
+(``[]`` is 1, ``{"a": [1]}`` is 2, a bare scalar is 0). Depth 64 is accepted, 65 is an
+:class:`InvalidBrokerDataError`. Alpaca payloads are a few levels deep; the limit keeps
+every recursive step (the JSON decoder, :func:`raw_json`) far from Python's recursion
+limit. It equals the contract evidence limit, so an accepted payload is also storable."""
+
+
+def check_payload_depth(value: object) -> None:
+    """Reject nesting deeper than :data:`MAX_PAYLOAD_DEPTH` (iterative; never recurses)."""
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if isinstance(item, Mapping):
+            children: Iterable[object] = item.values()
+        elif isinstance(item, (list, tuple)):
+            children = item
+        else:
+            continue
+        if depth > MAX_PAYLOAD_DEPTH:
+            raise InvalidBrokerDataError(f"payload nesting exceeds {MAX_PAYLOAD_DEPTH} levels")
+        stack.extend((child, depth + 1) for child in children)
+
 
 def raw_json(raw: Raw) -> str:
     """Canonical, deterministic JSON text of a raw broker payload (Step 15B.5B.1).
@@ -64,14 +88,18 @@ def raw_json(raw: Raw) -> str:
 
     Anything the JSON decoder cannot produce (non-string keys, sets, bytes, arbitrary
     objects) still raises ``TypeError``: that is a programming defect, not a broker
-    payload, and is deliberately not reclassified.
+    payload, and is deliberately not reclassified. Nesting deeper than
+    :data:`MAX_PAYLOAD_DEPTH` is a malformed payload (Step 15B.6B):
+    :class:`InvalidBrokerDataError`, raised before any recursion limit is approached.
     """
     parts: list[str] = []
-    _encode(raw, parts)
+    _encode(raw, parts, 0)
     return "".join(parts)
 
 
-def _encode(value: object, out: list[str]) -> None:
+def _encode(value: object, out: list[str], depth: int) -> None:
+    if isinstance(value, (Mapping, list, tuple)) and depth >= MAX_PAYLOAD_DEPTH:
+        raise InvalidBrokerDataError(f"payload nesting exceeds {MAX_PAYLOAD_DEPTH} levels")
     if isinstance(value, Mapping):
         if not all(isinstance(k, str) for k in value):
             raise TypeError("raw broker payload keys must be strings")
@@ -81,7 +109,7 @@ def _encode(value: object, out: list[str]) -> None:
                 out.append(",")
             out.append(json.dumps(key))
             out.append(":")
-            _encode(value[key], out)
+            _encode(value[key], out, depth + 1)
         out.append("}")
         return
     if isinstance(value, (list, tuple)):
@@ -89,7 +117,7 @@ def _encode(value: object, out: list[str]) -> None:
         for n, item in enumerate(value):
             if n:
                 out.append(",")
-            _encode(item, out)
+            _encode(item, out, depth + 1)
         out.append("]")
         return
     if isinstance(value, Decimal):

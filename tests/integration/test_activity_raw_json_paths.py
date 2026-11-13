@@ -50,9 +50,22 @@ D = Decimal
 NUMERIC_MONEY: dict[str, Any] = {"net_amount": 10.5}  # JSON number -> Decimal -> rejected
 NON_FINITE: dict[str, Any] = {"unmapped": math.nan}  # NaN constant -> not JSON
 VALID_EXTRA: dict[str, Any] = {"fee_rate": 0.000166, "nested": {"a": [1.50, 2, "x"]}}
+
+
+def deep(depth: int) -> Any:
+    value: Any = 1
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+# Step 15B.6B: inside a page (array, depth 1) of rows (object, depth 2), 63 more levels
+# reach depth 65 — one past MAX_PAYLOAD_DEPTH; rejected when the response is decoded.
+DEEP: dict[str, Any] = {"unmapped": deep(63)}
 MALFORMED = [pytest.param(NUMERIC_MONEY, id="numeric-money"),
              pytest.param(NON_FINITE, id="nan-unmapped"),
-             pytest.param({"unmapped": {"deep": [math.inf]}}, id="inf-nested")]  # fmt: skip
+             pytest.param({"unmapped": {"deep": [math.inf]}}, id="inf-nested"),
+             pytest.param(DEEP, id="deep-nesting")]  # fmt: skip
 
 
 def row(extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -116,6 +129,11 @@ def post(e: CliEnv, extra: dict[str, Any] | None = None) -> None:
     e.account.clock.advance(minutes=20)
 
 
+def cash_entries(e: CliEnv) -> list[tuple[Any, ...]]:
+    with e.open() as db, db.read() as s:
+        return [tuple(r) for r in s.fetch_all("SELECT * FROM cash_entries ORDER BY id")]
+
+
 def stored_csd(e: CliEnv) -> list[str]:
     with e.open() as db, db.read() as s:
         rows = s.fetch_all("SELECT raw_json FROM broker_activities WHERE activity_type='CSD'")
@@ -141,7 +159,7 @@ def test_malformed_activity_is_a_payload_halt_not_internal(e: CliEnv, bad: dict[
     e.ready()
     with e.open() as db, db.read() as s:
         marker, streak = complete_through(s), load_streak(s)
-    before = stored_csd(e)
+    before, journal = stored_csd(e), cash_entries(e)
     post(e, bad)
     code, env = e.run("sync")
     assert code == 10 and env["result"]["halts_raised"] == ["BROKER_PAYLOAD"]
@@ -156,6 +174,7 @@ def test_malformed_activity_is_a_payload_halt_not_internal(e: CliEnv, bad: dict[
         assert state.halted and state.reason_code == "BROKER_PAYLOAD"
         assert complete_through(s) == marker and load_streak(s) == streak
     assert stored_csd(e) == before  # the malformed activity was never booked
+    assert cash_entries(e) == journal  # the cash journal did not change
 
 
 def test_an_existing_halt_keeps_exit_4_precedence(e: CliEnv) -> None:
@@ -240,3 +259,45 @@ def test_c7_too_few_activities_stays_inconclusive() -> None:
     _, outcome = c7(account([row(VALID_EXTRA)]))
     assert outcome == {"outcome": "INCONCLUSIVE",
                        "code": "TOO_FEW_ACTIVITIES_TO_EXERCISE_PAGINATION"}  # fmt: skip
+
+
+# ============================================================ non-activity endpoints (15B.6B)
+DEEP_ACCOUNT: dict[str, Any] = {"unmapped": deep(64)}  # the account object is depth 1
+
+
+def test_depth_64_activity_is_still_accepted() -> None:
+    w = window(account([row({"unmapped": deep(62)}), row()]))  # 1 + 1 + 62 = 64
+    assert w.tail_confirmed and w.closed and len(w.activities) == 2
+
+
+def test_deep_account_payload_in_broker_check_is_exit_10(e: CliEnv) -> None:
+    e.account.account_overrides.update(DEEP_ACCOUNT)
+    code, env = e.run("broker-check")
+    assert code == 10 and env["exit_meaning"] == "BROKER_PAYLOAD"
+    assert env["result"]["error"] == "InvalidBrokerDataError"
+
+
+def test_deep_account_payload_refuses_init_ledger(e: CliEnv) -> None:
+    e.account.account_overrides.update(DEEP_ACCOUNT)
+    code, env = e.run("init-ledger", *confirm(e))
+    assert code == 10 and env["result"]["status"] == "BROKER_PAYLOAD"
+    assert not e.ledger.exists()
+    assert sorted(p.name for p in e.data.iterdir()) == ["ledger.sqlite3.lock"]
+
+
+def test_deep_account_payload_in_sync_is_a_persistent_halt(e: CliEnv) -> None:
+    e.ready()
+    with e.open() as db, db.read() as s:
+        marker, streak = complete_through(s), load_streak(s)
+    journal = cash_entries(e)
+    e.account.account_overrides.update(DEEP_ACCOUNT)
+    code, env = e.run("sync")
+    assert code == 10 and env["result"]["halts_raised"] == ["BROKER_PAYLOAD"]
+    assert env["result"]["preflight"]["broker_payload_error"] is True
+    assert env["result"]["broker_outage"]["cycle_failures"] == []
+    assert e.run("sync")[0] == 4
+    with e.open() as db, db.read() as s:
+        state = TradingStateRepository().get(s)
+        assert state.halted and state.reason_code == "BROKER_PAYLOAD"
+        assert complete_through(s) == marker and load_streak(s) == streak
+    assert cash_entries(e) == journal

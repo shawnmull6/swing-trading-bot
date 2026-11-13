@@ -44,6 +44,7 @@ from swing_trading_bot.broker.errors import (
     RateLimitedError,
     ServiceUnavailableError,
 )
+from swing_trading_bot.broker.mapping import check_payload_depth
 from swing_trading_bot.config.settings import Settings
 
 Service = Literal["trading", "data"]
@@ -82,11 +83,20 @@ def _check_path(path: str) -> None:
 
 
 def decode_json(text: str) -> object:
-    """Decode with exact decimals: JSON numbers with a fraction/exponent -> Decimal."""
+    """Decode with exact decimals: JSON numbers with a fraction/exponent -> Decimal.
+
+    Every broker response passes here. Nesting deeper than
+    :data:`~swing_trading_bot.broker.mapping.MAX_PAYLOAD_DEPTH` — including nesting deep
+    enough to make the decoder itself raise ``RecursionError`` — is a malformed payload
+    (:class:`InvalidBrokerDataError`, Step 15B.6B), never an internal error."""
     try:
-        return json.loads(text, parse_float=Decimal)
+        doc = json.loads(text, parse_float=Decimal)
     except ValueError:
         raise InvalidBrokerDataError("response body is not valid JSON") from None
+    except RecursionError:
+        raise InvalidBrokerDataError("response body nesting is too deep") from None
+    check_payload_depth(doc)
+    return doc
 
 
 def _retry_after(response: requests.Response) -> timedelta | None:
