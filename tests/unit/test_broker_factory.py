@@ -40,7 +40,7 @@ def account(**changes: Any) -> AccountSnapshot:
     base: dict[str, Any] = {
         "as_of": datetime(2026, 11, 9, tzinfo=UTC), "account_id": ACCOUNT_ID,
         "environment": "paper", "status": "ACTIVE", "currency": "USD", "cash": 0,
-        "non_marginable_buying_power": 0, "multiplier": 1, "pattern_day_trader": False,
+        "non_marginable_buying_power": 0, "multiplier": 1, "pattern_day_trader": None,
         "trading_blocked": False, "account_blocked": False, "accrued_fees": 0,
         "pending_reg_taf_fees": 0,
     }  # fmt: skip

@@ -5,8 +5,15 @@ replace or cancel an Alpaca order; the only execution path is the in-memory SimB
 by `simulate`. Every command prints a JSON envelope with `--json`; logs are redacted JSON
 on stderr. Exit codes: 0 OK · 1 internal / failed scenario · 2 usage · 3 refused ·
 4 halt raised, MISMATCH or account mismatch · 5 INCONCLUSIVE / incomplete · 6 lock held ·
-7 configuration / credentials · 8 broker unavailable · 9 ledger problem. Precedence when
-several apply: 1 > 2 > 6 > 7 > 9 > 4 > 8 > 5 > 3 > 0.
+7 configuration / credentials · 8 broker unavailable · 9 ledger problem · 10 broker
+payload broke the parsing contract (`InvalidBrokerDataError`). Precedence when several
+apply: 1 > 2 > 6 > 7 > 9 > 4 > 10 > 8 > 5 > 3 > 0.
+
+Exit 10 vs 4 for a malformed broker payload (Step 15B.3): the operation that **raises** the
+persistent `BROKER_PAYLOAD` halt from an un-halted ledger, with no other halt, exits 10.
+Every later operation blocked by that recorded halt exits 4, as does a payload error on a
+ledger that was already halted for another reason. A malformed payload never exits 8, is
+never retried as an outage and never counts toward `BROKER_OUTAGE` (§7, §13).
 
 All commands accept `--data-dir` (default `data`), `--config-dir` (default `config`),
 `--json` and `--actor` (audit identity, default `operator:<os user>`).
@@ -46,8 +53,15 @@ STB_ENV_FILE=/abs/path/paper.env uv run swing-trading-bot broker-check
 
 Ledger-free, GET-only. Shows the environment (`paper`), a masked account id, status,
 restrictions and U6 protections — never balances. Exit 3 if the account identity is
-uncertain (id not a canonical UUID, not ACTIVE, not USD). Only the HTTPS paper-trading and
-market-data hosts can be contacted; redirects and proxies are refused.
+uncertain (id not a canonical UUID, not ACTIVE, not USD); exit 10 if the account or
+configuration payload is malformed or a required field is missing or `null`. Only the
+HTTPS paper-trading and market-data hosts can be contacted; redirects and proxies are
+refused.
+
+`pattern_day_trader` is **informational only**: shown as reported, or `null` when the
+broker omits it (unknown — never treated as `false`). No gate, risk check, identity check,
+reconciliation or order decision uses it. The account's `trade_suspended_by_user` and
+`transfers_blocked` fields are **not** read or shown yet (open question, A§12.24).
 
 ### Supervised read-only contract run (operator-authorized only)
 
@@ -59,7 +73,15 @@ One process and one budget (120 requests, 300 s) for the broker-check and every 
 check; it stops on authentication failure, persisting rate limiting, uncertain identity or
 budget exhaustion. It prints only the execution status and the C1–C13 outcomes. Raw
 responses stay in the Git-ignored `contract-evidence/<run>/raw/` (0600); `summary.json` is
-sanitized. Never commit either without review.
+sanitized. Never commit either without review. The raw files contain the account id,
+account number and balances (only credentials are redacted): never paste or share them.
+
+Status (2026-11-12): the first authorized run stopped safely in setup after one
+`GET /v2/account` because the response omitted `pattern_day_trader` (then a required
+field; stop code `BROKER_CHECK_EXIT_8`, which would now be `_10`). No contract check ran;
+C1–C9 remain unverified and `/account/configurations` was never reached. The mapper was
+made compatible in Step 15B.2 (A§12.24). **Another supervised run needs separate,
+explicit operator authorization**; do not re-run on the strength of an earlier approval.
 
 ## 4. Ledger initialization (account-backed observe ledger)
 
@@ -205,6 +227,8 @@ by the OS automatically, and the JSON note in the file is diagnostic only.
 | 7 `CredentialSourceError` | no, ambiguous or unsafe credential source | select exactly one source (§2); fix file permissions/ownership |
 | 7 `BrokerNotConfiguredError` | no broker factory in this wiring | use the installed CLI entry point |
 | 8 | broker unavailable | retry later; see §7 if it persists |
+| 10 `InvalidBrokerDataError` | the broker's response broke the parsing contract (missing/`null` required field, wrong type, float money, unmapped status); runtime commands also set a persistent `BROKER_PAYLOAD` halt | do **not** retry or resume: it is not an outage. Inspect the error (field names only), get the mapper reviewed and fixed, then a CLEAN `reconcile` and an explicit `resume` |
+| 4 `BROKER_PAYLOAD` halt | an operation was blocked by an already-recorded payload halt | as for exit 10; the halt is never cleared automatically |
 | 9 `DatabaseNotFoundError` | no ledger | `init-ledger` (only for a new, flat account) |
 | 9 `MigrationRequiredError` | schema older than the code | `migrate --backup` (§11) |
 | 9 `ModeMismatchError` | simulation ledger opened as observe (or vice versa) | use `--sim-run` for simulation ledgers |

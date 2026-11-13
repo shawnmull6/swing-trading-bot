@@ -13,7 +13,14 @@ from swing_trading_bot.app.commands import BrokerNotConfiguredError
 from swing_trading_bot.app.exit_codes import PRECEDENCE, ExitCode, combine
 from swing_trading_bot.app.lock import LockHeldError
 from swing_trading_bot.app.paths import DataPaths, PathError
-from swing_trading_bot.broker.errors import ServiceUnavailableError
+from swing_trading_bot.broker.errors import (
+    AuthenticationError,
+    InvalidBrokerDataError,
+    OrderNotFoundError,
+    RateLimitedError,
+    ServiceUnavailableError,
+    UnknownBrokerStatusError,
+)
 from swing_trading_bot.config.yaml_loader import ConfigFileError
 from swing_trading_bot.ledger.errors import MigrationRequiredError
 
@@ -33,6 +40,17 @@ def test_precedence_is_total_and_ordered() -> None:
     assert combine(E.BROKER_UNAVAILABLE, E.HALT_OR_MISMATCH) is E.HALT_OR_MISMATCH
     assert combine(E.HALT_OR_MISMATCH, E.LEDGER, E.LOCK_HELD) is E.LOCK_HELD
     assert combine(E.OK, E.INTERNAL) is E.INTERNAL
+    # Step 15B.2: a broker payload violation ranks just below a halt/mismatch and above
+    # plain unavailability; the relative order of every pre-existing code is unchanged.
+    assert int(E.BROKER_PAYLOAD) == 10
+    assert combine(E.BROKER_PAYLOAD, E.HALT_OR_MISMATCH) is E.HALT_OR_MISMATCH
+    assert combine(E.BROKER_PAYLOAD, E.BROKER_UNAVAILABLE) is E.BROKER_PAYLOAD
+    assert combine(E.BROKER_PAYLOAD, E.INCONCLUSIVE, E.REFUSED) is E.BROKER_PAYLOAD
+    assert combine(E.BROKER_PAYLOAD, E.LEDGER) is E.LEDGER
+    assert [c for c in PRECEDENCE if c is not E.BROKER_PAYLOAD] == [
+        E.INTERNAL, E.USAGE, E.LOCK_HELD, E.CONFIG, E.LEDGER, E.HALT_OR_MISMATCH,
+        E.BROKER_UNAVAILABLE, E.INCONCLUSIVE, E.REFUSED, E.OK,
+    ]  # fmt: skip
 
 
 @pytest.mark.parametrize(
@@ -44,6 +62,12 @@ def test_precedence_is_total_and_ordered() -> None:
         (PathError("x"), E.USAGE),
         (MigrationRequiredError("x"), E.LEDGER),
         (ServiceUnavailableError("x"), E.BROKER_UNAVAILABLE),
+        (ServiceUnavailableError("x", kind="timeout"), E.BROKER_UNAVAILABLE),
+        (RateLimitedError("x"), E.BROKER_UNAVAILABLE),
+        (AuthenticationError("x", status_code=401), E.BROKER_UNAVAILABLE),
+        (OrderNotFoundError("x"), E.BROKER_UNAVAILABLE),
+        (InvalidBrokerDataError("missing required field 'cash'"), E.BROKER_PAYLOAD),
+        (UnknownBrokerStatusError("x"), E.BROKER_PAYLOAD),
         (RuntimeError("x"), E.INTERNAL),
     ],
 )

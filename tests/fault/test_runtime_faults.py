@@ -104,9 +104,14 @@ def test_truncated_json_halts_broker_payload(e: CliEnv) -> None:
     e.account.transport.always("trading", "/account/activities", '[{"id": "x", "activ')
     e.account.clock.advance(minutes=1)
     code, env = e.run("sync")
-    assert code == 4
+    assert code == 10  # Step 15B.3: this run raised only the BROKER_PAYLOAD halt
+    assert env["result"]["halts_raised"] == ["BROKER_PAYLOAD"]
     assert e.run("halts")[1]["result"]["trading_state"]["reason_code"] == "BROKER_PAYLOAD"
     assert env["result"]["broker_outage"]["event"] == "UNCHANGED"  # not an outage
+    e.account.clock.advance(minutes=1)
+    code, env = e.run("sync")  # still malformed, ledger already halted
+    assert code == 4 and env["result"]["broker_outage"]["event"] == "UNCHANGED"
+    assert e.run("halts")[1]["result"]["trading_state"]["reason_code"] == "BROKER_PAYLOAD"
 
 
 def test_replayed_activity_with_changed_content_is_a_conflict(e: CliEnv) -> None:

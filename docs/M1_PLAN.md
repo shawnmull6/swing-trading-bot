@@ -7,10 +7,13 @@ approved; step 13.2 (rebaseline accounting corrections: unverified dividends unr
 event-specific acknowledgements, corrected cash equation) implemented and awaiting review
 (§12.19). Steps 13–13.2 committed. Steps 14 and 14.1 approved (A§12.20, A§12.21). Step 15
 phase A accepted (A§12.22); step 15A.1 (harness budgets, sanitized outcomes, evidence
-permissions, head-check retry fix; A§12.23) implemented and awaiting review; phase B (live
-read-only contract run) not authorized yet. Position
-adjustments are not implemented (operational limitation). Live read-only contract checks
-not run. No Alpaca order submission; step 15 not committed until reviewed.**
+permissions, head-check retry fix; A§12.23) committed. Phase B: the first authorized
+supervised read-only run (2026-11-12) stopped in setup after one request because the
+account payload omitted `pattern_day_trader`; steps 15B.1–15B.3 (account payload
+compatibility, exit code 10, exit-code consistency; A§12.24) implemented offline and
+awaiting review. Contract rows C1–C9 remain unverified; a further live run needs
+separate authorization. Position
+adjustments are not implemented (operational limitation). No Alpaca order submission.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal
@@ -93,7 +96,7 @@ Each step lands with its tests; quality gates (§5.5) must pass at every step.
 | 13 | Reconciler | baselines, execution/order/position/cash checks, consistent-snapshot loop, INCONCLUSIVE escalation, two-step rebaseline workflow and audited adjustments (A§8.5) |
 | 14 | Runtime & CLI | lock, startup sequence, commands (§4.1) |
 | 14.1 | Broker-outage breaker | §10.5 escalation: ≥ 3 failed sync cycles ≥ 60 s apart spanning ≥ 30 min → `BROKER_OUTAGE`; durable streak; reset on a complete sync; gate `BROKER_OUTAGE_ACTIVE` (A§12.21) |
-| 15 | Hardening | **A (done, offline):** explicit credential loading, production read-only factory, `broker-check`, `verify-ledger`, contract replay suite + matrix, fault-injection suite, benchmarks, runbook, docs. **A.1 (done, offline):** shared 120-request/300 s budget, rate-limit evidence, sanitized outcomes C1–C13, evidence permissions, head-check retry fix (O2). **B (not authorized):** one supervised live read-only contract run (`python -m tests.contract.live_run`) |
+| 15 | Hardening | **A (done, offline):** explicit credential loading, production read-only factory, `broker-check`, `verify-ledger`, contract replay suite + matrix, fault-injection suite, benchmarks, runbook, docs. **A.1 (done, offline):** shared 120-request/300 s budget, rate-limit evidence, sanitized outcomes C1–C13, evidence permissions, head-check retry fix (O2). **B (run 1, 2026-11-12):** stopped in setup after 1 GET (`/v2/account` omitted `pattern_day_trader`); no check ran. **B.1–B.3 (offline):** `pattern_day_trader` optional/informational (`None` = unknown), exit 10 `BROKER_PAYLOAD`, payload-halt exit-code consistency, docs (A§12.24). **Next:** a second supervised run — needs separate authorization |
 
 ### 4.1 CLI (M1)
 ```
@@ -212,8 +215,13 @@ underlying client and fails the test on any non-GET request.
 
 M1 (read-only, runnable now):
 1. Base URL resolves to paper; account `status`, `cash`, `multiplier`,
-   `pattern_day_trader`, `trading_blocked` present and string-typed where expected.
-2. Account configuration fields (`no_shorting`, `max_margin_multiplier`, `pdt_check`).
+   `trading_blocked` present and string-typed where expected. *(Run 1, 2026-11-12: the
+   real `/v2/account` omitted `pattern_day_trader` and `daytrade_count`; the field is now
+   optional and informational — `null`/absent = unknown, never false (A§12.24).)*
+2. Account configuration fields (`no_shorting`, `max_margin_multiplier`, `pdt_check`,
+   `dtbp_check`, `suspend_trade`). *Not yet observed* — run 1 never reached
+   `/account/configurations`; `pdt_check`/`dtbp_check` stay required until evidence and
+   approval say otherwise.
 3. Calendar: `TRADING` and `SETTLEMENT` date types; `settlement_date` populated; known
    bank-holiday dates; horizon end.
 4. `get_order_by_client_id` for a random unknown id → exact error class/status (404?).
@@ -297,6 +305,9 @@ M1 is complete when all of the following are demonstrated:
 | PDT/settlement regulation changes | Regulatory | rules in configurable account profiles, not hard-coded |
 | SQLite loss/corruption | Operational | WAL + FULL sync, backups, startup invariants |
 | `alpaca.txt` plaintext credentials | Operational | operator cleanup (D15) |
+| Account payload differs from the SDK model (`pattern_day_trader`, `daytrade_count` absent in run 1) | Observed (one sample) | PDT optional/informational; every other field strict; malformed payload → exit 10 + persistent `BROKER_PAYLOAD` halt (A§12.24) |
+| `/account/configurations` shape (`pdt_check`, `dtbp_check`, `suspend_trade`) | Unverified | stays required; next authorized run observes it |
+| `trade_suspended_by_user` / `transfers_blocked` ignored; `suspend_trade` checked only at startup | Open question (**M2 blocker**) | verify semantics and enforce trading suspension at every entry decision before any real order execution (A§12.24 ¶4) |
 
 ## 8. Out of scope for M1
 Strategy/signals, scheduler, websocket stream, Alpaca execution adapter, RTH-01
@@ -307,4 +318,6 @@ adjustments, notifications, dashboards.
 SDK write-path retries disabled and tested; out-of-order fill restatement procedure and
 execution-ordered ingestion in place (ARCHITECTURE §12.8); M2 pre-execution contract
 suite designed; Alpaca execution adapter reviewed separately; U6 preflight enforced;
+verified trading-suspension enforcement (`trade_suspended_by_user` / `suspend_trade`,
+A§12.24 ¶4); contract rows C1–C9 reviewed from an authorized supervised run;
 explicit approval to submit paper orders.

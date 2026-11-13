@@ -391,3 +391,30 @@ def test_pytest_failure_output_is_sanitized(tmp_path: Path) -> None:
 
 def test_fail_if_not_ok_passes_a_clean_summary() -> None:
     fail_if_not_ok({"execution": {"status": "COMPLETED"}, "rows": {"C1": {"outcome": "VERIFIED"}}})
+
+
+# ============================================================ Step 15B.2 account schema
+def test_account_without_pdt_completes_and_verifies_identity(
+    tmp_path: Path, logs: io.StringIO
+) -> None:
+    clock = FakeTime()
+    session = HarnessSession(clock)
+    assert "pattern_day_trader" not in session.account._account({})  # the observed shape
+    summary = run(tmp_path, logs, session, clock)
+    assert summary["execution"]["status"] == "COMPLETED"
+    assert summary["execution"]["setup"]["broker_check_exit"] == 0
+    assert summary["rows"]["C1"] == {"outcome": "VERIFIED", "code": "OK"}
+
+
+def test_account_payload_violation_in_setup_stops_with_exit_10(
+    tmp_path: Path, logs: io.StringIO
+) -> None:
+    clock = FakeTime()
+    session = HarnessSession(clock)
+    session.account.account_overrides["pattern_day_trader"] = "false"
+    summary = run(tmp_path, logs, session, clock)
+    assert summary["execution"]["status"] == "STOPPED"
+    assert summary["execution"]["stop_code"] == "BROKER_CHECK_EXIT_10"
+    assert summary["execution"]["requests_by_phase"] == {"setup": 1}  # no retry, no checks
+    assert all(v["code"] == "NOT_RUN" for r, v in summary["rows"].items()
+               if r not in {"C10", "C11", "C12", "C13"})  # fmt: skip

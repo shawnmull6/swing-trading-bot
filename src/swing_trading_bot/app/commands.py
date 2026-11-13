@@ -397,6 +397,7 @@ def cmd_broker_check(ctx: Context, _args: argparse.Namespace) -> Outcome:
         "currency": account.currency,
         "trading_blocked": account.trading_blocked,
         "account_blocked": account.account_blocked,
+        # Informational only: None (JSON null) = the broker did not report it (unknown).
         "pattern_day_trader": account.pattern_day_trader,
         "no_shorting": config.no_shorting,
         "max_margin_multiplier": str(config.max_margin_multiplier),

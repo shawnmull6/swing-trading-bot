@@ -33,7 +33,12 @@ class AccountSnapshot:
     cash: Decimal
     non_marginable_buying_power: Decimal
     multiplier: Decimal
-    pattern_day_trader: bool
+    pattern_day_trader: bool | None
+    """**Informational only.** ``None`` means *unknown*: the broker did not report the
+    field (the Alpaca paper ``/v2/account`` payload observed in Step 15B omits it). It is
+    never coerced to ``False``. No risk, pre-trade, gate, identity, reconciliation,
+    order-submission or ledger decision may read it (structural test
+    ``tests/unit/test_pdt_isolation.py``); only ``broker-check`` reports it."""
     trading_blocked: bool
     account_blocked: bool
     accrued_fees: Decimal

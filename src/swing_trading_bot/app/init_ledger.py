@@ -46,7 +46,7 @@ from swing_trading_bot.app.exit_codes import ExitCode
 from swing_trading_bot.app.paths import SQLITE_SIDECARS, DataPaths
 from swing_trading_bot.app.runtime import ObserveBroker
 from swing_trading_bot.broker.activity_feed import DEFAULT_RESCAN_POLICY, collect_window
-from swing_trading_bot.broker.errors import BrokerError
+from swing_trading_bot.broker.errors import BrokerError, InvalidBrokerDataError
 from swing_trading_bot.broker.models import AccountConfigSnapshot, AccountSnapshot
 from swing_trading_bot.domain.calendar import MARKET_TZ, CalendarFetch, CalendarKind
 from swing_trading_bot.domain.enums import RuntimeMode
@@ -66,6 +66,8 @@ class InitStatus(StrEnum):
     CONFIRMATION_REQUIRED = "CONFIRMATION_REQUIRED"
     REFUSED = "REFUSED"
     BROKER_UNAVAILABLE = "BROKER_UNAVAILABLE"
+    BROKER_PAYLOAD = "BROKER_PAYLOAD"
+    """The broker's response broke the parsing contract (``InvalidBrokerDataError``)."""
 
 
 @dataclass(slots=True)
@@ -119,6 +121,7 @@ class InitResult:
             InitStatus.CONFIRMATION_REQUIRED: ExitCode.REFUSED,
             InitStatus.REFUSED: ExitCode.REFUSED,
             InitStatus.BROKER_UNAVAILABLE: ExitCode.BROKER_UNAVAILABLE,
+            InitStatus.BROKER_PAYLOAD: ExitCode.BROKER_PAYLOAD,
         }[self.status]
 
     def to_dict(self) -> dict[str, Any]:
@@ -233,6 +236,10 @@ def initialize_observe_ledger(  # noqa: PLR0911 - one return per audited outcome
         return result
     try:
         ev = gather_evidence(broker, now)
+    except InvalidBrokerDataError as exc:  # nothing created: evidence precedes the ledger
+        result.status = InitStatus.BROKER_PAYLOAD
+        result.problems = [f"{type(exc).__name__}: {exc}"]
+        return result
     except BrokerError as exc:
         result.status = InitStatus.BROKER_UNAVAILABLE
         result.problems = [f"{type(exc).__name__}: {exc}"]

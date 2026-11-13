@@ -40,7 +40,7 @@ from swing_trading_bot.app.config import (
     AppConfig,
 )
 from swing_trading_bot.app.exit_codes import ExitCode, combine
-from swing_trading_bot.broker.errors import BrokerError
+from swing_trading_bot.broker.errors import BrokerError, InvalidBrokerDataError
 from swing_trading_bot.broker.models import (
     AccountConfigSnapshot,
     AccountSnapshot,
@@ -271,6 +271,10 @@ class PreflightReport:
     identity_problem: str | None = None
     identity_mismatch: bool = False
     halted: HaltReason | None = None
+    payload_error: bool = False
+    """The read failed with ``InvalidBrokerDataError`` (a broken parsing contract)."""
+    already_halted: bool = False
+    """The ledger was already persistently halted when the payload error occurred."""
 
     @property
     def ok(self) -> bool:
@@ -278,6 +282,12 @@ class PreflightReport:
 
     @property
     def exit_code(self) -> ExitCode:
+        if self.payload_error:
+            # Never BROKER_UNAVAILABLE: a malformed payload is not an outage (§12.24).
+            # This run raised the BROKER_PAYLOAD halt -> 10; an operation blocked by an
+            # already-recorded persistent halt -> 4 (HALT_OR_MISMATCH).
+            raised_now = self.halted is HaltReason.BROKER_PAYLOAD and not self.already_halted
+            return ExitCode.BROKER_PAYLOAD if raised_now else ExitCode.HALT_OR_MISMATCH
         if self.halted is not None or self.identity_mismatch:
             return ExitCode.HALT_OR_MISMATCH
         if self.broker_error is not None:
@@ -296,6 +306,7 @@ class PreflightReport:
             if self.account_config is None
             else self.account_config.m2_protections_in_place,
             "broker_error": self.broker_error,
+            "broker_payload_error": self.payload_error,
             "identity_problem": self.identity_problem,
             "halted": None if self.halted is None else self.halted.value,
         }
@@ -312,6 +323,9 @@ def preflight(rt: Runtime) -> PreflightReport:
         report.clock = rt.broker.get_clock()
     except BrokerError as exc:
         report.broker_error = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, InvalidBrokerDataError):
+            report.payload_error = True
+            report.already_halted = rt.state().halted
         reason = read_error_halt(exc)
         if reason is not None and halt_once(
             rt.db, reason, f"preflight read failed: {report.broker_error}", at=now
@@ -456,22 +470,33 @@ class CycleReport:
     last_successful_sync: datetime | None = None
     outage: OutageUpdate | None = None
     failure_categories: tuple[str, ...] = ()
+    halt_events_before: int = 0
+    halts_raised: tuple[str, ...] = ()
+    """Reason codes of every persistent halt recorded during this operation."""
 
     @property
     def completed(self) -> bool:
         return self.preflight.ok and self.sync is not None
 
     @property
+    def payload_halt_only(self) -> bool:
+        """This operation started unhalted and the only persistent halt it raised is
+        BROKER_PAYLOAD: reported as exit 10 instead of the generic HALT_OR_MISMATCH."""
+        return (
+            not self.before.halted
+            and bool(self.halts_raised)
+            and set(self.halts_raised) == {HaltReason.BROKER_PAYLOAD.value}
+            and self.after.reason_code == HaltReason.BROKER_PAYLOAD.value
+        )
+
+    @property
     def exit_code(self) -> ExitCode:
+        halt = ExitCode.BROKER_PAYLOAD if self.payload_halt_only else ExitCode.HALT_OR_MISMATCH
         codes = [self.preflight.exit_code]
         if new_halt(self.before, self.after):
-            codes.append(ExitCode.HALT_OR_MISMATCH)
+            codes.append(halt)
         if self.sync is not None and self.sync.status is not SyncStatus.OK:
-            codes.append(
-                ExitCode.HALT_OR_MISMATCH
-                if self.sync.status is SyncStatus.HALTED
-                else ExitCode.INCONCLUSIVE
-            )
+            codes.append(halt if self.sync.status is SyncStatus.HALTED else ExitCode.INCONCLUSIVE)
         if self.failure_categories:
             codes.append(ExitCode.BROKER_UNAVAILABLE)
         if self.preflight.ok and not cycle_complete(self):
@@ -512,6 +537,7 @@ class CycleReport:
             if self.outage is None
             else {**self.outage.to_dict(), "cycle_failures": list(self.failure_categories)},
             "new_halt": new_halt(self.before, self.after),
+            "halts_raised": list(self.halts_raised),
             "trading_state": state_dict(self.after),
         }
 
@@ -522,13 +548,27 @@ def sync_cycle(rt: Runtime, *, extra_marks: Iterable[str] = ()) -> CycleReport:
     started = rt.now()
     rt.broker.reset()
     before = rt.state()
-    pre = preflight(rt)
-    report = CycleReport(before=before, after=before, preflight=pre)
+    report = CycleReport(before=before, after=before, preflight=PreflightReport(),
+                         halt_events_before=_halt_event_count(rt))  # fmt: skip
+    report.preflight = pre = preflight(rt)
     if pre.ok:
         _run_cycle(rt, report, extra_marks)
     _update_outage(rt, report, cycle_at=started)
-    report.after = rt.state()
+    refresh_after(rt, report)
     return report
+
+
+def _halt_event_count(rt: Runtime) -> int:
+    with rt.db.read() as s:
+        return len(TradingStateRepository().events(s))
+
+
+def refresh_after(rt: Runtime, report: CycleReport) -> None:
+    """Record the trading state after the operation and the halts it raised."""
+    report.after = rt.state()
+    with rt.db.read() as s:
+        events = TradingStateRepository().events(s)[report.halt_events_before :]
+    report.halts_raised = tuple(e.reason_code for e in events if e.action == "HALT")
 
 
 def _run_cycle(rt: Runtime, report: CycleReport, extra_marks: Iterable[str]) -> None:
@@ -636,7 +676,7 @@ def reconcile(rt: Runtime) -> ReconcileResult:
         return result
     result.recon = rt.reconciler.run(now=rt.now())
     result.gate = rt.gates.run_startup(now=rt.now())
-    result.cycle.after = rt.state()
+    refresh_after(rt, result.cycle)
     return result
 
 

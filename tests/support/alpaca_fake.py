@@ -56,12 +56,24 @@ def js(value: Any) -> str:
     return json.dumps(value)
 
 
+#: Synthetic values in the field-name/JSON-type shape of the real paper ``/v2/account``
+#: payload observed in Step 15B (names and types only; no real value is reproduced).
+#: ``pattern_day_trader`` and ``daytrade_count`` are deliberately ABSENT, as observed.
 ACCOUNT = {
     "id": "acct", "account_number": "PA0000", "status": "ACTIVE", "currency": "USD",
     "cash": "100000.12", "non_marginable_buying_power": "100000.12",
-    "buying_power": "400000.48", "multiplier": "4", "pattern_day_trader": False,
-    "trading_blocked": False, "account_blocked": False, "accrued_fees": "0",
-    "pending_reg_taf_fees": "0.01", "equity": "100000.12", "daytrade_count": 0,
+    "buying_power": "400000.48", "regt_buying_power": "200000.24",
+    "effective_buying_power": "400000.48", "options_buying_power": "100000.12",
+    "multiplier": "4", "trading_blocked": False, "account_blocked": False,
+    "transfers_blocked": False, "trade_suspended_by_user": False, "shorting_enabled": True,
+    "accrued_fees": "0", "pending_reg_taf_fees": "0.01", "equity": "100000.12",
+    "last_equity": "100000.12", "portfolio_value": "100000.12",
+    "long_market_value": "0", "short_market_value": "0", "position_market_value": "0",
+    "initial_margin": "0", "maintenance_margin": "0", "last_maintenance_margin": "0",
+    "sma": "0", "intraday_adjustments": "0", "balance_asof": "2026-11-06",
+    "created_at": "2026-01-05T15:00:00.000000Z", "crypto_status": "INACTIVE",
+    "crypto_tier": 0, "options_approved_level": 0, "options_trading_level": 0,
+    "admin_configurations": {}, "user_configurations": None,
 }  # fmt: skip
 
 CONFIG = {

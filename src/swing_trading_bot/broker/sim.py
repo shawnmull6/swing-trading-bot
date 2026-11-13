@@ -170,6 +170,8 @@ class SimConfig:
     account_status: str = "ACTIVE"
     trading_blocked: bool = False
     suspend_trade: bool = False
+    pattern_day_trader: bool | None = False
+    """Reported as-is; ``None`` omits the field from the account payload (unknown)."""
 
 
 # ---------------------------------------------------------------- internal state
@@ -334,7 +336,7 @@ class SimBroker:
     # =========================================================== read port
     def get_account(self) -> AccountSnapshot:
         self._enter("get_account")
-        raw = {
+        raw: Raw = {
             "id": self.config.account_id,
             "status": self.config.account_status,
             "currency": self.config.currency,
@@ -342,12 +344,13 @@ class SimBroker:
             "non_marginable_buying_power": _num(max(ZERO, self._cash)),
             "buying_power": _num(self._cash * self.config.margin_multiplier),  # never read
             "multiplier": _num(self.config.margin_multiplier),
-            "pattern_day_trader": False,
             "trading_blocked": self.config.trading_blocked,
             "account_blocked": False,
             "accrued_fees": "0",
             "pending_reg_taf_fees": "0",
         }
+        if self.config.pattern_day_trader is not None:
+            raw["pattern_day_trader"] = self.config.pattern_day_trader
         return account_from_raw(
             self._mutate("get_account", raw), as_of=self.clock.now(), environment=ENVIRONMENT
         )

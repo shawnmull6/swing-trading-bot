@@ -3,8 +3,16 @@
 When several conditions apply to one command, the code earliest in :data:`PRECEDENCE`
 wins: an internal error over everything; then usage, lock, configuration and ledger
 problems (the command could not start safely); then a persistent halt raised during
-this run or a reconciliation MISMATCH; then broker unavailability; then INCONCLUSIVE
-evidence; then a plain refusal; OK only when nothing else applies.
+this run or a reconciliation MISMATCH; then a broker payload that broke the parsing
+contract; then broker unavailability; then INCONCLUSIVE evidence; then a plain refusal;
+OK only when nothing else applies.
+
+``BROKER_PAYLOAD`` (Step 15B.2) is a fail-closed schema/contract mismatch
+(``InvalidBrokerDataError``): retrying will not help, unlike ``BROKER_UNAVAILABLE``.
+Inside the runtime a malformed read still raises the persistent ``BROKER_PAYLOAD`` halt
+and never counts toward a broker outage (Step 15B.3): the operation that raised it from
+an un-halted ledger, with no other new halt, reports ``BROKER_PAYLOAD``; an operation
+governed by an already-recorded persistent halt reports ``HALT_OR_MISMATCH``.
 
 * Informational commands (``status``, ``portfolio``, ``orders``, ``halts``, ``audit``)
   return OK while *reporting* an existing halt.
@@ -29,6 +37,7 @@ class ExitCode(IntEnum):
     CONFIG = 7
     BROKER_UNAVAILABLE = 8
     LEDGER = 9
+    BROKER_PAYLOAD = 10
 
 
 PRECEDENCE: Final = (
@@ -38,6 +47,7 @@ PRECEDENCE: Final = (
     ExitCode.CONFIG,
     ExitCode.LEDGER,
     ExitCode.HALT_OR_MISMATCH,
+    ExitCode.BROKER_PAYLOAD,
     ExitCode.BROKER_UNAVAILABLE,
     ExitCode.INCONCLUSIVE,
     ExitCode.REFUSED,

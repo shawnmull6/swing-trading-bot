@@ -100,6 +100,12 @@ def boolean(raw: Raw, key: str) -> bool:
     return value
 
 
+def opt_boolean(raw: Raw, key: str) -> bool | None:
+    """``None`` when the field is absent or ``null`` (unknown, never ``False``); a present
+    value must be a JSON boolean."""
+    return None if raw.get(key) is None else boolean(raw, key)
+
+
 def timestamp(raw: Raw, key: str) -> datetime:
     value = text(raw, key)
     try:
@@ -185,7 +191,8 @@ def account_from_raw(raw: Raw, *, as_of: datetime, environment: str) -> AccountS
         cash=decimal(raw, "cash"),
         non_marginable_buying_power=decimal(raw, "non_marginable_buying_power"),
         multiplier=decimal(raw, "multiplier"),
-        pattern_day_trader=boolean(raw, "pattern_day_trader"),
+        # Informational; absent/null -> None (unknown). Every other field stays required.
+        pattern_day_trader=opt_boolean(raw, "pattern_day_trader"),
         trading_blocked=boolean(raw, "trading_blocked"),
         account_blocked=boolean(raw, "account_blocked"),
         accrued_fees=decimal(raw, "accrued_fees"),
