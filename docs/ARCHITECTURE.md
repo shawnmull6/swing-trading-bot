@@ -9,7 +9,9 @@ reconciliation retry safety, §12.23) committed; the first supervised live read-
 stopped in setup on missing configuration fields; step 15B.4 (configuration payload
 compatibility, §12.25) committed; live run #3 completed with C4 FAILED on a settlement
 calendar mapping error; step 15B.5A (settlement calendar mapping correction, §12.26)
-implemented offline and awaiting review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
+committed; step 15B.5B (activity description compatibility and wrapped payload errors,
+§12.27) implemented offline and awaiting review. Live run #4 needs separate
+authorization.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -2609,6 +2611,84 @@ the observed shape (synthetic values).
 C7 still inconclusive until the activity `description` fix (15B.5B); C5/C9 INCONCLUSIVE
 on a flat account. `init-ledger` against the real account stays blocked until C4 and C7
 are verified live and the flat-account INCONCLUSIVE rows are accepted on review.
+
+### 12.27 Activity description compatibility and wrapped payload errors (15B.5B)
+
+Offline implementation. **No schema change, no migration;** the settlement calendar
+(§12.26), runtime, reconciliation, gates, OMS, risk limits, the evidence sanitizer and
+broker-write behavior are unchanged.
+
+**1. Observed C7 issue (live run #3).** The real account's one activity (a non-trade
+activity) carried `"description": ""`. The mapper used `opt_text`, which rejects an
+empty string, so the page raised `InvalidBrokerDataError`; `collect_window` wrapped it in
+`IncompleteRetrievalError` (original kept as `__cause__`), and the C7 check reported
+INCONCLUSIVE `BROKER_INCOMPLETE_RETRIEVAL`. The same wrapping made `init-ledger` and the
+CLI report exit 8 ("broker unavailable") for what is a payload contract problem. The
+runtime sync path already unwrapped the cause and raised the `BROKER_PAYLOAD` halt.
+
+**2. Field-specific description rule.** `mapping._activity_description` (non-trade
+activities only): absent or `null` → `None`; any string, **including `""`**, kept exactly;
+boolean, number, array or object → `InvalidBrokerDataError`. It is evaluated before the
+raw JSON is serialized, so a JSON-float description is a payload error rather than a
+serialization `TypeError`. `text()`/`opt_text()` are unchanged, and every other field
+(`id`, `activity_type`, `symbol`, `order_id`, …) is as strict as before. `""` and `None`
+stay distinct end to end: the raw JSON is stored verbatim, and FEE twin detection
+(`classify._fee`) compares the stored raw `description` with the mapped value — `""`
+twins are detected exactly like named twins (booked once), while `""` vs absent are, like
+any two different descriptions, distinct fees (unchanged rule).
+
+**3. `payload_cause()`** (`broker/errors.py`): returns the `InvalidBrokerDataError`
+(incl. `UnknownBrokerStatusError`) that is `exc` itself or the explicit `__cause__` of at
+most `PAYLOAD_CAUSE_MAX_DEPTH` (4) nested `IncompleteRetrievalError` wrappers; nothing
+else is traversed (no `__context__`, no other exception types). Timeouts, network
+failures, 5xx, 429, auth errors and genuinely incomplete pagination (no cause, or a
+non-payload cause) are never payload errors. Exceptions are not modified.
+
+**4. Classification.**
+
+| Where | Direct payload error | Wrapped payload error | Genuine incomplete / transient |
+|---|---|---|---|
+| CLI `exit_code_for` | 10 | **10** (was 8) | 8 |
+| `init-ledger` | 10 `BROKER_PAYLOAD`, nothing created | **10** (was 8) | 8 `BROKER_UNAVAILABLE` |
+| Runtime sync | persistent `BROKER_PAYLOAD` halt; 10 first, 4 when governed by a recorded halt (§12.24 ¶3) | unchanged (already unwrapped) | INCOMPLETE; outage breaker counts transient causes only |
+| Outage breaker | not counted | not counted (unchanged) | counted per §12.21 |
+| Reconciliation | read failure → INCONCLUSIVE | window incomplete → never CLEAN (unchanged) | INCONCLUSIVE |
+| Gates | `BROKER_DATA_INVALID` (unchanged) | n/a (gates read account/config/clock) | `BROKER_UNAVAILABLE` |
+| Contract outcomes | VIOLATION → FAILED `BROKER_PAYLOAD_CONTRACT_BROKEN` | **FAILED** (was INCONCLUSIVE `BROKER_INCOMPLETE_RETRIEVAL`) | INCONCLUSIVE `BROKER_INCOMPLETE_RETRIEVAL` |
+
+Completeness is unchanged: a window that failed part-way is never complete and never
+advances the coverage marker. As before (`OrderSync._ingest_all`), activities read on earlier good pages
+are ingested idempotently ("nothing is skipped"); the malformed row itself is never
+recorded. A malformed activity that recurs on every sync re-records the
+`BROKER_PAYLOAD` halt event each cycle (existing mid-sync halt behavior); the halt is
+never cleared automatically.
+
+**5. Remaining C7 limitation.** C7's criterion is unchanged (`multi_page_exercised`:
+more than 10 activities in the 30-day window). The real flat paper account had one
+activity, so after this fix C7 is expected to be INCONCLUSIVE
+`TOO_FEW_ACTIVITIES_TO_EXERCISE_PAGINATION` on live run #4 — tail confirmation,
+page-size independence and window partition are then actually exercised, multi-page
+pagination is not.
+
+**6. Open finding (not fixed; needs a separate decision).** A JSON float anywhere in a
+non-trade activity other than `description` (e.g. `net_amount`, `qty`, or an unmapped
+field) is decoded as `Decimal` and makes `raw_json()` raise `TypeError` before field
+validation. That still fails closed (the command ends with exit 1 `INTERNAL`, `init-ledger`
+creates nothing, coverage does not advance), but it is not classified as a payload error
+and raises no `BROKER_PAYLOAD` halt (verified offline). A fix would make
+activity raw serialization report non-JSON values as `InvalidBrokerDataError`.
+
+**7. Tests.** Description matrix (missing, `null`, `""`, non-empty, boolean, number,
+JSON-float `Decimal`, array, object); other text fields still strict; global helpers
+unchanged; structural check that only `description` uses the relaxed rule;
+`payload_cause` (direct, nested up to the limit, bounded beyond it, transient causes,
+`__context__` ignored, causes preserved); CLI exit 10 vs 8; collector with empty
+descriptions, malformed first and later pages (partial never complete); runtime halt
+(10 then 4), outage streak and coverage unchanged; reconciliation not CLEAN and gates
+blocked by the persistent halt; `init-ledger` accepting `""` and refusing malformed
+activities with exit 10 and no ledger (a timeout still exits 8); FEE twins with `""`;
+C7 VERIFIED with empty descriptions, FAILED on a malformed later page, INCONCLUSIVE on a
+genuine interruption and on too few activities.
 
 ---
 

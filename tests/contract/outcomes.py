@@ -26,10 +26,10 @@ from swing_trading_bot.broker.errors import (
     AuthenticationError,
     BrokerError,
     IncompleteRetrievalError,
-    InvalidBrokerDataError,
     OrderNotFoundError,
     RateLimitedError,
     ServiceUnavailableError,
+    payload_cause,
 )
 from tests.contract.checks import ContractContext, ContractViolation, InsufficientEvidence
 
@@ -76,11 +76,12 @@ def classify_exception(exc: Exception) -> CheckResult:  # noqa: PLR0911 - one co
         return CheckResult(CheckStatus.BROKER_ERROR, "BROKER_RATE_LIMITED")
     if isinstance(exc, ServiceUnavailableError):
         return CheckResult(CheckStatus.BROKER_ERROR, f"BROKER_UNAVAILABLE_{exc.kind.upper()}")
+    if payload_cause(exc) is not None:
+        # The broker's response broke the parsing contract the code relies on — directly,
+        # or on a page inside an interrupted retrieval (Step 15B.5B; e.g. C7).
+        return CheckResult(CheckStatus.VIOLATION, "BROKER_PAYLOAD_CONTRACT_BROKEN")
     if isinstance(exc, IncompleteRetrievalError):
         return CheckResult(CheckStatus.BROKER_ERROR, "BROKER_INCOMPLETE_RETRIEVAL")
-    if isinstance(exc, InvalidBrokerDataError):
-        # The broker's response broke the parsing contract the code relies on.
-        return CheckResult(CheckStatus.VIOLATION, "BROKER_PAYLOAD_CONTRACT_BROKEN")
     if isinstance(exc, OrderNotFoundError):
         return CheckResult(CheckStatus.BROKER_ERROR, "BROKER_NOT_FOUND")
     if isinstance(exc, BrokerError):

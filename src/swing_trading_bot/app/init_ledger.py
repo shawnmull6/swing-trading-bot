@@ -46,7 +46,7 @@ from swing_trading_bot.app.exit_codes import ExitCode
 from swing_trading_bot.app.paths import SQLITE_SIDECARS, DataPaths
 from swing_trading_bot.app.runtime import ObserveBroker
 from swing_trading_bot.broker.activity_feed import DEFAULT_RESCAN_POLICY, collect_window
-from swing_trading_bot.broker.errors import BrokerError, InvalidBrokerDataError
+from swing_trading_bot.broker.errors import BrokerError, payload_cause
 from swing_trading_bot.broker.models import AccountConfigSnapshot, AccountSnapshot
 from swing_trading_bot.domain.calendar import MARKET_TZ, CalendarFetch, CalendarKind
 from swing_trading_bot.domain.enums import RuntimeMode
@@ -236,13 +236,14 @@ def initialize_observe_ledger(  # noqa: PLR0911 - one return per audited outcome
         return result
     try:
         ev = gather_evidence(broker, now)
-    except InvalidBrokerDataError as exc:  # nothing created: evidence precedes the ledger
-        result.status = InitStatus.BROKER_PAYLOAD
-        result.problems = [f"{type(exc).__name__}: {exc}"]
-        return result
-    except BrokerError as exc:
-        result.status = InitStatus.BROKER_UNAVAILABLE
-        result.problems = [f"{type(exc).__name__}: {exc}"]
+    except BrokerError as exc:  # nothing created: evidence precedes the ledger
+        cause = payload_cause(exc)  # direct, or behind an interrupted activity window
+        if cause is not None:
+            result.status = InitStatus.BROKER_PAYLOAD
+            result.problems = [f"{type(cause).__name__}: {cause}"]
+        else:
+            result.status = InitStatus.BROKER_UNAVAILABLE
+            result.problems = [f"{type(exc).__name__}: {exc}"]
         return result
     result.evidence = ev
     if ev.problems:

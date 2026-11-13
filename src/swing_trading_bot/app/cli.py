@@ -49,7 +49,7 @@ from swing_trading_bot.app.commands import (
 from swing_trading_bot.app.exit_codes import ExitCode
 from swing_trading_bot.app.lock import LockHeldError
 from swing_trading_bot.app.paths import DataPaths, PathError
-from swing_trading_bot.broker.errors import BrokerError, InvalidBrokerDataError
+from swing_trading_bot.broker.errors import BrokerError, payload_cause
 from swing_trading_bot.config.settings import SettingsError
 from swing_trading_bot.config.yaml_loader import ConfigFileError
 from swing_trading_bot.ledger.errors import PersistenceError
@@ -157,8 +157,8 @@ def exit_code_for(exc: BaseException) -> ExitCode:  # noqa: PLR0911 - one code p
         return ExitCode.USAGE
     if isinstance(exc, PersistenceError):
         return ExitCode.LEDGER
-    if isinstance(exc, InvalidBrokerDataError):  # before BrokerError: a schema mismatch
-        return ExitCode.BROKER_PAYLOAD  # is not an outage; retrying will not help
+    if payload_cause(exc) is not None:  # before BrokerError: a schema mismatch, direct or
+        return ExitCode.BROKER_PAYLOAD  # behind an incomplete retrieval; not an outage
     if isinstance(exc, BrokerError):
         return ExitCode.BROKER_UNAVAILABLE
     return ExitCode.INTERNAL

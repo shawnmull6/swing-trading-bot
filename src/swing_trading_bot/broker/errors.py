@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from enum import StrEnum
+from typing import Final
 
 
 class OrderState(StrEnum):
@@ -150,3 +151,29 @@ def submit_failure_state(error: BaseException) -> OrderState:
     if isinstance(error, DuplicateClientOrderIdError):
         return OrderState.EXISTS
     return OrderState.UNKNOWN
+
+
+PAYLOAD_CAUSE_MAX_DEPTH: Final = 4
+"""How many ``IncompleteRetrievalError`` wrappers :func:`payload_cause` will look through."""
+
+
+def payload_cause(exc: BaseException) -> InvalidBrokerDataError | None:
+    """The malformed-payload error behind ``exc``, or ``None``.
+
+    Recognizes ``exc`` itself (``InvalidBrokerDataError``, incl. ``UnknownBrokerStatusError``)
+    and the ``__cause__`` of an :class:`IncompleteRetrievalError` — e.g. a page that failed
+    to parse inside ``collect_window`` — following at most
+    :data:`PAYLOAD_CAUSE_MAX_DEPTH` such wrappers. Nothing else is traversed: a timeout,
+    network failure, HTTP 429 or a genuinely incomplete pagination (no cause, or a
+    non-payload cause) is never a payload error. The exception and its cause chain are
+    not modified; the incomplete-retrieval semantics (partial results are never
+    complete) are unaffected.
+    """
+    current: BaseException | None = exc
+    for _ in range(PAYLOAD_CAUSE_MAX_DEPTH + 1):
+        if isinstance(current, InvalidBrokerDataError):
+            return current
+        if not isinstance(current, IncompleteRetrievalError):
+            return None
+        current = current.__cause__
+    return None

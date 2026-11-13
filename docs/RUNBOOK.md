@@ -88,7 +88,8 @@ stopped in setup after 2 requests (`BROKER_CHECK_EXIT_10`) because
 `/account/configurations` omitted `pdt_check`/`dtbp_check`; Step 15B.4 made those
 optional (A§12.25). Run #3 (2026-11-12) completed: C1, C2, C3, C6, C8 verified; C4
 failed because the settlement calendar was read from the wrong field (corrected in Step
-15B.5A, A§12.26); C7 inconclusive (an activity with an empty `description`; open);
+15B.5A, A§12.26); C7 inconclusive (an activity with an empty `description`; accepted
+since Step 15B.5B, A§12.27 — C7 is still expected INCONCLUSIVE with too few activities);
 C5/C9 inconclusive on a flat account. **Run #4 needs separate, explicit operator
 authorization**; do not re-run on the strength of an earlier approval. Run it well away
 from the market open and close.
@@ -243,7 +244,7 @@ by the OS automatically, and the JSON note in the file is diagnostic only.
 | 7 `CredentialSourceError` | no, ambiguous or unsafe credential source | select exactly one source (§2); fix file permissions/ownership |
 | 7 `BrokerNotConfiguredError` | no broker factory in this wiring | use the installed CLI entry point |
 | 8 | broker unavailable | retry later; see §7 if it persists |
-| 10 `InvalidBrokerDataError` | the broker's response broke the parsing contract (missing/`null` required field, wrong type, float money, unmapped status); runtime commands also set a persistent `BROKER_PAYLOAD` halt | do **not** retry or resume: it is not an outage. Inspect the error (field names only), get the mapper reviewed and fixed, then a CLEAN `reconcile` and an explicit `resume` |
+| 10 `InvalidBrokerDataError` | the broker's response broke the parsing contract (missing/`null` required field, wrong type, float money, unmapped status), directly or on a page inside an interrupted multi-page read (e.g. an activity window); runtime commands also set a persistent `BROKER_PAYLOAD` halt. An activity's `description` may be `""` (valid since Step 15B.5B). Known gap: a JSON float in a non-trade activity field other than `description` currently ends the command with exit 1 instead (A§12.27 ¶6) | do **not** retry or resume: it is not an outage. Inspect the error (field names only), get the mapper reviewed and fixed, then a CLEAN `reconcile` and an explicit `resume` |
 | 4 `BROKER_PAYLOAD` halt | an operation was blocked by an already-recorded payload halt | as for exit 10; the halt is never cleared automatically |
 | 9 `DatabaseNotFoundError` | no ledger | `init-ledger` (only for a new, flat account) |
 | 9 `MigrationRequiredError` | schema older than the code | `migrate --backup` (§11) |

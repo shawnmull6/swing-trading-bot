@@ -74,6 +74,23 @@ def decimal(raw: Raw, key: str) -> Decimal:
         raise InvalidBrokerDataError(str(exc)) from None
 
 
+def _activity_description(raw: Raw) -> str | None:
+    """Field-specific rule for an activity's free-text ``description`` (Step 15B.5B).
+
+    Absent or ``null`` -> ``None``; any string, **including the empty string**, is kept
+    exactly (Alpaca sent ``""`` in Step 15B live run #3); anything else ->
+    :class:`InvalidBrokerDataError`. ``""`` and ``None`` stay distinct: FEE twin
+    detection compares the stored raw value with this one. :func:`text` and
+    :func:`opt_text` are unchanged for every other field.
+    """
+    value = raw.get("description")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise InvalidBrokerDataError("field 'description' must be a string")
+    return value
+
+
 def opt_decimal(raw: Raw, key: str) -> Decimal | None:
     return None if raw.get(key) is None else decimal(raw, key)
 
@@ -282,7 +299,8 @@ def activity_from_raw(raw: Raw) -> BrokerActivity:
             order_status=text(raw, "order_status"),
             fill_type=text(raw, "type"),
         )
-    return BrokerActivity(
+    description = _activity_description(raw)  # before raw_json: a JSON-float description
+    return BrokerActivity(  # must be a payload error, not a serialization TypeError
         activity_id=activity_id,
         activity_type=activity_type,
         activity_date=calendar_date(raw, "date"),
@@ -293,7 +311,7 @@ def activity_from_raw(raw: Raw) -> BrokerActivity:
         order_id=opt_text(raw, "order_id"),
         qty=opt_decimal(raw, "qty"),
         per_share_amount=opt_decimal(raw, "per_share_amount"),
-        description=opt_text(raw, "description"),
+        description=description,
     )
 
 
