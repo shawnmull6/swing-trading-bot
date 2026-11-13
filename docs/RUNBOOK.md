@@ -142,8 +142,39 @@ no settlement data covers it); otherwise they stay unsettled and new entries are
 
 ## 4. Ledger initialization (account-backed observe ledger)
 
+> **Do not run `init-ledger` against the real account until a separate, explicit
+> authorization is granted.** The M1 initialization exception (A§12.32) is a policy, not
+> an authorization; C5, C7 and C9 remain INCONCLUSIVE and M2 order execution is not
+> authorized.
+
 Prerequisites: the dedicated paper account is **flat** (no positions, no open orders), not
 restricted, no pending fees; `data/` contains nothing but `sim/` or the lock file.
+
+**Operator checklist (A§12.32).** Items marked *(code)* refuse automatically; the others
+are the operator's responsibility.
+
+1. Written authorization for this one invocation exists; it names the account (masked)
+   and the target path.
+2. Exactly one credential source is selected (§2) *(code)*; no account settings or
+   margin changes have been made, and none are made during initialization.
+3. `broker-check` exits 0: paper, `ACTIVE`, USD *(code)*.
+4. `data/` holds no ledger, sidecar or unexpected entry *(code)*.
+5. Run the **preview** (no confirmation flags) and save its output to a private 0600 file
+   outside the repository — it shows the full account id. Check in it: no `problems`;
+   `positions` 0 and `open_orders` 0 *(code, both observations)*; `activity_tail_confirmed`
+   true and `activity_pages` 1 *(code — more than one page request refuses with exit 3,
+   Step 15B.8)*; both calendars listed *(code)*. Fees pending or a restriction refuse
+   *(code)*.
+6. Run the **confirmed** invocation, typing the path, account id and environment from the
+   preview exactly *(code)*; save its output privately as well. Account id and cash must
+   not change between the two observations *(code)*.
+7. Expect `INITIALIZED`, `created.halted` true and `halt_reason` `INITIALIZED`. On any
+   refusal (exit 3), broker error (8) or payload error (10) nothing is created *(code)*:
+   report the status and problems (no identifiers) and stop — do not retry around it.
+8. Report only the masked account id, counts and status. Never paste the account id,
+   balances or raw output.
+9. Do **not** `reconcile` or `resume` without their own authorization; `resume` releases
+   `INITIALIZED` only after a CLEAN reconciliation taken after the halt *(code)*.
 
 1. Preview — creates nothing and prints the exact values to confirm:
    ```bash

@@ -14,8 +14,10 @@ committed; step 15B.5B (activity description compatibility and wrapped payload e
 step 15B.5C (live contract evidence sanitization, §12.29) committed; step 15B.5D (atomic
 evidence publication and write-failure handling, §12.30) committed; live run #4
 (2026-11-13) PASSED with no FAILED row (C7 still INCONCLUSIVE); steps 15B.6A–15B.6C
-(configuration errors, deep nesting, exact activity comparison, §12.31) committed.
-Real-ledger initialization remains blocked (§12.31 ¶7).** Decision log: `docs/M1_PLAN.md` §2.
+(configuration errors, deep nesting, exact activity comparison, §12.31) committed;
+step 15B.8 (single-page activity guard for `init-ledger`) committed; a narrow M1
+initialization exception policy is recorded (§12.32). Real-ledger initialization is not
+authorized; M2 execution is not authorized.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -2617,7 +2619,9 @@ the observed shape (synthetic values).
 C7 still inconclusive until the activity `description` fix (15B.5B); C5/C9 INCONCLUSIVE
 on a flat account. `init-ledger` against the real account stays blocked until C4 and C7
 are verified live and the flat-account INCONCLUSIVE rows are accepted on review.
-*Run #4 result: §12.31 — C4 VERIFIED; C7 still INCONCLUSIVE; requirement unchanged.*
+*Run #4 result: §12.31 — C4 VERIFIED; C7 still INCONCLUSIVE. For the initial M1 ledger
+creation only, this requirement is narrowed by the exception in §12.32 (C7 stays
+INCONCLUSIVE; initialization still needs separate authorization).*
 
 ### 12.27 Activity description compatibility and wrapped payload errors (15B.5B)
 
@@ -3101,6 +3105,96 @@ and end-to-end reconciliation tests.
   `closing_transactions_only`, `transfers_blocked` and `suspend_trade` enforcement
   remain unresolved (§12.25 ¶5; M2-V1).
 * Native no-replace publication is still unverified on Linux (§12.30 ¶7).
+
+*Update (15B.8/15B.9): the C7 decision is recorded in §12.32 — a narrow exception policy
+for the initial M1 ledger creation only; initialization itself is still not authorized.*
+
+### 12.32 M1 ledger initialization exception (15B.8 guard, 15B.9 policy)
+
+**1. Status.** *Exception policy:* approved direction (2026-11-13), recorded here.
+*Implementation:* the single-page guard (Step 15B.8) is committed; every other control
+below already existed. *Live validation:* incomplete — C5, C7 and C9 remain
+INCONCLUSIVE, C10–C13 DEFERRED. *Initialization:* **not authorized** — an `init-ledger`
+invocation needs a separate, explicit approval after a preflight review. *M2 execution:*
+**not authorized**. This section narrows §12.26 ¶7 for one operation only; it does not
+mark any contract row VERIFIED.
+
+**2. Scope.** The exception permits *considering* the initial creation of the M1
+observe-only virtual ledger while C5, C7 and C9 are INCONCLUSIVE, and only when all of
+the following hold: an Alpaca **paper** account; zero positions and zero working (open)
+orders; a stable account cash snapshot; the 7-day activity lookback read in **exactly one
+completed page request** with a confirmed tail; both calendars validated; and the new
+ledger created **halted** (`INITIALIZED`). It applies to that initial creation only — not
+to a rebaseline, a re-initialization of another account, or any later operation. It does
+not waive any runtime reconciliation, persistent-halt or gate behavior, does not
+authorize M2 trading or any broker write, and **expires before M2 order execution**
+(¶6). C7 stays INCONCLUSIVE until live multi-page cursor behavior is verified; C5 and C9
+stay INCONCLUSIVE until their missing live scenarios are exercised; C10–C13 stay
+DEFERRED.
+
+**3. Gates.** *Code-enforced* (refusal → nothing created):
+
+| Gate | Where |
+|---|---|
+| Exactly one credential source (environment **or** `STB_ENV_FILE`; absolute path, owner, 0600, not a symlink, not Git-tracked) | `app/credentials.py` (§12.22); exit 7 otherwise |
+| Paper-trading and market-data hosts only; GET only; no redirects; proxies and `.netrc` ignored | `broker/alpaca_http.py` (`trust_env = False`, `allow_redirects=False`); `app/safety.py` (`init-ledger` is `READ_ONLY`) |
+| Identity: environment `paper`, canonical UUID, `ACTIVE`, USD | `broker_factory.account_identity_problems` |
+| Exact confirmation of target path, account id and environment | `init_ledger._confirmations` (exit 3 `CONFIRMATION_REQUIRED`) |
+| Zero positions and zero open orders in **both** observations | `init_ledger.gather_evidence` |
+| Not `account_blocked` / `trading_blocked`; no accrued or pending regulatory fees | `gather_evidence` |
+| Same account id and cash in both observations | `gather_evidence` |
+| 7-day activity window read in exactly one page request (`ActivityWindow.pages == 1`, fewer than 100 activities); missing or inconsistent page metadata refuses | `init_ledger.single_page_problems` (Step 15B.8) |
+| Activity tail confirmed; an interrupted read refuses (exit 8, or 10 for a payload error) | `gather_evidence`, `collect_window` |
+| TRADING and SETTLEMENT calendars accepted (range, weekend, conflict, `settlement_date` mapping) | `_build` → `CalendarStore.record_fetch` (§12.26) |
+| No existing ledger, SQLite sidecar or unexpected `data/` entry; exclusive lock | `check_target`, `LedgerLock` |
+| Built under a temporary name in one transaction; no-clobber `os.link`; temporary file removed on any failure | `initialize_observe_ledger`, `_build` |
+| `INITIALIZED` persistent halt kept | `Database.create`; reported as `created.halted` |
+| Coverage marker (`activities.complete_through`) not set; the first sync starts at the portfolio's creation | `_build` (never writes it); `oms/sync.py` |
+| No broker write path exists (no execution adapter) | structural (§12.22) |
+
+*Operator procedures* (not enforced by code):
+
+* No margin use and no account-setting change on the account (U6 protections are not in
+  place, ¶6).
+* Initialization output contains the **full account id** (it must be typed back to
+  confirm): keep it in a private 0600 file outside the repository, never in chat,
+  tickets or commits; report only the masked id, counts and status. It contains no
+  balances.
+* Preview first; check `activity_pages == 1`, zero positions and orders and no problems
+  before the confirmed invocation (RUNBOOK §4).
+* Run away from the market open and close; a refusal is reported, not retried around.
+* `reconcile` and `resume` after initialization are separate authorizations.
+
+**4. Compensating controls.**
+* The baseline is the broker's **cash snapshot** (equity = cash on a flat account), not
+  a replay of historical activities. Activities before the baseline are counted for the
+  evidence but **never booked** into the virtual ledger; sync starts at the portfolio's
+  creation and the reconciliation history window at the first baseline.
+* The single-page guard means initialization never relies on the unverified multi-page
+  cursor (`page_token`) semantics.
+* After initialization, the cash identity (broker cash = baseline + recorded movements;
+  otherwise `CASH_UNEXPLAINED`, a MISMATCH halt) and the position checks can detect many
+  omitted cash- or position-affecting activities. They **cannot** guarantee detection of
+  every omission: an activity without cash or position effect, or omissions that offset
+  each other exactly, can go unseen. Reconciliation is **not** proof of a complete
+  activity history.
+* Incomplete retrieval stays fail-closed: an incomplete window never advances coverage,
+  cash is `CASH_NOT_EVALUATED` (INCONCLUSIVE) without complete history, and a payload
+  error sets the persistent `BROKER_PAYLOAD` halt.
+* Releasing `INITIALIZED` requires a separately authorized `resume`, which succeeds only
+  on a CLEAN reconciliation taken after the halt (§12.20).
+
+**5. Residual risk.** A sync or reconciliation window that later needs more than one page
+uses the unverified cursor; an omission there is detected only to the extent of ¶4. On a
+flat observe-only account that volume is not expected; in M2 it is, hence ¶6.
+
+**6. Expiry — this exception does not satisfy M2 readiness.** Before any M2 broker order
+write, a separate review must cover, none of which is resolved by this section: C7 live
+multi-page verification; C5 non-empty positions and order semantics; C9 non-account
+numeric precision; C10–C13; U6 account protections; mapping and enforcement of
+`trade_suspended_by_user`, `closing_transactions_only`, `transfers_blocked` and
+`suspend_trade` (§12.25 ¶5, M2-V1); and every existing M2 entry criterion (M1_PLAN §9,
+§9.1).
 
 ---
 
