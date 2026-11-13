@@ -29,6 +29,7 @@ from swing_trading_bot.app.broker_factory import (
     production_broker_factory,
 )
 from swing_trading_bot.app.config import D8_CAPITAL, AppConfig
+from swing_trading_bot.app.confirmation import ConfirmationFileError, load_confirmation
 from swing_trading_bot.app.exit_codes import ExitCode
 from swing_trading_bot.app.init_ledger import initialize_observe_ledger
 from swing_trading_bot.app.lock import LedgerLock, LockMode
@@ -241,21 +242,42 @@ def cmd_audit(ctx: Context, args: argparse.Namespace) -> Outcome:
 
 
 # ===================================================================== lifecycle
+def _refused(*problems: str) -> Outcome:
+    return Outcome(ExitCode.REFUSED, {"status": "REFUSED", "problems": list(problems)})
+
+
+def _init_confirmations(args: argparse.Namespace) -> tuple[str | None, str | None, str | None]:
+    """Exactly one confirmation source: the three ``--confirm-*`` options or
+    ``--confirm-file`` (Step 15B.10A). Raises :class:`ConfirmationFileError`."""
+    inline = (args.confirm_path, args.confirm_account, args.confirm_environment)
+    if args.confirm_file is None:
+        return inline
+    if any(v is not None for v in inline):
+        raise ConfirmationFileError(
+            "use either --confirm-file or the --confirm-* options, not both"
+        )
+    c = load_confirmation(Path(args.confirm_file))
+    return c.path, c.account, c.environment
+
+
 def cmd_init_ledger(ctx: Context, args: argparse.Namespace) -> Outcome:
+    try:  # before credentials are loaded or any broker request is made
+        confirm_path, confirm_account, confirm_environment = _init_confirmations(args)
+    except ConfirmationFileError as exc:
+        return _refused(str(exc))
     broker = ctx.broker()
     config = ctx.config()
     if not ctx.paths.root.is_dir():
-        return Outcome(ExitCode.REFUSED, {"status": "REFUSED", "problems": [
-            f"data directory does not exist: {ctx.paths.root}"]})  # fmt: skip
+        return _refused(f"data directory does not exist: {ctx.paths.root}")
     with LedgerLock(ctx.paths.observe_ledger, LockMode.EXCLUSIVE, command=ctx.command):
         result = initialize_observe_ledger(
             ctx.paths,
             broker,
             config,
             now=ctx.deps.clock(),
-            confirm_path=args.confirm_path,
-            confirm_account=args.confirm_account,
-            confirm_environment=args.confirm_environment,
+            confirm_path=confirm_path,
+            confirm_account=confirm_account,
+            confirm_environment=confirm_environment,
             initial_capital=ctx.deps.initial_capital,
             max_capital_allocation=ctx.deps.max_capital_allocation,
         )

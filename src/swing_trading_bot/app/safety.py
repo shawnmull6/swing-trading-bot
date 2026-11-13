@@ -78,7 +78,8 @@ COMMAND_SAFETY: Final = (
                   "checks (no ledger, no balances)"),
     CommandSafety("init-ledger", Broker.READ_ONLY, LedgerWrites.CREATE, Recovery.NO,
                   Halts.CREATES_INITIALIZED,
-                  "--confirm-path, --confirm-account, --confirm-environment must match", _EX,
+                  "--confirm-path, --confirm-account, --confirm-environment (or one private "
+                  "--confirm-file) must match", _EX,
                   "target checks → broker evidence → confirmations → build under a temp name "
                   "→ no-clobber link"),
     CommandSafety("migrate", Broker.NONE, LedgerWrites.SCHEMA, Recovery.NO, Halts.NONE,

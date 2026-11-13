@@ -111,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one declarativ
     p.add_argument("--confirm-path")
     p.add_argument("--confirm-account")
     p.add_argument("--confirm-environment")
+    p.add_argument("--confirm-file", metavar="PATH",
+                   help="private JSON file (absolute path, owned by you, mode 0600) holding "
+                   "confirm_path, confirm_account and confirm_environment; replaces the "
+                   "three --confirm-* options so the account id stays out of argv")  # fmt: skip
     p = add("migrate", cmd_migrate, "explicit, backed-up schema migration", sim_target)
     p.add_argument("--backup", required=True, metavar="PATH", help="new backup file")
     p = add("backup", cmd_backup, "verified online backup", sim_target)

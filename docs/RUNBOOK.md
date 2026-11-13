@@ -165,8 +165,10 @@ are the operator's responsibility.
    true and `activity_pages` 1 *(code — more than one page request refuses with exit 3,
    Step 15B.8)*; both calendars listed *(code)*. Fees pending or a restriction refuse
    *(code)*.
-6. Run the **confirmed** invocation, typing the path, account id and environment from the
-   preview exactly *(code)*; save its output privately as well. Account id and cash must
+6. Run the **confirmed** invocation with the path, account id and environment from the
+   preview, preferably via `--confirm-file` (below) so the account id stays out of the
+   command line and shell history *(code: exact match)*; save its output privately as
+   well. Account id and cash must
    not change between the two observations *(code)*.
 7. Expect `INITIALIZED`, `created.halted` true and `halt_reason` `INITIALIZED`. On any
    refusal (exit 3), broker error (8) or payload error (10) nothing is created *(code)*:
@@ -176,11 +178,30 @@ are the operator's responsibility.
 9. Do **not** `reconcile` or `resume` without their own authorization; `resume` releases
    `INITIALIZED` only after a CLEAN reconciliation taken after the halt *(code)*.
 
-1. Preview — creates nothing and prints the exact values to confirm:
+1. Preview — creates nothing and prints the exact values to confirm (it shows the full
+   account id, so save it privately, outside the repository):
    ```bash
-   uv run swing-trading-bot init-ledger
+   umask 077; uv run swing-trading-bot init-ledger --json > /ABSOLUTE/PRIVATE/DIR/init-preview.json
    ```
-2. Confirm all three values exactly:
+2. Confirm all three values exactly — either with a private confirmation file
+   (recommended; Step 15B.10A):
+   ```bash
+   uv run swing-trading-bot init-ledger --json --confirm-file /ABSOLUTE/PRIVATE/DIR/confirm.json
+   ```
+   The file is a JSON object with exactly the `required_confirmation` keys from the
+   preview — `confirm_path`, `confirm_account`, `confirm_environment` — all strings, no
+   other keys, no duplicates. It must be an absolute path to a regular file (not a
+   symlink), owned by you, mode `0600` or stricter, at most 4 KiB. **Store it outside the
+   repository** (e.g. next to the private preview output) and delete it after use. One
+   way to write it from a saved preview without echoing the id:
+   ```bash
+   umask 077; jq .result.required_confirmation /ABSOLUTE/PRIVATE/DIR/init-preview.json > /ABSOLUTE/PRIVATE/DIR/confirm.json
+   ```
+   Check the last four characters of the account id in the preview against the expected
+   account first. An unsafe or malformed file, or `--confirm-file` combined with any
+   `--confirm-*` option, refuses with exit 3 before any broker request; messages never
+   contain the values. Or with the three options (the account id is then visible in the
+   command line and shell history):
    ```bash
    uv run swing-trading-bot init-ledger --confirm-path <path> --confirm-account <id> --confirm-environment paper
    ```
