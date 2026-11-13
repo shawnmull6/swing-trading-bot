@@ -328,4 +328,26 @@ execution-ordered ingestion in place (ARCHITECTURE §12.8); M2 pre-execution con
 suite designed; Alpaca execution adapter reviewed separately; U6 preflight enforced;
 verified trading-suspension and closing-only enforcement (`trade_suspended_by_user`,
 `suspend_trade`, `closing_transactions_only`; A§12.25 ¶5); contract rows C1–C9 reviewed from an authorized supervised run;
+the M2 pre-execution verification requirements in §9.1 met;
 explicit approval to submit paper orders.
+
+### 9.1 M2 pre-execution verification requirements
+
+Added 2026-11-12 after the read-only review of `alpacahq/alpaca-skills@0e7c35163ae4`
+(`docs/EXTERNAL_REFERENCES.md`). Each item is verified from SDK source and/or the M2
+pre-execution contract suite (authorized, supervised, paper only) and recorded in
+ARCHITECTURE §3/§12 before any order is submitted to Alpaca. The external skills are
+hypotheses, not evidence; where they disagree with this project's design, this project's
+design stands until verification says otherwise and a reviewed change is approved.
+Nothing here changes M1 behavior. These are verification requirements only: they do not
+authorize implementing an execution adapter, enabling a broker write path, or submitting
+any order, which still require the separate review and explicit approval listed in §9.
+
+| # | Requirement | Verify | Pass condition |
+|---|---|---|---|
+| M2-V1 | **Trading restrictions and paper-account identity** | `/v2/account` `status` (including `PAPER_ONLY`), `trading_blocked`, `account_blocked`, `trade_suspended_by_user`; configuration `suspend_trade`, `no_shorting`, `max_margin_multiplier`; `closing_transactions_only` presence and meaning; resolved base URL is the paper URL literal (A§3 V1); the account id matches the one recorded in the ledger baseline | Every restriction field mapped and enforced at every entry decision (extends the §7 M2 blocker and U6); an unknown account status or a changed account id fails closed (block/halt); no path reads the base URL from configuration |
+| M2-V2 | **Order field validation and asset eligibility** | Order payload rules for the order types M2 will use (`type`/`time_in_force` combinations, `qty` vs `notional` exclusivity, `extended_hours`, `client_order_id` ≤ 128 chars and uniqueness); asset record fields `tradable`, `status`, `fractionable`, `shortable`, `easy_to_borrow` via `GET /v2/assets/{symbol}` | Pre-trade gate rejects locally (reason code, no broker call) any order the broker would reject for field or eligibility reasons; asset eligibility is read fresh per session and a missing/unknown asset fails closed |
+| M2-V3 | **HTTP 403 / 422 / 429 handling on order endpoints** | Actual status codes and bodies for: insufficient buying power or shares, unrecognized or invalid fields, non-tradable symbol, market closed, rate limiting (`Retry-After`, `X-RateLimit-*`). The external skill states 403 on `POST /v2/orders` means insufficient buying power/shares, not an auth failure; A§10.5 currently maps 401/403 to persistent halt `AUTH` | A reviewed, explicit mapping from observed responses to `REJECTED` vs halt vs ambiguous; any change to the 403 → `AUTH` rule is a separate reviewed decision (fail-closed until then); 429 on submit is never retried by the SDK or a generic loop (A§3 V2) |
+| M2-V4 | **Ambiguous order submission outcomes** | SDK write-path retries disabled (V2); behavior of timeout, connection drop, 5xx and 504 on submit; `orders:by_client_order_id` response for a just-submitted and an unknown id (visibility latency, error shape); duplicate `client_order_id` response | Every non-definitive submit outcome enters `SUBMIT_AMBIGUOUS` and is resolved only by the A§10.3 protocol; a duplicate-id response is treated as "order exists"; no automated resend |
+| M2-V5 | **Quantity and price precision** | Trading API limits for `qty` (decimal places; whole shares unless fractional is explicitly enabled), `notional`, `limit_price`/`stop_price` increments (sub-dollar vs ≥ $1 prices), and the precision of echoed fill fields | Values rounded once, at the send boundary, with an explicit Decimal rounding mode (round down for buy quantity and notional); sent values and broker-echoed values stored verbatim; a precision rejection is a local pre-trade rejection, never a broker surprise |
+| M2-V6 | **Order-status polling limits** | Rate-limit budget from response headers on the paper account; order/activity visibility lag after submit | A documented polling schedule with a per-order cap and backoff, sharing one read budget with sync/reconcile; exceeding the cap escalates through the existing ambiguous/outage paths rather than polling indefinitely |

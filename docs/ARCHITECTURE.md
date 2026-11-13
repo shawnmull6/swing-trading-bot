@@ -33,6 +33,10 @@ Scope: the core infrastructure delivered in Milestone M1 and the seams later mil
    most once; replay after a crash converges to the same state.
 6. **No network I/O inside a DB transaction**, and no state change outside one.
 7. **Secrets never leave `.env`.** `SecretStr`, never logged, printed, repr'd or stored.
+8. **External guidance is reference only.** External agent skills and vendor guidance
+   (e.g. Alpaca Skills, pinned and reviewed in `docs/EXTERNAL_REFERENCES.md`) are never
+   installed and never override the OMS, the virtual ledger, risk gates, persistent
+   halts, credential handling or broker-write authorization.
 
 ---
 

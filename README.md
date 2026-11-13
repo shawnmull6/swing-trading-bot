@@ -10,6 +10,7 @@ exists only against an in-memory simulator.
 * Plan, decisions and acceptance criteria: [`docs/M1_PLAN.md`](docs/M1_PLAN.md)
 * Operating procedures: [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
 * Performance measurements: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)
+* External references (pinned, read-only; never installed): [`docs/EXTERNAL_REFERENCES.md`](docs/EXTERNAL_REFERENCES.md)
 
 ## Quick start (offline)
 
