@@ -22,7 +22,11 @@ The supervised live read-only contract run (Step 15B, prepared in Step 15A.1).
 
 The run stops — and every later check is ``NOT_RUN`` — on budget or deadline exhaustion,
 a write attempt, an authentication failure, persisting rate limiting, or an invalid account
-identity. The summary separates *execution* (COMPLETED / STOPPED) from each row's
+identity. Before any request it stops with a fixed code when no credential source is
+selected (``CREDENTIALS_UNAVAILABLE``) or the selected settings are invalid
+(``CONFIGURATION_INVALID``, Step 15B.6A — e.g. ``TRADING_MODE`` missing or not ``paper``);
+the exception message is discarded, no session is created and the budget never starts.
+The summary separates *execution* (COMPLETED / STOPPED) from each row's
 *verification* outcome.
 
 Usage (authorized operator only)::
@@ -47,6 +51,7 @@ from swing_trading_bot.app.commands import production_dependencies
 from swing_trading_bot.app.credentials import CredentialSourceError, load_credentials
 from swing_trading_bot.broker.alpaca_http import AlpacaReadTransport
 from swing_trading_bot.broker.alpaca_read import AlpacaPaperReadAdapter
+from swing_trading_bot.config.settings import SettingsError
 from swing_trading_bot.observability.logging import (
     SecretRedactor,
     configure_logging,
@@ -113,8 +118,10 @@ def run_supervised(  # noqa: PLR0915 - injectable dependencies; one linear scrip
         secrets = loaded.settings.secret_values()
         register_secrets(secrets)
         execution["credential_source"] = loaded.source
-    except CredentialSourceError:
+    except CredentialSourceError:  # no/ambiguous/unsafe source (a SettingsError subclass)
         stop("CREDENTIALS_UNAVAILABLE")
+    except SettingsError:  # Step 15B.6A: invalid or missing setting; message discarded
+        stop("CONFIGURATION_INVALID")
     if execution["status"] == "COMPLETED":
         budget.start()
         session = BudgetedSession(session_factory(), budget)

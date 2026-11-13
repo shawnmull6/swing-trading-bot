@@ -22,6 +22,7 @@ import requests
 
 from swing_trading_bot.broker.errors import AuthenticationError, ServiceUnavailableError
 from tests.contract import checks as contract_checks
+from tests.contract import live_run
 from tests.contract.live_run import fail_if_not_ok, render, run_supervised
 from tests.contract.supervisor import (
     EVIDENCE_ROOT,
@@ -441,3 +442,168 @@ def test_malformed_config_in_setup_stops_with_exit_10(tmp_path: Path, logs: io.S
     summary = run(tmp_path, logs, session, clock)
     assert summary["execution"]["stop_code"] == "BROKER_CHECK_EXIT_10"
     assert summary["execution"]["requests_by_phase"] == {"setup": 2}
+
+
+# ============================================================ configuration (15B.6A)
+MODE_SENTINEL = "sentinel-mode-4242"
+ENABLED_SENTINEL = "sentinel-enabled-4242"
+CREDENTIALS = {"ALPACA_API_KEY": KEY, "ALPACA_SECRET_KEY": SECRET}
+INVALID_SETTINGS = [
+    pytest.param(CREDENTIALS, id="missing-trading-mode"),
+    pytest.param({**CREDENTIALS, "TRADING_MODE": "live"}, id="trading-mode-live"),
+    pytest.param({**CREDENTIALS, "TRADING_MODE": MODE_SENTINEL}, id="trading-mode-unknown"),
+    pytest.param({**ENV, "TRADING_ENABLED": ENABLED_SENTINEL}, id="malformed-trading-enabled"),
+]
+
+
+class NoSession:
+    """A session factory that must never be called: no session, so no HTTP request."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> Any:
+        self.calls += 1
+        raise AssertionError("a broker session was created")
+
+
+class Untouched:
+    """A monotonic clock that records every read: the budget must never start."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __call__(self) -> float:
+        self.reads += 1
+        return 0.0
+
+
+def env_file(tmp_path: Path, values: dict[str, str], mode: int = 0o600,
+             name: str = "paper.env") -> Path:  # fmt: skip
+    path = tmp_path / name
+    path.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+    path.chmod(mode)
+    return path
+
+
+def run_refused(tmp_path: Path, logs: io.StringIO, environ: dict[str, str]
+                ) -> tuple[dict[str, Any], Untouched, NoSession]:  # fmt: skip
+    clock, factory = Untouched(), NoSession()
+    summary = run_supervised(
+        environ,
+        budget=RequestBudget(monotonic=clock),
+        session_factory=factory,
+        sleep=lambda _s: None,
+        evidence=EvidenceWriter(tmp_path / "evidence", run="run", require_git_ignored=False),
+        log_stream=logs,
+        log_target=logging.getLogger("swing_trading_bot"),
+    )
+    return summary, clock, factory
+
+
+def assert_stopped_before_any_request(
+    tmp_path: Path, logs: io.StringIO, environ: dict[str, str], code: str
+) -> None:
+    summary, clock, factory = run_refused(tmp_path, logs, environ)
+    ex = summary["execution"]
+    assert (ex["status"], ex["stop_code"]) == ("STOPPED", code)
+    assert summary["verdict"] == {"status": "FAILED", "code": code}
+    assert factory.calls == 0 and clock.reads == 0  # no session, budget never started
+    assert ex["requests_used"] == 0 and ex["requests_by_phase"] == {}
+    assert ex["elapsed_s"] == 0.0 and ex["max_requests"] == 120 and ex["deadline_s"] == 300.0
+    assert summary["methods_seen"] == [] and summary["rate_limits"] == {}
+    assert ex["setup"] == {"broker_check_exit": None}
+    assert all(r["outcome"] in ("INCONCLUSIVE", "DEFERRED") for r in summary["rows"].values())
+    assert summary["checks"]["account_identity"]["code"] == "NOT_RUN"
+    with pytest.raises(pytest.fail.Exception, match=f"contract run FAILED \\({code}\\)"):
+        fail_if_not_ok(summary)
+    # The evidence run holds the sanitized summary only (no exchanges were made).
+    run_dir = tmp_path / "evidence" / "run"
+    assert summary["evidence"] == {"written": True, "summary": "summary.json"}
+    files = sorted(p for p in run_dir.rglob("*") if p.is_file())
+    assert [p.relative_to(run_dir).as_posix() for p in files] == ["summary.json"]
+    corpus = (json.dumps(summary) + logs.getvalue() + render(summary)
+              + "".join(p.read_text() for p in files))  # fmt: skip
+    assert leaks(corpus) == []
+    for value in (MODE_SENTINEL, ENABLED_SENTINEL, "invalid settings", "Traceback",
+                  "SettingsError", "CredentialSourceError", str(tmp_path)):  # fmt: skip
+        assert value not in corpus
+
+
+@pytest.mark.parametrize("values", INVALID_SETTINGS)
+def test_invalid_settings_file_is_configuration_invalid(
+    tmp_path: Path, logs: io.StringIO, values: dict[str, str]
+) -> None:
+    environ = {"STB_ENV_FILE": str(env_file(tmp_path, values))}
+    assert_stopped_before_any_request(tmp_path, logs, environ, "CONFIGURATION_INVALID")
+
+
+@pytest.mark.parametrize("values", INVALID_SETTINGS)
+def test_invalid_settings_environment_is_configuration_invalid(
+    tmp_path: Path, logs: io.StringIO, values: dict[str, str]
+) -> None:
+    assert_stopped_before_any_request(tmp_path, logs, dict(values), "CONFIGURATION_INVALID")
+
+
+def test_credential_source_problems_keep_credentials_unavailable(
+    tmp_path: Path, logs: io.StringIO
+) -> None:
+    sources = [
+        {},  # nothing selected
+        {"STB_ENV_FILE": str(tmp_path / "absent.env")},
+        {"STB_ENV_FILE": str(env_file(tmp_path, ENV, mode=0o644, name="open.env"))},
+        {"STB_ENV_FILE": str(env_file(tmp_path, ENV)), "ALPACA_API_KEY": KEY},  # ambiguous
+    ]
+    for n, environ in enumerate(sources):
+        target = tmp_path / str(n)
+        target.mkdir()
+        assert_stopped_before_any_request(target, logs, environ, "CREDENTIALS_UNAVAILABLE")
+
+
+def test_valid_settings_file_still_completes(tmp_path: Path, logs: io.StringIO) -> None:
+    clock = FakeTime()
+    session = HarnessSession(clock)
+    summary = run_supervised(
+        {"STB_ENV_FILE": str(env_file(tmp_path, ENV))},
+        budget=RequestBudget(monotonic=clock),
+        session_factory=lambda: session,
+        sleep=clock.sleep,
+        now=lambda: session.account.clock.now,
+        evidence=EvidenceWriter(tmp_path / "evidence", run="run", require_git_ignored=False),
+        log_stream=logs,
+        log_target=logging.getLogger("swing_trading_bot"),
+    )
+    ex = summary["execution"]
+    assert (ex["status"], ex["credential_source"]) == ("COMPLETED", "file")
+    assert ex["setup"]["broker_check_exit"] == 0 and ex["requests_used"] > 0
+    assert summary["verdict"] == {"status": "PASSED", "code": "OK"}
+    assert leaks(json.dumps(summary) + logs.getvalue()) == []
+
+
+def test_cli_exits_nonzero_without_a_traceback_on_invalid_configuration(
+    tmp_path: Path,
+    logs: io.StringIO,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "TRADING_MODE", "TRADING_ENABLED",
+                 "INITIAL_CAPITAL", "MAX_CAPITAL_ALLOCATION"):  # fmt: skip
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(live_run.ENABLE_VARIABLE, "1")
+    monkeypatch.setenv("STB_ENV_FILE", str(env_file(tmp_path, CREDENTIALS)))
+    real, factory = live_run.run_supervised, NoSession()
+
+    def contained(environ: Any) -> dict[str, Any]:  # the real runner; evidence kept in tmp
+        return real(environ, session_factory=factory,
+                    evidence=EvidenceWriter(tmp_path / "ev", run="run",
+                                            require_git_ignored=False),
+                    log_target=logging.getLogger("swing_trading_bot"))  # fmt: skip
+
+    monkeypatch.setattr(live_run, "run_supervised", contained)
+    assert live_run.main() == 1
+    out, err = capsys.readouterr()
+    assert out.startswith("run verdict: FAILED (CONFIGURATION_INVALID)")
+    assert "execution: STOPPED (stop: CONFIGURATION_INVALID)" in out
+    assert factory.calls == 0
+    for value in ("Traceback", "SettingsError", "invalid settings", KEY, SECRET):
+        assert value not in out + err
