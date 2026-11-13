@@ -221,6 +221,13 @@ uv run swing-trading-bot resume --reason "initial resume after clean reconciliat
 * `sync` — preflight (identity), calendar refresh, recovery lookups, activity/order sync,
   marks, loss limits, outage breaker. Read-only toward the broker.
 * `reconcile` — the sync sequence plus full reconciliation and startup readiness.
+  Its 7-day PERIODIC re-scan also reads activities from before the ledger existed.
+  Those `init-ledger` observed (with the identical payload) are recorded as
+  baseline-reflected history (`EXTERNAL`, never booked or counted; A§12.33). Any other
+  activity — even one dated before initialization but posted after it — counts as new
+  broker cash and, if unexplained, is a MISMATCH: investigate it, never "explain" it by
+  its date. A ledger created before Step 15B.13A only treats the last activity
+  `init-ledger` saw as reflected.
   OK → 0; INCONCLUSIVE → 5 (re-run on the next cycle; 5 cycles escalate); MISMATCH → 4
   and a persistent halt with findings.
 * Inspection (no broker, no writes): `status`, `portfolio`, `orders`, `halts`, `audit`;

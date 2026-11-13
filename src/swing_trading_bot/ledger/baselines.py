@@ -11,6 +11,7 @@ audited workflow, :mod:`swing_trading_bot.oms.rebaseline`). Old baselines are ke
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -28,6 +29,7 @@ from swing_trading_bot.ledger.codec import (
 from swing_trading_bot.ledger.db import Session, Tx
 from swing_trading_bot.ledger.errors import PersistenceError
 from swing_trading_bot.ledger.repositories import canonical_json
+from swing_trading_bot.ledger.sync_keys import BASELINE_REFLECTED_ACTIVITIES
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,8 +121,6 @@ class BrokerBaselinesRepository:
         )
         if row is None:
             return None
-        import json  # noqa: PLC0415
-
         return BrokerBaseline(
             id=int_from_db(row[0]),
             portfolio_id=int_from_db(row[1]),
@@ -133,19 +133,70 @@ class BrokerBaselinesRepository:
         )
 
 
+def reflected_activities(s: Session) -> dict[str, str | None]:
+    """Activities already inside the INIT baseline cash (Step 15B.13A), by identity.
+
+    ``init-ledger`` reads a complete (single-page, tail-confirmed) activity window before
+    it records the broker cash, but stores none of those activities. They are recorded
+    as ``{activity_id: raw_json}`` under :data:`BASELINE_REFLECTED_ACTIVITIES`. A ledger
+    initialized before Step 15B.13A has only the INIT baseline's ``activity_cursor_id``
+    (the last id of that window): it alone is reflected, without a payload (``None``) —
+    any other historical activity then fails closed. Never a timestamp range."""
+    raw = s.scalar("SELECT value FROM sync_state WHERE key = ?", (BASELINE_REFLECTED_ACTIVITIES,))
+    if raw is not None:
+        try:
+            doc = json.loads(str(raw))
+        except ValueError:
+            raise PersistenceError("baseline reflected activities are not valid JSON") from None
+        if not isinstance(doc, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in doc.items()
+        ):
+            raise PersistenceError("baseline reflected activities are malformed")
+        return dict(doc)
+    row = s.fetch_one(
+        "SELECT activity_cursor_id FROM broker_baselines WHERE reason = 'INIT' "
+        "AND activity_cursor_id IS NOT NULL ORDER BY id LIMIT 1"
+    )
+    return {} if row is None else {str_from_db(row[0]): None}
+
+
+def is_baseline_reflected(
+    reflected: dict[str, str | None], activity_id: str, raw_json: str
+) -> bool:
+    """True only for an activity ``init-ledger`` observed — with the identical payload
+    whenever the payload was recorded. A changed payload is not reflected: its financial
+    effect is not established, so it is treated as new (and fails closed)."""
+    if activity_id not in reflected:
+        return False
+    expected = reflected[activity_id]
+    return expected is None or expected == raw_json
+
+
 def movements_since(s: Session, baseline: BrokerBaseline) -> Decimal:
-    """Σ net cash of every broker activity first ingested AFTER the baseline was taken.
+    """Σ net cash of every broker activity first ingested AFTER the baseline was taken,
+    except activities already reflected in the INIT baseline (Step 15B.13A).
 
     Activities ingested at or before the baseline observation were already reflected in
     the broker cash it recorded (the observation followed a complete activity read), so
-    they are inside ``baseline.cash``. Using the ingestion time — not the activity's own
-    timestamp — means a late-posted activity with an earlier timestamp is counted once,
-    when it is first seen, never silently folded into a time range."""
+    they are inside ``baseline.cash``. So are the activities ``init-ledger`` observed but
+    did not store (:func:`reflected_activities`), even when they are first ingested
+    later. Using the ingestion time — not the activity's own timestamp — means a
+    late-posted activity with an earlier timestamp is counted once, when it is first
+    seen, never silently folded into a time range."""
+    reflected = reflected_activities(s)
     rows = s.fetch_all(
-        "SELECT net_amount FROM broker_activities WHERE ingested_at > ? AND net_amount IS NOT NULL",
+        "SELECT activity_id, raw_json, net_amount FROM broker_activities "
+        "WHERE ingested_at > ? AND net_amount IS NOT NULL",
         (ts_to_db(baseline.taken_at),),
     )
-    return sum((dec_from_db(r[0]) for r in rows), Decimal(0))
+    return sum(
+        (
+            dec_from_db(r[2])
+            for r in rows
+            if not is_baseline_reflected(reflected, str_from_db(r[0]), str_from_db(r[1]))
+        ),
+        Decimal(0),
+    )
 
 
 def cash_residual(s: Session, baseline: BrokerBaseline, broker_cash: Decimal) -> Decimal:
@@ -154,4 +205,11 @@ def cash_residual(s: Session, baseline: BrokerBaseline, broker_cash: Decimal) ->
     return broker_cash - (baseline.cash + movements_since(s, baseline))
 
 
-__all__ = ["BrokerBaseline", "BrokerBaselinesRepository", "cash_residual", "movements_since"]
+__all__ = [
+    "BrokerBaseline",
+    "BrokerBaselinesRepository",
+    "cash_residual",
+    "is_baseline_reflected",
+    "movements_since",
+    "reflected_activities",
+]

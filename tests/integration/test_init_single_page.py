@@ -110,7 +110,10 @@ def test_incomplete_retrieval_creates_nothing(e: CliEnv) -> None:
 # ============================================================ metadata the collector cannot
 # produce (it always returns a confirmed tail and a positive page count): injected windows.
 def window(pages: object, n: int = 0, *, tail: bool = True) -> ActivityWindow:
-    acts = tuple(SimpleNamespace(activity_id=f"a{i:04d}", activity_type="CSD") for i in range(n))
+    acts = tuple(
+        SimpleNamespace(activity_id=f"a{i:04d}", activity_type="CSD", raw_json="{}")
+        for i in range(n)
+    )
     return ActivityWindow(None, T, acts, pages, tail_confirmed=tail, closed=False)  # type: ignore[arg-type]
 
 

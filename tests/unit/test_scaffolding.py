@@ -104,11 +104,24 @@ def test_ledger_package_has_no_network_or_broker_imports() -> None:
                 assert name.split(".")[0] not in banned, f"{path}: imports {name}"
 
 
+def _snapshot(path: Path) -> tuple[bool, bytes, int | None]:
+    """Existence, content and mtime of a path (the real ledger may legitimately exist
+    since the first supervised initialization, Step 15B.12)."""
+    if not path.exists():
+        return False, b"", None
+    return True, path.read_bytes(), path.stat().st_mtime_ns
+
+
 def test_tests_cannot_touch_the_production_ledger(tmp_path: Path) -> None:
-    for target in (REPO_ROOT / "data" / "ledger.sqlite3", REPO_ROOT / "data" / "x" / "y.db"):
+    real = REPO_ROOT / "data" / "ledger.sqlite3"
+    before = _snapshot(real)
+    for target in (real, REPO_ROOT / "data" / "x" / "y.db"):
         with pytest.raises(ProductionLedgerAccessError):
             Database.create(target, RuntimeMode.SIMULATE)
         with pytest.raises(ProductionLedgerAccessError):
             Database.open(target, RuntimeMode.OBSERVE)
-    assert not (REPO_ROOT / "data" / "ledger.sqlite3").exists()
+    assert _snapshot(real) == before  # neither created, opened for writing nor modified
+    assert not (REPO_ROOT / "data" / "x").exists()
+    for sidecar in ("-wal", "-shm", "-journal"):
+        assert not real.with_name(real.name + sidecar).exists()
     Database.create(tmp_path / "ok.sqlite3", RuntimeMode.SIMULATE).close()  # tmp is fine

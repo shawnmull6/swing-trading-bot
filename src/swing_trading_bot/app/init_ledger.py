@@ -63,8 +63,16 @@ from swing_trading_bot.ledger.calendar_store import CalendarStore
 from swing_trading_bot.ledger.db import Database, assert_no_transaction
 from swing_trading_bot.ledger.integrity import integrity_report
 from swing_trading_bot.ledger.portfolio import VirtualPortfolio
-from swing_trading_bot.ledger.repositories import SyncStateRepository, TradingStateRepository
-from swing_trading_bot.ledger.sync_keys import BROKER_ACCOUNT_ID, BROKER_ENVIRONMENT
+from swing_trading_bot.ledger.repositories import (
+    SyncStateRepository,
+    TradingStateRepository,
+    canonical_json,
+)
+from swing_trading_bot.ledger.sync_keys import (
+    BASELINE_REFLECTED_ACTIVITIES,
+    BROKER_ACCOUNT_ID,
+    BROKER_ENVIRONMENT,
+)
 
 ZERO = Decimal(0)
 INIT_ACTIVITY_PAGE_SIZE = MAX_ACTIVITY_PAGE_SIZE
@@ -92,6 +100,8 @@ class InitEvidence:
     activity_tail_confirmed: bool = False
     activity_pages: int | None = None
     last_activity_id: str | None = None
+    reflected_activities: dict[str, str] = field(default_factory=dict)
+    """``{activity_id: raw_json}`` of the window; recorded, never printed (Step 15B.13A)."""
     calendars: tuple[CalendarFetch, ...] = ()
     problems: list[str] = field(default_factory=list)
 
@@ -192,6 +202,7 @@ def gather_evidence(broker: ObserveBroker, now: datetime) -> InitEvidence:
     ev.activity_tail_confirmed = window.tail_confirmed
     ev.activity_pages = window.pages
     ev.last_activity_id = window.activities[-1].activity_id if window.activities else None
+    ev.reflected_activities = {a.activity_id: a.raw_json for a in window.activities}
     a, p = ev.account, ev.problems
     p.extend(account_identity_problems(a, environment="paper"))
     if a.account_blocked or a.trading_blocked:
@@ -356,6 +367,9 @@ def _build(
             sync = SyncStateRepository()
             sync.set(tx, BROKER_ACCOUNT_ID, account.account_id, now)
             sync.set(tx, BROKER_ENVIRONMENT, account.environment, now)
+            # Already inside the baseline cash: never counted again (Step 15B.13A).
+            sync.set(tx, BASELINE_REFLECTED_ACTIVITIES,
+                     canonical_json(ev.reflected_activities), now)  # fmt: skip
             baseline_id = BrokerBaselinesRepository().record_initial(
                 tx,
                 portfolio_id=pid,

@@ -43,6 +43,7 @@ from swing_trading_bot.domain.models import BrokerOrderSnapshot
 from swing_trading_bot.domain.money import ZERO
 from swing_trading_bot.domain.state_machine import AMBIGUOUS_STATUSES
 from swing_trading_bot.ledger.activity_coverage import advance_coverage, complete_through
+from swing_trading_bot.ledger.baselines import is_baseline_reflected, reflected_activities
 from swing_trading_bot.ledger.db import Database, assert_no_transaction
 from swing_trading_bot.ledger.portfolio import (
     CashActivity,
@@ -218,6 +219,18 @@ class OrderSync:
         report: SyncReport,
         now: datetime,
     ) -> None:
+        with self._db.read() as s:
+            reflected = is_baseline_reflected(
+                reflected_activities(s), activity.activity_id, activity.raw_json
+            )
+        if reflected:
+            # Observed by init-ledger and already inside the INIT baseline cash (Step
+            # 15B.13A): recorded as explained history, never booked, never counted. A
+            # replay with different content still conflicts and halts.
+            if self._preserve(activity, now, ActivityAttribution.EXTERNAL):
+                report.conflicts.append(activity.activity_id)
+                report.mark(SyncStatus.HALTED, f"activity {activity.activity_id} conflict")
+            return
         if activity.is_fill:
             self._ingest_fill(activity, snapshots, report, now)
             return

@@ -3167,9 +3167,13 @@ DEFERRED.
 
 **4. Compensating controls.**
 * The baseline is the broker's **cash snapshot** (equity = cash on a flat account), not
-  a replay of historical activities. Activities before the baseline are counted for the
-  evidence but **never booked** into the virtual ledger; sync starts at the portfolio's
-  creation and the reconciliation history window at the first baseline.
+  a replay of historical activities. Activities before the baseline are **never booked**
+  into the virtual ledger. *Corrected in Step 15B.13A (§12.33):* sync starts at the
+  portfolio's creation and the FULL_HISTORY window at the first baseline, but the
+  7-day PERIODIC re-scan does reach back before the baseline and ingests historical
+  activities. Those observed by `init-ledger` are recorded as *baseline-reflected* and
+  attributed by identity (§12.33); before that step they were counted again as cash
+  movements and flagged as unexplained, a false MISMATCH.
 * The single-page guard means initialization never relies on the unverified multi-page
   cursor (`page_token`) semantics.
 * After initialization, the cash identity (broker cash = baseline + recorded movements;
@@ -3195,6 +3199,68 @@ numeric precision; C10–C13; U6 account protections; mapping and enforcement of
 `trade_suspended_by_user`, `closing_transactions_only`, `transfers_blocked` and
 `suspend_trade` (§12.25 ¶5, M2-V1); and every existing M2 entry criterion (M1_PLAN §9,
 §9.1).
+
+### 12.33 Baseline-reflected activity attribution (15B.13A)
+
+**1. Defect (found before the first live reconciliation).** `init-ledger` reads the
+complete 7-day activity window (single page, confirmed tail; §12.32) *before* recording
+the broker cash, but stored none of those activities — only the last id as
+`broker_baselines.activity_cursor_id`, which nothing read. The first reconciliation's
+7-day PERIODIC re-scan (`rescans_due`) then ingested them *after* the baseline:
+`movements_since` selects by **ingestion time** (`ingested_at > baseline.taken_at`), so
+their net amounts were counted a second time (`CASH_UNEXPLAINED`), and an unclassified
+type such as `JNLC` was recorded UNEXPLAINED (`UNEXPLAINED_CASH_ACTIVITY`) — a false
+MISMATCH and a `RECON_CASH` persistent halt on a correct, flat ledger. Reproduced offline;
+the live first reconciliation was not run.
+
+**2. Effective time vs. ingestion time.** An activity's own timestamp (`transaction_time`,
+or its `date`) is when it *took effect*; `ingested_at` is when the ledger first stored it.
+Neither says whether its cash was already in a baseline: a late-posted correction can
+carry an earlier timestamp yet post after the observation, and activity ids are opaque
+(never assumed chronological). The only reliable fact is **what `init-ledger` actually
+observed** in its complete window immediately before it read the cash.
+
+**3. Attribution rule.** At initialization the window's activities are recorded as
+`sync_state["baseline.reflected_activities"]` = canonical JSON `{activity_id: raw_json}`
+(`init_ledger._build`). An activity is *baseline-reflected* only if its id is in that set
+**and** its payload is byte-identical to the observed one
+(`ledger.baselines.is_baseline_reflected`). Then:
+
+* ingestion (`OrderSync._ingest`, cash and fill paths) records it with attribution
+  `EXTERNAL` and **no ledger effect** — never booked, never a fill, never a halt; a later
+  replay with different content is still a CONFLICT (`RECON_EXECUTION` halt);
+* `movements_since` excludes it, whenever it is ingested;
+* consequently it raises no `UNEXPLAINED_CASH_ACTIVITY`, no entry-gate block and no
+  rebaseline acknowledgement item.
+
+No timestamp range is excluded. A ledger initialized before this step has no recorded
+set: only the INIT baseline's `activity_cursor_id` is reflected, by id alone — any other
+historical activity is treated as new (a false MISMATCH at worst, never a silent
+acceptance).
+
+**4. What still fails closed.**
+* Any activity *not* observed by `init-ledger` — including one timestamped before the
+  baseline but posted after it (late-posted correction or adjustment), or one at the
+  exact baseline instant that the window did not contain — is post-baseline: counted
+  once in `movements_since` and classified as usual (unclassified → UNEXPLAINED →
+  MISMATCH, `RECON_CASH`).
+* An observed activity re-delivered with a different payload is not reflected: its
+  effect is not established, so it is counted and flagged.
+* Broker cash that moves with no activity is `CASH_UNEXPLAINED`. A legacy (id-only)
+  reflected activity whose amount silently changed also surfaces here, since excluding
+  it removes only the double count, not the broker-cash change.
+* Pagination, tail confirmation, coverage, identity, position, order and rebaseline
+  checks are unchanged; reflected activities are never acknowledgements.
+
+**5. Tests.** `tests/integration/test_baseline_reflected_activities.py` (16, offline): a
+pre-baseline `JNLC` → first reconciliation CLEAN with `INITIALIZED` kept; found only by
+the PERIODIC re-scan; a pre-baseline fill not booked; post-baseline unexplained cash
+activity and cash without activity still halt `RECON_CASH`; late-posted backdated
+activity fails closed; a late-posted `INT` credit counted once (CLEAN); changed content
+before and after storage fails closed / conflicts; duplicate retrieval across days;
+coverage marker unset at init; rebaseline lists only the post-baseline activity; the
+baseline instant (observed → reflected; not observed → MISMATCH); legacy ledgers (cursor
+only → CLEAN; more history → MISMATCH). 12 of the 16 fail on the previous implementation.
 
 ---
 
