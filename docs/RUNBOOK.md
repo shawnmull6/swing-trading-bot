@@ -59,7 +59,10 @@ HTTPS paper-trading and market-data hosts can be contacted; redirects and proxie
 refused.
 
 `pattern_day_trader` is **informational only**: shown as reported, or `null` when the
-broker omits it (unknown — never treated as `false`). No gate, risk check, identity check,
+broker omits it (unknown — never treated as `false`). The configuration fields
+`pdt_check`/`dtbp_check` are optional too (not shown; recorded in a new ledger's broker
+baseline as JSON `null` when unreported; A§12.25); every other configuration field is
+still required. No gate, risk check, identity check,
 reconciliation or order decision uses it. The account's `trade_suspended_by_user` and
 `transfers_blocked` fields are **not** read or shown yet (open question, A§12.24).
 
@@ -80,8 +83,12 @@ Status (2026-11-12): the first authorized run stopped safely in setup after one
 `GET /v2/account` because the response omitted `pattern_day_trader` (then a required
 field; stop code `BROKER_CHECK_EXIT_8`, which would now be `_10`). No contract check ran;
 C1–C9 remain unverified and `/account/configurations` was never reached. The mapper was
-made compatible in Step 15B.2 (A§12.24). **Another supervised run needs separate,
-explicit operator authorization**; do not re-run on the strength of an earlier approval.
+made compatible in Step 15B.2 (A§12.24). Run #2 (2026-11-12) parsed the account, then
+stopped in setup after 2 requests (`BROKER_CHECK_EXIT_10`) because
+`/account/configurations` omitted `pdt_check`/`dtbp_check`; Step 15B.4 made those
+optional (A§12.25). C1–C9 are still unverified. **Run #3 needs separate, explicit
+operator authorization**; do not re-run on the strength of an earlier approval. Run it
+well away from the market open and close.
 
 ## 4. Ledger initialization (account-backed observe ledger)
 

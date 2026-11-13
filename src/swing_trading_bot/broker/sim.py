@@ -163,8 +163,9 @@ class SimConfig:
     cancel_delay: timedelta = timedelta(0)
     no_shorting: bool = True
     max_margin_multiplier: Decimal = Decimal("1")
-    pdt_check: str = "entry"
-    dtbp_check: str = "entry"
+    pdt_check: str | None = "entry"
+    dtbp_check: str | None = "entry"
+    """``None`` omits the key from the configuration payload (not reported)."""
     currency: str = "USD"
     account_id: str = "sim-account-0001"
     account_status: str = "ACTIVE"
@@ -357,14 +358,16 @@ class SimBroker:
 
     def get_account_config(self) -> AccountConfigSnapshot:
         self._enter("get_account_config")
-        raw = {
+        raw: Raw = {
             "no_shorting": self.config.no_shorting,
             "max_margin_multiplier": _num(self.config.max_margin_multiplier),
-            "pdt_check": self.config.pdt_check,
-            "dtbp_check": self.config.dtbp_check,
             "suspend_trade": self.config.suspend_trade,
             "fractional_trading": False,
         }
+        for key in ("pdt_check", "dtbp_check"):
+            value = getattr(self.config, key)
+            if value is not None:
+                raw[key] = value
         return account_config_from_raw(self._mutate("get_account_config", raw))
 
     def get_clock(self) -> MarketClock:

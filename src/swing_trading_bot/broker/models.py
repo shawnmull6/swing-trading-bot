@@ -52,8 +52,15 @@ class AccountSnapshot:
 class AccountConfigSnapshot:
     no_shorting: bool
     max_margin_multiplier: Decimal
-    pdt_check: str
-    dtbp_check: str
+    pdt_check: str | None
+    """``None`` = not reported by the broker (absent or ``null``); never interpreted as a
+    restriction being on or off. Informational/audit only: recorded in new broker baselines
+    (JSON ``null`` when unknown) and read by no gate, risk, reconciliation or order
+    decision (structural test ``tests/unit/test_config_field_isolation.py``). The
+    installed alpaca-py 0.45.0 marks it deprecated and "removed from Alpaca responses on
+    2026-07-06"; the Step 15B run #2 payload omitted it (A§12.25)."""
+    dtbp_check: str | None
+    """Same policy as :attr:`pdt_check`."""
     suspend_trade: bool
     fractional_trading: bool
 

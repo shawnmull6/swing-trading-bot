@@ -5,9 +5,10 @@ M1 steps 1–13.2 implemented; steps 14 and 14.1 approved (§12.20,
 §12.21); step 15 phase A accepted (§12.22); step 15A.1 (live-run harness hardening and
 reconciliation retry safety, §12.23) committed; the first supervised live read-only run
 (phase B, 2026-11-12) stopped in setup on a missing account field; steps 15B.1–15B.3
-(account payload compatibility and exit-code consistency, §12.24) implemented offline and
-awaiting review. Contract rows C1–C9 remain unverified; another live run needs separate
-authorization.** Decision log: `docs/M1_PLAN.md` §2.
+(account payload compatibility and exit-code consistency, §12.24) committed; live run #2
+stopped in setup on missing configuration fields; step 15B.4 (configuration payload
+compatibility, §12.25) implemented offline and awaiting review. Contract rows C1–C9
+remain unverified; live run #3 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -64,7 +65,7 @@ These facts come from reading the installed SDK, not from live calls. Items mark
 | V6 | Order statuses in SDK: `new, partially_filled, filled, done_for_day, canceled, expired, replaced, pending_cancel, pending_replace, pending_review (deprecated), accepted, pending_new, accepted_for_bidding, stopped, rejected, suspended, calculated, held`. | Exhaustive explicit mapping in `domain/broker_status.py`; an unmapped status → persistent halt. A unit test enumerates the SDK enum so a new SDK value fails the build. |
 | V10 | `Position` has `current_price` but **no timestamp**. Market-data `Trade` (latest trade) has `timestamp`, but types `price` as float. | `Position.current_price` is never a mark (U7); used only as a cross-check. Marks come from the latest-trade / latest-bar endpoints parsed raw into `Decimal` with their exchange timestamp (§6.6). **CT**: feed (IEX vs SIP) available to this account and timestamp semantics. |
 | V7 | `get_calendar(GetCalendarRequest(date_type=SETTLEMENT|TRADING))`; `Calendar` has `settlement_date`; docstring says data covers 1970–2029. | Settlement dates come from Alpaca's calendar, cached locally. **CT**: paper returns `settlement_date` populated; behavior on bank holidays when markets are open (e.g. Veterans Day). Missing calendar data → proceeds stay unsettled (fail closed). Calendar horizon (2029) noted as a future risk. |
-| V8 | `AccountConfiguration` exposes `no_shorting`, `max_margin_multiplier` ("1"–"4"), `pdt_check`, `dtbp_check`, `suspend_trade`, `fractional_trading`. `TradeAccount` (the SDK model) exposes `cash`, `non_marginable_buying_power`, `multiplier`, `pattern_day_trader`, `daytrade_count`, `trading_blocked`, `account_blocked`, `accrued_fees`, `pending_reg_taf_fees`. *Observed 2026-11-12 (§12.24):* the real paper `/v2/account` response omitted `pattern_day_trader` and `daytrade_count`; `/account/configurations` has not been observed. | Startup preflight reads (never writes) these and reports them (U6: report-only in M1; `no_shorting=true` and `max_margin_multiplier="1"` become **required** before M2 paper execution); `trading_blocked`/`account_blocked` → block. `pending_reg_taf_fees`/`accrued_fees` feed cash explainability (§8.3). **CT**: whether paper simulates regulatory fees at all. |
+| V8 | `AccountConfiguration` exposes `no_shorting`, `max_margin_multiplier` ("1"–"4"), `pdt_check`, `dtbp_check`, `suspend_trade`, `fractional_trading`. `TradeAccount` (the SDK model) exposes `cash`, `non_marginable_buying_power`, `multiplier`, `pattern_day_trader`, `daytrade_count`, `trading_blocked`, `account_blocked`, `accrued_fees`, `pending_reg_taf_fees`. *Observed 2026-11-12 (§12.24, §12.25):* the real paper `/v2/account` response omitted `pattern_day_trader` and `daytrade_count`; `/account/configurations` omitted `pdt_check` and `dtbp_check` and returned 8 fields. *Note:* the installed alpaca-py 0.45.0 itself marks `pattern_day_trader`, `daytrade_count`, `daytrading_buying_power`, `pdt_check` and `dtbp_check` deprecated ("removed from Alpaca responses on 2026-07-06", FINRA intraday-margin migration) — the original V-table inspection missed those markers. | Startup preflight reads (never writes) these and reports them (U6: report-only in M1; `no_shorting=true` and `max_margin_multiplier="1"` become **required** before M2 paper execution); `trading_blocked`/`account_blocked` → block. `pending_reg_taf_fees`/`accrued_fees` feed cash explainability (§8.3). **CT**: whether paper simulates regulatory fees at all. |
 | V9 | `Position.qty_available` exists (shares not held by open sell orders). | Relevant to future protective stops/partial exits (§9). |
 
 Assumptions that **cannot** be contract-tested in M1 because they require submitting an
@@ -2383,8 +2384,8 @@ and `/v2/account/configurations` were never contacted, so **the configurations p
 (`pdt_check`, `dtbp_check`, `suspend_trade`, …) is still unverified**. Raw evidence stays in
 the Git-ignored `contract-evidence/`; only field names and JSON types were inspected
 afterwards (15B.1). Observed account fields that the SDK model lists but the response
-lacked: `pattern_day_trader`, `daytrade_count`. Why they are absent is **not known**; no
-claim about Alpaca's intent or a regulatory change is made.
+lacked: `pattern_day_trader`, `daytrade_count`. No claim about Alpaca's intent is made
+from the API itself; see §12.25 ¶2 for the installed SDK's deprecation note.
 
 **2. `pattern_day_trader` is optional and informational (15B.2, Policy B).**
 `AccountSnapshot.pattern_day_trader: bool | None`. Absent or `null` → `None` (**unknown,
@@ -2428,11 +2429,13 @@ parsing contract is not an outage, so it no longer reports 8:
 account payload also carries `trade_suspended_by_user` and `transfers_blocked`, which the
 mapper ignores:
 * `trade_suspended_by_user` may mirror the configurations flag `suspend_trade` (which a
-  startup gate finding already covers, `BROKER_ACCOUNT_CONFIG_UNSUPPORTED`). That
-  equivalence is **unverified**. `suspend_trade` is checked only at startup — not by the
-  transient gate layer, pre-trade, reconciliation or `init-ledger` — so a suspension set
-  mid-session, or a disagreement between the two flags, would not block entries until a
-  restart.
+  gate finding already covers, `BROKER_ACCOUNT_CONFIG_UNSUPPORTED`). That equivalence is
+  **unverified**. *Corrected in 15B.4 (§12.25 ¶5):* `suspend_trade` is **not** checked
+  only at startup. Its finding carries the STARTUP layer label but is recomputed from a
+  fresh configuration read on **every** gate evaluation, and every entry path consumes a
+  fresh evaluation, so a suspension set mid-session blocks the next entry. It is not
+  checked by reconciliation, `init-ledger` or exit readiness, and
+  `trade_suspended_by_user` is not read at all.
 * `transfers_blocked`: Alpaca's field descriptions (not re-checked in this step) relate
   it to money transfers, not orders; whether it can signal a wider account hold is
   unknown, so it is not assumed harmless.
@@ -2449,6 +2452,81 @@ decimal strings); the configurations payload; rate limits beyond one sample. A s
 supervised run is justified after review of 15B.2–15B.3 but **requires separate, explicit
 authorization**. `init-ledger` against the real account stays blocked until C1–C9 are
 reviewed.
+
+### 12.25 Step 15B live run #2 and account configuration compatibility (15B.4)
+
+Offline implementation after one authorized run. **No schema change, no migration;**
+risk limits, execution boundaries and the HTTP transport are unchanged; no new
+restriction gate.
+
+**1. Live run #2 (2026-11-12, 21:35 ET, market closed).** One authorized run of
+`python -m tests.contract.live_run`. It **stopped in setup** after **2** requests (both
+`GET`, both HTTP 200, host `paper-api.alpaca.markets`): `/v2/account` parsed (same 37
+field names and JSON types as run #1; `pattern_day_trader` absent → `None`), then
+`/v2/account/configurations` lacked `pdt_check`, which the mapper required → `broker-check`
+exit 10 → stop code `BROKER_CHECK_EXIT_10`. No contract check ran (C1–C9
+`INCONCLUSIVE/NOT_RUN`, C10–C13 `DEFERRED`); the market-data host was not contacted.
+Rate-limit headers: `X-RateLimit-Limit: 200` on both responses (two samples, not a
+verified limit). Only field names and JSON types were read from the evidence.
+
+**Observed configuration schema** (8 fields): `closing_transactions_only` bool,
+`disable_overnight_trading` bool, `fractional_trading` bool, `max_margin_multiplier` str,
+`no_shorting` bool, `ptp_no_exception_entry` bool, `suspend_trade` bool,
+`trade_confirm_email` str. **Absent:** `pdt_check`, `dtbp_check` (and
+`max_options_trading_level`, which the old test fake carried).
+
+**2. Installed-SDK note (attributed, not independently verified).** The installed
+alpaca-py **0.45.0** marks `AccountConfiguration.pdt_check`/`dtbp_check` and
+`TradeAccount.pattern_day_trader`/`daytrade_count`/`daytrading_buying_power` as deprecated,
+"removed from Alpaca responses on 2026-07-06 following the FINRA intraday-margin
+migration". That matches both runs, but it is the SDK's statement; Alpaca's own API
+documentation was not consulted (offline). `closing_transactions_only` does not appear in
+the installed SDK at all.
+
+**3. Policy B for `pdt_check` / `dtbp_check`.** `AccountConfigSnapshot.pdt_check` and
+`.dtbp_check` are `str | None`, parsed with the existing `opt_text()`: absent or `null` →
+`None` ("not reported" — never read as a restriction on or off); a present non-empty string
+→ kept verbatim (values are not interpreted); empty string, boolean, number, array or
+object → `InvalidBrokerDataError` (exit 10 / persistent `BROKER_PAYLOAD` halt, §12.24).
+`no_shorting`, `max_margin_multiplier`, `suspend_trade` and `fractional_trading` are
+unchanged and still required. Neither field was ever a decision input: the dependency
+trace found them only in the model, the mapper, the SimBroker and the init-ledger baseline
+dict; the structural test `tests/unit/test_config_field_isolation.py` keeps them out of
+gates, risk, pre-trade, reconciliation, rebaseline, OMS, runtime, ledger and domain code.
+`broker-check` never displayed them and still does not. `SimConfig.pdt_check` /
+`dtbp_check` default to `"entry"` as before; `None` omits the key. The test fake's
+configuration payload now has exactly the observed 8 names and JSON types (synthetic
+values).
+
+**4. Baselines and audit.** New broker baselines keep both keys — `"pdt_check": null`,
+`"dtbp_check": null` when unreported — inside `account_config_json` (valid JSON, canonical
+serialization). Historical baselines holding strings are untouched: rows are immutable
+(trigger), rebaseline copies the stored dict verbatim (`rebaseline.py`), the loader does
+not validate keys, `verify-ledger` treats the JSON as opaque, and the fingerprint of
+existing rows cannot change. Tested: init stores `null`; historical-string ledgers load,
+verify, sync and reconcile CLEAN while the broker omits the fields; the historical row's
+digest and the `broker_baselines` fingerprint are stable; a rebaseline copies strings or
+`null` verbatim.
+
+**5. Restriction enforcement today (correction to §12.24 ¶4) and open questions.**
+`TradingGates.evaluate()` reads account, configuration and clock fresh on every call; the
+`suspend_trade`/`fractional_trading` finding (`BROKER_ACCOUNT_CONFIG_UNSUPPORTED`, STARTUP
+layer label) is recomputed each time and blocks new entries whenever true. Pre-trade
+requires a gate status at most 30 s old and an account snapshot at most 120 s old;
+`OrderManager.place_entry` reads the account and evaluates the gates fresh before creating
+an intent. `status`/`trading_blocked`/`account_blocked` additionally block via the
+transient layer, pre-trade, exit readiness, reconciliation (INCONCLUSIVE) and
+`init-ledger`. Not enforced anywhere: `trade_suspended_by_user` (SDK: "not allowed to place
+orders"), `closing_transactions_only` (semantics **unconfirmed** — absent from the SDK;
+not inferred from its name), `transfers_blocked` (SDK: money-transfer requests only).
+`suspend_trade` is not checked by reconciliation, `init-ledger` or exit readiness. These
+remain open; verified trading-suspension/closing-only enforcement at every entry decision
+is an **M2 blocker** (not implemented in 15B.4).
+
+**6. Next.** Live run #3 is justified after review of 15B.4 and **requires separate,
+explicit authorization**. A mismatch inside a contract check is recorded as a FAILED row
+and later checks still run; one in setup (`/clock` during `broker-check`) stops the run.
+`init-ledger` against the real account stays blocked until C1–C9 are reviewed.
 
 ---
 

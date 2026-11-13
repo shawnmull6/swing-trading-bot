@@ -204,8 +204,10 @@ def account_config_from_raw(raw: Raw) -> AccountConfigSnapshot:
     return AccountConfigSnapshot(
         no_shorting=boolean(raw, "no_shorting"),
         max_margin_multiplier=decimal(raw, "max_margin_multiplier"),
-        pdt_check=text(raw, "pdt_check"),
-        dtbp_check=text(raw, "dtbp_check"),
+        # Informational/audit only: absent/null -> None; a present value must be a
+        # non-empty string. Every other configuration field stays required.
+        pdt_check=opt_text(raw, "pdt_check"),
+        dtbp_check=opt_text(raw, "dtbp_check"),
         suspend_trade=boolean(raw, "suspend_trade"),
         fractional_trading=boolean(raw, "fractional_trading"),
     )

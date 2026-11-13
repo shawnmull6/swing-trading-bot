@@ -76,10 +76,14 @@ ACCOUNT = {
     "admin_configurations": {}, "user_configurations": None,
 }  # fmt: skip
 
+#: Synthetic values in the field-name/JSON-type shape of the real paper
+#: ``/v2/account/configurations`` payload observed in Step 15B run #2 (8 fields; names and
+#: types only, no real value reproduced). ``pdt_check`` and ``dtbp_check`` are ABSENT, as
+#: observed.
 CONFIG = {
-    "dtbp_check": "entry", "trade_confirm_email": "all", "suspend_trade": False,
-    "no_shorting": True, "fractional_trading": False, "max_margin_multiplier": "1",
-    "pdt_check": "entry", "max_options_trading_level": 0,
+    "closing_transactions_only": False, "disable_overnight_trading": False,
+    "fractional_trading": False, "max_margin_multiplier": "1", "no_shorting": True,
+    "ptp_no_exception_entry": False, "suspend_trade": False, "trade_confirm_email": "all",
 }  # fmt: skip
 
 CLOCK = {

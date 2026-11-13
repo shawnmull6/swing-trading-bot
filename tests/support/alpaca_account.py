@@ -62,6 +62,8 @@ class FakeAlpacaAccount:
     account_id: str = ACCOUNT_ID
     cash: Decimal = Decimal("100000.00")
     account_overrides: dict[str, Any] = field(default_factory=dict)
+    config_overrides: dict[str, Any] = field(default_factory=dict)
+    """Merged over ``CONFIG`` for ``/account/configurations`` (a ``None`` value = JSON null)."""
     positions: list[dict[str, Any]] = field(default_factory=list)
     open_orders: list[dict[str, Any]] = field(default_factory=list)
     activities: list[tuple[datetime, dict[str, Any]]] = field(default_factory=list)
@@ -75,7 +77,7 @@ class FakeAlpacaAccount:
     def __post_init__(self) -> None:
         routes = {
             "/account": self._account,
-            "/account/configurations": lambda _p: dict(CONFIG),
+            "/account/configurations": lambda _p: {**CONFIG, **self.config_overrides},
             "/clock": self._clock,
             "/calendar": self._calendar,
             "/positions": lambda _p: list(self.positions),

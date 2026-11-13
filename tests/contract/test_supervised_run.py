@@ -418,3 +418,26 @@ def test_account_payload_violation_in_setup_stops_with_exit_10(
     assert summary["execution"]["requests_by_phase"] == {"setup": 1}  # no retry, no checks
     assert all(v["code"] == "NOT_RUN" for r, v in summary["rows"].items()
                if r not in {"C10", "C11", "C12", "C13"})  # fmt: skip
+
+
+def test_observed_config_shape_completes_setup_and_verifies_c2(
+    tmp_path: Path, logs: io.StringIO
+) -> None:
+    from tests.support.alpaca_fake import CONFIG  # noqa: PLC0415
+
+    assert "pdt_check" not in CONFIG and "dtbp_check" not in CONFIG  # Step 15B run #2 shape
+    clock = FakeTime()
+    session = HarnessSession(clock)
+    summary = run(tmp_path, logs, session, clock)
+    assert summary["execution"]["status"] == "COMPLETED"
+    assert summary["execution"]["setup"]["broker_check_exit"] == 0
+    assert summary["rows"]["C2"] == {"outcome": "VERIFIED", "code": "OK"}
+
+
+def test_malformed_config_in_setup_stops_with_exit_10(tmp_path: Path, logs: io.StringIO) -> None:
+    clock = FakeTime()
+    session = HarnessSession(clock)
+    session.account.config_overrides["pdt_check"] = ""
+    summary = run(tmp_path, logs, session, clock)
+    assert summary["execution"]["stop_code"] == "BROKER_CHECK_EXIT_10"
+    assert summary["execution"]["requests_by_phase"] == {"setup": 2}
