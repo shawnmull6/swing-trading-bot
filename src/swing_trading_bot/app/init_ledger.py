@@ -12,6 +12,9 @@ Safety properties (ARCHITECTURE §8.1, §12.20; D15):
   both calendars, then account, positions and open orders again. Initialization is
   refused unless the account is flat, unrestricted, USD, without pending fees, and the
   two observations agree.
+* The activity window must be read in exactly **one** page request (Step 15B.8): live
+  multi-page cursor semantics are unverified (contract C7), so a window that needed a
+  second request — including the confirming request after a full first page — refuses.
 * The operator must confirm the exact target path, broker account id and environment.
   Without matching confirmations nothing is created; the preview lists the values.
 * The ledger is built under a temporary name and linked into place only when complete
@@ -45,9 +48,14 @@ from swing_trading_bot.app.config import (
 from swing_trading_bot.app.exit_codes import ExitCode
 from swing_trading_bot.app.paths import SQLITE_SIDECARS, DataPaths
 from swing_trading_bot.app.runtime import ObserveBroker
-from swing_trading_bot.broker.activity_feed import DEFAULT_RESCAN_POLICY, collect_window
+from swing_trading_bot.broker.activity_feed import (
+    DEFAULT_RESCAN_POLICY,
+    ActivityWindow,
+    collect_window,
+)
 from swing_trading_bot.broker.errors import BrokerError, payload_cause
 from swing_trading_bot.broker.models import AccountConfigSnapshot, AccountSnapshot
+from swing_trading_bot.broker.ports import MAX_ACTIVITY_PAGE_SIZE
 from swing_trading_bot.domain.calendar import MARKET_TZ, CalendarFetch, CalendarKind
 from swing_trading_bot.domain.enums import RuntimeMode
 from swing_trading_bot.ledger.baselines import BrokerBaselinesRepository
@@ -59,6 +67,8 @@ from swing_trading_bot.ledger.repositories import SyncStateRepository, TradingSt
 from swing_trading_bot.ledger.sync_keys import BROKER_ACCOUNT_ID, BROKER_ENVIRONMENT
 
 ZERO = Decimal(0)
+INIT_ACTIVITY_PAGE_SIZE = MAX_ACTIVITY_PAGE_SIZE
+"""Page size of the initialization activity window; a full page forces a second request."""
 
 
 class InitStatus(StrEnum):
@@ -80,6 +90,7 @@ class InitEvidence:
     activities: int | None = None
     activity_types: tuple[str, ...] = ()
     activity_tail_confirmed: bool = False
+    activity_pages: int | None = None
     last_activity_id: str | None = None
     calendars: tuple[CalendarFetch, ...] = ()
     problems: list[str] = field(default_factory=list)
@@ -99,6 +110,7 @@ class InitEvidence:
             "activities_in_lookback": self.activities,
             "activity_types": list(self.activity_types),
             "activity_tail_confirmed": self.activity_tail_confirmed,
+            "activity_pages": self.activity_pages,
             "m2_account_protections": None if c is None else c.m2_protections_in_place,
             "calendars": [f"{f.kind.value} {f.start}..{f.end}" for f in self.calendars],
             "problems": list(self.problems),
@@ -163,6 +175,7 @@ def gather_evidence(broker: ObserveBroker, now: datetime) -> InitEvidence:
         until=now,
         now=now,
         posting_lag=ACTIVITY_POSTING_LAG,
+        page_size=INIT_ACTIVITY_PAGE_SIZE,
     )
     today = now.astimezone(MARKET_TZ).date()
     ev.calendars = tuple(
@@ -177,6 +190,7 @@ def gather_evidence(broker: ObserveBroker, now: datetime) -> InitEvidence:
     ev.activities = len(window.activities)
     ev.activity_types = tuple(sorted({a.activity_type for a in window.activities}))
     ev.activity_tail_confirmed = window.tail_confirmed
+    ev.activity_pages = window.pages
     ev.last_activity_id = window.activities[-1].activity_id if window.activities else None
     a, p = ev.account, ev.problems
     p.extend(account_identity_problems(a, environment="paper"))
@@ -190,9 +204,31 @@ def gather_evidence(broker: ObserveBroker, now: datetime) -> InitEvidence:
         p.append(f"account has {len(open_orders)} open order(s)")
     if not window.tail_confirmed:
         p.append("activity history could not be read to its end")
+    p.extend(single_page_problems(window))
     if (again.account_id, again.cash) != (a.account_id, a.cash):
         p.append("account changed while evidence was being gathered; retry")
     return ev
+
+
+def single_page_problems(window: ActivityWindow) -> list[str]:
+    """Step 15B.8: the initialization window must have been read in exactly one request.
+
+    ``window.pages`` is the number of successful ``get_activities`` requests the collector
+    made. One page means the first response was short (or empty) and confirmed the tail
+    without a cursor; a full first page always causes a confirming second request, so it
+    shows up here as two. Missing, non-integer or inconsistent metadata refuses too."""
+    pages: object = window.pages  # checked at runtime, not trusted from the annotation
+    if type(pages) is not int or pages < 1:
+        return ["activity page count is missing or invalid; cannot confirm a single page"]
+    if pages > 1:
+        return [
+            f"activity history needed {pages} page requests; initialization requires "
+            "exactly one (multi-page pagination is not verified live, contract C7)"
+        ]
+    if len(window.activities) >= INIT_ACTIVITY_PAGE_SIZE:
+        return ["activity page count is inconsistent with a full page; cannot confirm a "
+                "single page"]  # fmt: skip
+    return []
 
 
 def _confirmations(
