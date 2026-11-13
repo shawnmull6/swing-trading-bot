@@ -12,8 +12,10 @@ calendar mapping error; step 15B.5A (settlement calendar mapping correction, §1
 committed; step 15B.5B (activity description compatibility and wrapped payload errors,
 §12.27) committed; step 15B.5B.1 (activity raw-JSON serialization, §12.28) committed;
 step 15B.5C (live contract evidence sanitization, §12.29) committed; step 15B.5D (atomic
-evidence publication and write-failure handling, §12.30) implemented offline and awaiting
-review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
+evidence publication and write-failure handling, §12.30) committed; live run #4
+(2026-11-13) PASSED with no FAILED row (C7 still INCONCLUSIVE); steps 15B.6A–15B.6C
+(configuration errors, deep nesting, exact activity comparison, §12.31) committed.
+Real-ledger initialization remains blocked (§12.31 ¶7).** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -2615,6 +2617,7 @@ the observed shape (synthetic values).
 C7 still inconclusive until the activity `description` fix (15B.5B); C5/C9 INCONCLUSIVE
 on a flat account. `init-ledger` against the real account stays blocked until C4 and C7
 are verified live and the flat-account INCONCLUSIVE rows are accepted on review.
+*Run #4 result: §12.31 — C4 VERIFIED; C7 still INCONCLUSIVE; requirement unchanged.*
 
 ### 12.27 Activity description compatibility and wrapped payload errors (15B.5B)
 
@@ -2755,8 +2758,9 @@ confirmation are unchanged.
 `float` there: two deliveries of one activity id differing only beyond float precision in
 an unmapped field would be treated as the same content (mapped money fields are compared
 as exact `Decimal`s; `merge_activities` compares the text exactly). Not changed (ledger
-code). (b) Nesting deep enough to exhaust Python recursion (~1000 levels) raises
-`RecursionError` (exit 1), as the decoder and the old `json.dumps` also would.
+code). *Resolved in Step 15B.6C (§12.31 ¶6).* (b) Nesting deep enough to exhaust Python
+recursion (~1000 levels) raises `RecursionError` (exit 1), as the decoder and the old
+`json.dumps` also would. *Resolved in Step 15B.6B (§12.31 ¶5).*
 (c) Other broker payloads (account, orders, positions, clock, calendar) are mapped to
 typed models and never re-serialized; the evidence writer's redaction is §12.29 (15B.5C).
 
@@ -3005,6 +3009,98 @@ private permissions and sanitization, concurrent same-name publication, unsuppor
 missing symbol, unsupported-filesystem and other native errors as write failures, `EEXIST`
 as a collision, no ordinary-rename fallback, no `os.rename` in the source) and the former
 strict-xfail race test, now a normal passing test in `test_run_verdict.py`.
+
+### 12.31 Live run #4 and post-live hardening (15B.6A–15B.6C)
+
+**1. Live run #4 (2026-11-13).** Exactly one completed supervised read-only run under
+the 15B.5D harness; **run verdict PASSED (`OK`)**. 26 GETs of 120 (setup 3, contract 23),
+zero retries, 3.3 s of 300 s, hosts `paper-api.alpaca.markets` and `data.alpaca.markets`
+only. No broker writes (no order created, modified or cancelled; no account setting
+changed), no real-ledger operation (`data/` untouched), no rebaseline or reconciliation.
+
+| Row | Outcome | Note |
+|---|---|---|
+| C1 account identity, C2 configuration and restrictions, C3 broker clock | VERIFIED | |
+| C4 trading and settlement calendars | **VERIFIED** | the §12.26 `settlement_date` mapping, verified against the live paper API (FAILED on run #3) |
+| C5 positions and orders | INCONCLUSIVE | `FLAT_ACCOUNT_ORDER_SEMANTICS_UNEXERCISED` |
+| C6 unknown client-order-id lookup | VERIFIED | |
+| C7 activity retrieval and pagination | INCONCLUSIVE | `TOO_FEW_ACTIVITIES_TO_EXERCISE_PAGINATION` (see ¶2) |
+| C8 latest trades and daily bars | VERIFIED | |
+| C9 decimal precision | INCONCLUSIVE | `ONLY_ACCOUNT_NUMERICS_OBSERVED` |
+| C10–C13 | DEFERRED | cannot be tested in this phase (by design) |
+
+**No row FAILED.** Evidence was published atomically (§12.30): every file valid,
+sanitized JSON at 0600 in 0700 directories, no credential or account identifier
+present, no staging directory left behind. Rate-limit headers: data host limit 200
+observed; trading host `LIMIT_INCONSISTENT` (as on run #3). Account settings observed
+(values not recorded here): shorting not disabled, margin multiplier ≠ 1, fractional
+trading enabled — the U6 protections are still **not** in place.
+
+**2. C7.** Activity mapping now gets past the run-#3 failure (an empty `description`,
+§12.27): the account's single activity was read, mapped and encoded for storage with
+its money field present, and tail confirmation, page-size independence and window
+partition ran. C7 remains INCONCLUSIVE **solely** because the account has too little
+activity history to exercise multi-page pagination (criterion unchanged: > 10
+activities in the 30-day window). C7 is **not** VERIFIED, and the §12.26 ¶7 requirement
+(C4 and C7 verified live before `init-ledger` against the real account) is **not** met;
+no exception to it has been approved.
+
+**3. Two earlier attempts made no request.** Before the run, one attempt stopped at
+preflight with no credential source selected; a second exited 1 after **zero** requests
+because the selected file lacked `TRADING_MODE`, and the runner let the resulting
+`SettingsError` escape as an uncaught exception (fixed in ¶4). Neither reached the
+network; the completed run is the only run #4.
+
+**4. Configuration errors (15B.6A).** `tests/contract/live_run.py` only: a
+`CredentialSourceError` (no, ambiguous or unsafe source) still stops with
+`CREDENTIALS_UNAVAILABLE`; any other `SettingsError` (missing or invalid setting, e.g.
+`TRADING_MODE` absent or not `paper`, malformed `TRADING_ENABLED`) now stops with
+**`CONFIGURATION_INVALID`**. Both happen before the session is created: **zero broker
+requests**, no evidence written, a sanitized FAILED run verdict, CLI exit 1 with no
+traceback; the exception message (field names only) is discarded. No `src/` change.
+Tests: `tests/contract/test_supervised_run.py`.
+
+**5. Deep nesting (15B.6B; closes §12.28 ¶4b).** `broker.mapping.MAX_PAYLOAD_DEPTH = 64`
+(the outermost container is depth 1; scalars add none): depth 64 is accepted, 65 is
+rejected. `decode_json` — the single decode point for broker responses — maps a decoder
+`RecursionError` and any container deeper than the limit (checked iteratively, never by
+recursion) to `InvalidBrokerDataError`; `raw_json` also refuses to encode beyond the
+limit. So excessive nesting takes the existing payload paths: runtime commands set the
+persistent `BROKER_PAYLOAD` halt (first failure exit 10, later invocations under the halt
+exit 4), `broker-check` exits 10, `init-ledger` refuses with exit 10 and creates nothing,
+and a malformed activity makes C7 FAILED. No retry. Valid `raw_json` output is
+byte-identical to before. Tests: `tests/unit/test_alpaca_http.py`,
+`tests/unit/test_activity_raw_json.py`, `tests/integration/test_activity_raw_json_paths.py`.
+
+**6. Exact activity comparison (15B.6C, 15B.6C.1; closes §12.28 ¶4a).**
+`ActivityRecord.content_key()` — used only by `ActivitiesRepository.record` to decide
+DUPLICATE vs CONFLICT for a re-delivered activity id — now parses the stored payload with
+`json.loads(..., parse_float=Decimal)` and tags each JSON boolean as `(bool, value)`, so
+that comparison is exact JSON value equality: integers and decimals by exact value at any
+size or exponent, `true`/`false` never equal to `1`/`0`/`1.0`/`0.0`, strings never equal
+to numbers, `null` only to `null`, objects regardless of key order, arrays in order.
+Numerically equal spellings (`1.10`/`1.1`, `1.0`/`1`, `1E+2`/`100`) stay DUPLICATE. A
+change below float precision, beyond float range, or between a boolean and a number is
+now a CONFLICT (→ the existing `RECON_EXECUTION` halt, no second booking) instead of a
+silent DUPLICATE. Typed money comparison, append-only storage, activity-id idempotency,
+`raw_json` encoding, stored text, schema and reconciliation semantics are unchanged.
+Tests: `tests/unit/test_activity_content_key.py` (tables and two bounded Hypothesis
+properties against an independent type-aware reference equality), repository, portfolio
+and end-to-end reconciliation tests.
+
+**7. Still open (unchanged requirements).**
+* C7 multi-page pagination is unverified live; the C7 VERIFIED requirement before
+  real-ledger initialization stands (¶2). Options — keep it, formally amend it, or
+  re-run after real activity exists — are an operator decision, not taken.
+* C5 and C9 remain INCONCLUSIVE on the flat account and need review acceptance.
+* C10–C13 remain DEFERRED (M2).
+* Real-ledger initialization (`init-ledger`) stays blocked pending a separate readiness
+  decision and authorization.
+* M2 order writes remain unauthorized (M1_PLAN §9, §9.1).
+* U6 account protections are not in place, and `trade_suspended_by_user`,
+  `closing_transactions_only`, `transfers_blocked` and `suspend_trade` enforcement
+  remain unresolved (§12.25 ¶5; M2-V1).
+* Native no-replace publication is still unverified on Linux (§12.30 ¶7).
 
 ---
 

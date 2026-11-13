@@ -102,7 +102,13 @@ count as verified evidence. Publication uses an atomic no-replace rename (macOS
 even an empty directory — is never replaced. On any other OS, on Linux with glibc older
 than 2.28, or on a filesystem without no-replace support (some network mounts) the run
 stops with `EVIDENCE_WRITE_FAILED` and publishes nothing: keep `contract-evidence/` on a
-local disk (APFS/ext4/xfs/btrfs).
+local disk (APFS/ext4/xfs/btrfs). If the run prints `stop: CREDENTIALS_UNAVAILABLE`, no,
+more than one, or an unsafe credential source was selected (§2). If it prints
+`stop: CONFIGURATION_INVALID` (Step 15B.6A, A§12.31 ¶4), the selected settings are
+missing or invalid — e.g. `TRADING_MODE` absent or not `paper`, or a malformed
+`TRADING_ENABLED`. In both cases **no broker request was made**, nothing was written and
+the run verdict is FAILED; fix the file (field names only — never paste values) and treat
+a retry as a new run needing separate authorization.
 
 Status (2026-11-12): the first authorized run stopped safely in setup after one
 `GET /v2/account` because the response omitted `pattern_day_trader` (then a required
@@ -119,6 +125,14 @@ C5/C9 inconclusive on a flat account; the redactor corrupted `"next_page_token":
 the raw evidence (fixed in Step 15B.5C, A§12.29). **Run #4 needs separate, explicit operator
 authorization**; do not re-run on the strength of an earlier approval. Run it well away
 from the market open and close.
+
+Run #4 (2026-11-13) **PASSED**: 26 GETs, no retries, 3.3 s; C1–C4, C6, C8 verified
+(C4 now correct); C5/C9 inconclusive on the flat account; C7 inconclusive only because
+the account has too few activities for multi-page pagination; C10–C13 deferred; none
+failed; evidence published and sanitized (A§12.31). **This does not authorize
+`init-ledger`:** C7 is not verified live, C5/C9 still need review acceptance, and a
+separate readiness decision is required (§4). Any further run needs its own
+authorization.
 
 Settlement calendar: Alpaca's SETTLEMENT calendar lists trade dates with their
 `settlement_date`; the bot stores the `settlement_date` values as settlement days. Sale
@@ -270,12 +284,13 @@ by the OS automatically, and the JSON note in the file is diagnostic only.
 | 7 `CredentialSourceError` | no, ambiguous or unsafe credential source | select exactly one source (§2); fix file permissions/ownership |
 | 7 `BrokerNotConfiguredError` | no broker factory in this wiring | use the installed CLI entry point |
 | 8 | broker unavailable | retry later; see §7 if it persists |
-| 10 `InvalidBrokerDataError` | the broker's response broke the parsing contract (missing/`null` required field, wrong type, float money, unmapped status), directly or on a page inside an interrupted multi-page read (e.g. an activity window); runtime commands also set a persistent `BROKER_PAYLOAD` halt. An activity's `description` may be `""` (valid since Step 15B.5B). A JSON number in an activity money field, or NaN/±Infinity anywhere in an activity, is also exit 10 (Step 15B.5B.1, A§12.28); a valid JSON number in an unmapped activity field is stored exactly and is not an error | do **not** retry or resume: it is not an outage. Inspect the error (field names only), get the mapper reviewed and fixed, then a CLEAN `reconcile` and an explicit `resume` |
+| 10 `InvalidBrokerDataError` | the broker's response broke the parsing contract (missing/`null` required field, wrong type, float money, unmapped status), directly or on a page inside an interrupted multi-page read (e.g. an activity window); runtime commands also set a persistent `BROKER_PAYLOAD` halt. An activity's `description` may be `""` (valid since Step 15B.5B). A JSON number in an activity money field, or NaN/±Infinity anywhere in an activity, is also exit 10 (Step 15B.5B.1, A§12.28); a valid JSON number in an unmapped activity field is stored exactly and is not an error. Any response nested deeper than 64 levels is also exit 10 (Step 15B.6B, A§12.31 ¶5) | do **not** retry or resume: it is not an outage. Inspect the error (field names only), get the mapper reviewed and fixed, then a CLEAN `reconcile` and an explicit `resume` |
 | 4 `BROKER_PAYLOAD` halt | an operation was blocked by an already-recorded payload halt | as for exit 10; the halt is never cleared automatically |
 | 9 `DatabaseNotFoundError` | no ledger | `init-ledger` (only for a new, flat account) |
 | 9 `MigrationRequiredError` | schema older than the code | `migrate --backup` (§11) |
 | 9 `ModeMismatchError` | simulation ledger opened as observe (or vice versa) | use `--sim-run` for simulation ledgers |
 | 9 `DatabaseCorruptError` | file damaged or not a ledger | do not touch it; restore (§10) |
+| `CONFIGURATION_INVALID` (supervised contract run, CLI exit 1) | settings in the selected source are missing or invalid; no request was made | fix the setting (field names only); a retry is a new run needing authorization |
 | 4 `RECON_*` halt | reconciliation mismatch | inspect `audit` / `reconcile --json` findings; rebaseline only for external cash events |
 | 4 `RECON_ACCOUNT` | connected account differs from the ledger or identity uncertain | check credentials; never rebaseline to another account |
 | 6 | lock held | wait (§12) |
