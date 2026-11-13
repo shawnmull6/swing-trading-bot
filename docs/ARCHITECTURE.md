@@ -11,8 +11,9 @@ compatibility, §12.25) committed; live run #3 completed with C4 FAILED on a set
 calendar mapping error; step 15B.5A (settlement calendar mapping correction, §12.26)
 committed; step 15B.5B (activity description compatibility and wrapped payload errors,
 §12.27) committed; step 15B.5B.1 (activity raw-JSON serialization, §12.28) committed;
-step 15B.5C (live contract evidence sanitization, §12.29) implemented offline and
-awaiting review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
+step 15B.5C (live contract evidence sanitization, §12.29) committed; step 15B.5D (atomic
+evidence publication and write-failure handling, §12.30) implemented offline and awaiting
+review. Live run #4 needs separate authorization.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -2797,7 +2798,8 @@ in `Exchange.body` (in memory only; `repr=False`; never logged) → after the ru
 `forbidden_values()` and `identity_values()` read the original bodies →
 `EvidenceWriter.write` checks the summary, sanitizes and verifies **every** raw body, and
 only then creates the directory and writes (0700/0600, `O_EXCL | O_NOFOLLOW`,
-Git-ignored root). Any `SanitizationError` leaves nothing on disk.
+Git-ignored root). Any `SanitizationError` leaves nothing on disk. *Publication is
+atomic since Step 15B.5D (§12.30).*
 
 **3. Policy** (`supervisor.py`):
 
@@ -2862,6 +2864,147 @@ runs: valid leak-free raw evidence with unchanged rows, echoed error bodies scru
 malformed evidence → `SUMMARY_SANITIZATION_FAILED` with nothing persisted and nothing
 VERIFIED, a leaking summary → `SUMMARY_FORBIDDEN_VALUE`, permissions 0700/0600, the
 evidence root Git-ignored and untracked.
+
+### 12.30 Atomic evidence publication and write-failure handling (15B.5D)
+
+Offline implementation, confined to the contract harness (`tests/contract/supervisor.py`,
+`tests/contract/live_run.py`); no `src/` change. Sanitization (§12.29), C1–C13 criteria and
+outcomes are unchanged.
+
+**1. Defect.** `EvidenceWriter` created `<root>/<run>/` and wrote each file straight into
+it, `summary.json` last, without `fsync`. Any `OSError` (root creation, `mkdir`, `open`,
+`write`, the flush in `close`, `chmod`) escaped `run_supervised` as a raw traceback with no
+fixed code, and left a directory named like a completed run holding only some files (no
+summary). A Git failure (missing binary, timeout) in the ignore check escaped likewise.
+
+**2. Design.** All sanitization and forbidden-value checks finish in memory first (a
+`SanitizationError` still writes nothing and is never reported as a write failure). Then:
+
+1. *Refusals without writes* (codes unchanged): invalid path or run name — run names may
+   no longer start with `.`; root not a directory/symlink; root not Git-ignored (a Git
+   error now counts as "not ignored"); destination already exists (`lexists`, so an empty
+   directory or dangling symlink is also refused).
+2. *Staging:* the root is created 0700 if needed; a private staging directory
+   `<root>/.incomplete-<run>-<16 hex>/` (+ `raw/`, both 0700) on the same filesystem.
+3. *Write:* each file `O_CREAT | O_EXCL | O_NOFOLLOW` 0600, written in a short-write
+   loop, `fsync`ed, closed (a close error counts), `chmod 0600`; `summary.json` too.
+   Both staging directories are `fsync`ed.
+4. *Verify:* every expected file is a regular file of exactly the expected size with mode
+   0600; both directories are directories with mode 0700.
+5. *Publish:* one **atomic no-replace** rename of staging to `<root>/<run>` (¶7): it
+   succeeds only if the destination does not exist at that instant — an existing empty
+   or non-empty directory, file or symlink is never replaced. Then the root is `fsync`ed.
+   Only after this does `run_supervised` report `evidence.written = true`.
+
+All filesystem calls go through one `FileOps` seam (used by the fault-injection tests).
+
+**3. `EVIDENCE_WRITE_FAILED`.** Any `OSError` in steps 2–5 becomes `EvidenceWriteError`
+(message = the fixed code; the errno text, paths and content are dropped, cause
+suppressed). The staging directory is removed (`shutil.rmtree`, which never follows
+symlinks). `run_supervised` returns only
+`{"execution": {"status": "STOPPED", "stop_code": "EVIDENCE_WRITE_FAILED"},
+"evidence": {"written": false, "code": "EVIDENCE_WRITE_FAILED", "staging_removed": <bool>}}`
+— no rows, so nothing is VERIFIED; the pytest verdict and `main()` (exit 1) fail. If
+cleanup itself fails, `staging_removed` is `false` and a `.incomplete-…` directory
+remains: dot-prefixed (never a valid run name), private (0700/0600), holding only
+sanitized bytes, and never treated as a run. Refusals in step 1 keep their diagnostic
+codes (`evidence.written = false`, execution status and rows unchanged) but **fail the
+run** (¶6). A destination that appears (non-empty) between the pre-check and the rename
+makes `rename` fail with `EEXIST`/`ENOTEMPTY`; that is reported as a collision,
+`EVIDENCE_DESTINATION_EXISTS` (staging removed), not as a write failure.
+
+**4. Remaining crash-consistency limitations.** (a) A process crash or power loss
+before the rename leaves a `.incomplete-…` directory that is not cleaned automatically
+(it can never be mistaken for a run; delete it manually). (b) If the root's `fsync` fails
+*after* the rename, the run directory is complete and verified, but the run is still
+reported `EVIDENCE_WRITE_FAILED` because durability is not confirmed. (c) Publication requires a native no-replace rename (¶7); elsewhere it fails closed.
+(d) The root's parent must already exist (the default
+`contract-evidence/` lives at the repository root).
+
+**5. Tests.** `tests/contract/test_evidence_persistence.py`: atomic success (at the
+moment of publication the final directory is absent and staging is complete; no staging
+leftovers; 0700/0600; leak-free; `next_page_token: null` intact), no overwrite of a
+completed run, a concurrently published run left intact, unique staging names and
+dot-prefixed run names refused; fault injection at evidence-root creation and `chmod`,
+staging and `raw/` creation, first/later file open and write, a mid-file failure after a
+short write, a lying short write caught by verification, a zero-byte write, a
+non-private staging directory refused by verification, summary open/write, file
+`fsync`, close and `chmod`, staging `fsync`, final publication and the root's `fsync`
+after publication; cleanup failure (artifact dot-prefixed, private, sanitized);
+sanitization failure writes nothing and is not a write failure; a Git failure counts as
+not ignored; supervised runs: success keeps C1–C13 outcomes, a write failure returns
+`EVIDENCE_WRITE_FAILED` without rows or leaks (with and without cleanup failure), and the
+CLI `main()` exits 1.
+
+**6. Run verdict (15B.5D review).** The final supervised-run verdict is separate from the
+individual C1–C13 rows. `live_run.run_verdict(summary)` — recomputed from the summary,
+never read from a stored field — passes only if execution is `COMPLETED`,
+`evidence.written` is exactly `true` and no row is FAILED; its code is, in precedence, the
+stop code, the evidence code (a refusal such as `EVIDENCE_DESTINATION_EXISTS`,
+`EVIDENCE_PATH_INVALID`, `EVIDENCE_ROOT_NOT_A_DIRECTORY`, `EVIDENCE_ROOT_NOT_GIT_IGNORED`,
+or `EVIDENCE_NOT_WRITTEN` when absent), `CONTRACT_ROWS_FAILED`, else `OK`. The summary
+carries `verdict: {status, code}`; `render` prints `run verdict: …` first, then the
+execution status, `evidence written: …` and the rows under "contract rows (individual
+results, not the run verdict)". `fail_if_not_ok` (pytest) and `main()` (exit 1) use the
+same function. *Before:* a refusal left `execution: COMPLETED` and the verdict passed with
+`evidence.written = false`. *After:* every refusal, sanitization failure and write failure
+fails the run; refusals keep their rows and code for diagnosis; sanitization and write
+failures keep `SUMMARY_SANITIZATION_FAILED` / `EVIDENCE_WRITE_FAILED` without rows. The
+`summary.json` on disk is written before publication, so it carries no `evidence` /
+`verdict` fields (unchanged); the verdict is the runner's output. Tests:
+`tests/contract/test_run_verdict.py` (existing/empty destination, relative / file /
+symlinked root, root not Git-ignored, invalid run names, a collision at publication,
+successful checks with `evidence.written = false`, pytest and CLI exits, precedence, a
+forged stored verdict ignored).
+
+**7. Atomic no-replace publication (Option A, approved and implemented).** *The former
+race:* POSIX `rename(2)` refuses a non-empty destination directory but silently replaces
+an **empty** one, so an empty `<run>` directory created between the pre-check and the
+rename was replaced (verified on macOS). The `lexists` pre-check stays only as an early,
+cheap refusal; it is **not** the guarantee.
+
+*Implementation* (`tests/contract/supervisor.py`, isolated behind `FileOps.rename`; no
+third-party dependency, no `src/` change): `resolve_noreplace_rename(platform)` binds the
+C library through `ctypes.CDLL(None, use_errno=True)` with explicit signatures and
+reviewed constants —
+
+| Platform | Call | Signature (`argtypes` → `restype`) | Flag |
+|---|---|---|---|
+| macOS 10.12+ (`sys.platform == "darwin"`) | `renamex_np(from, to, flags)` | `c_char_p, c_char_p, c_uint` → `c_int` | `RENAME_EXCL = 0x4` |
+| Linux kernel 3.15+, glibc 2.28+ | `renameat2(AT_FDCWD, old, AT_FDCWD, new, flags)` | `c_int, c_char_p, c_int, c_char_p, c_uint` → `c_int` | `RENAME_NOREPLACE = 0x1`, `AT_FDCWD = -100` |
+
+`noreplace_rename` encodes both paths with `os.fsencode`, refuses an embedded NUL
+(`EINVAL`, before any native call — `c_char_p` would truncate), clears `errno`, and on a
+non-zero return raises `OSError(errno, strerror)` (no path; `EIO` if `errno` is 0). The
+resolved call is cached per process.
+
+*Fail closed — never `os.rename`/`os.replace`:* any other OS, a missing symbol (e.g.
+glibc < 2.28) or an unloadable C library → `ENOSYS`; a filesystem without no-replace
+support returns `EINVAL`/`ENOTSUP` (e.g. some network filesystems) — all are
+`EVIDENCE_WRITE_FAILED`, staging removed, nothing published. A static test asserts the
+harness contains no `os.rename`/`os.replace`/`shutil.move` call, and a runtime test
+publishes with those functions replaced by tripwires.
+
+*Classification:* `EEXIST`/`ENOTEMPTY` from the publication rename →
+`EVIDENCE_DESTINATION_EXISTS` (a collision; staging removed); any other publication or
+durability error → `EVIDENCE_WRITE_FAILED`; sanitization → `SUMMARY_SANITIZATION_FAILED`
+(unchanged). Every one fails the run verdict (¶6); refusals and collisions keep the rows
+for diagnosis, sanitization and write failures report none.
+
+*Verified on this host* (macOS 26.5, arm64, APFS): `renamex_np(RENAME_EXCL)` publishes to
+an absent destination and fails with `EEXIST` — leaving source and destination untouched
+— for an existing empty directory, non-empty directory, file and dangling symlink; a
+missing source gives `ENOENT`; two writers publishing the same run name at the same
+instant (threads released by a barrier) yield exactly one publication and one collision.
+The Linux path is implemented and its tests are gated to Linux; it has **not** been run
+on Linux in this environment.
+
+*Tests:* `tests/contract/test_native_publication.py` (constants, signatures, real native
+publication / refusal for each destination kind, native errno without paths, NUL refusal,
+private permissions and sanitization, concurrent same-name publication, unsupported OS,
+missing symbol, unsupported-filesystem and other native errors as write failures, `EEXIST`
+as a collision, no ordinary-rename fallback, no `os.rename` in the source) and the former
+strict-xfail race test, now a normal passing test in `test_run_verdict.py`.
 
 ---
 

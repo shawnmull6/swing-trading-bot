@@ -389,7 +389,8 @@ def test_pytest_failure_output_is_sanitized(tmp_path: Path) -> None:
 
 
 def test_fail_if_not_ok_passes_a_clean_summary() -> None:
-    fail_if_not_ok({"execution": {"status": "COMPLETED"}, "rows": {"C1": {"outcome": "VERIFIED"}}})
+    fail_if_not_ok({"execution": {"status": "COMPLETED"}, "evidence": {"written": True},
+                    "rows": {"C1": {"outcome": "VERIFIED"}}})  # fmt: skip
 
 
 # ============================================================ Step 15B.2 account schema

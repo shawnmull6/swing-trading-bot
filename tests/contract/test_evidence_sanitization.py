@@ -352,6 +352,7 @@ def test_malformed_evidence_fails_closed_and_nothing_is_verified(
     assert summary == {
         "execution": {"status": "STOPPED", "stop_code": "SUMMARY_SANITIZATION_FAILED"},
         "evidence": {"written": False, "code": "EVIDENCE_JSON_MALFORMED"},
+        "verdict": {"status": "FAILED", "code": "SUMMARY_SANITIZATION_FAILED"},
     }
     assert "VERIFIED" not in json.dumps(summary) and "rows" not in summary
     assert not (tmp_path / "evidence").exists()  # nothing persisted, raw or summary

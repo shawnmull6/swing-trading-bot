@@ -13,7 +13,12 @@ The supervised live read-only contract run (Step 15B, prepared in Step 15A.1).
    and a sanitized summary. Raw bodies are structurally sanitized (Step 15B.5C); if any
    evidence cannot be proven sanitized, nothing is written and the summary is reduced to
    ``STOPPED`` / ``SUMMARY_SANITIZATION_FAILED`` with a fixed reason code (no rows, so
-   nothing can be VERIFIED).
+   nothing can be VERIFIED). Evidence is published atomically (Step 15B.5D); a filesystem
+   failure is ``STOPPED`` / ``EVIDENCE_WRITE_FAILED``, likewise without rows.
+6. the final **run verdict** (:func:`run_verdict`) is separate from the individual C1-C13
+   rows: it passes only if execution COMPLETED, the evidence was published
+   (``evidence.written`` is true) and no row FAILED. A refusal before writing (e.g.
+   ``EVIDENCE_DESTINATION_EXISTS``) keeps the rows for diagnosis but fails the run.
 
 The run stops — and every later check is ``NOT_RUN`` — on budget or deadline exhaustion,
 a write attempt, an authentication failure, persisting rate limiting, or an invalid account
@@ -60,6 +65,7 @@ from tests.contract.supervisor import (
     BudgetedSession,
     BudgetExhausted,
     EvidenceError,
+    EvidenceWriteError,
     EvidenceWriter,
     RequestBudget,
     SanitizationError,
@@ -161,17 +167,46 @@ def run_supervised(  # noqa: PLR0915 - injectable dependencies; one linear scrip
     except SanitizationError as exc:  # fail closed: no rows, nothing written
         summary = {"execution": {"status": "STOPPED", "stop_code": "SUMMARY_SANITIZATION_FAILED"},
                    "evidence": {"written": False, "code": exc.code}}  # fmt: skip
-    except EvidenceError as exc:
+    except EvidenceWriteError as exc:  # fail closed: no rows; never "written"
+        summary = {"execution": {"status": "STOPPED", "stop_code": exc.code},
+                   "evidence": {"written": False, "code": exc.code,
+                                "staging_removed": exc.staging_removed}}  # fmt: skip
+    except EvidenceError as exc:  # a refusal before any write (unchanged)
         summary["evidence"] = {"written": False, "code": str(exc)}
+    passed, verdict_code = run_verdict(summary)
+    summary["verdict"] = {"status": "PASSED" if passed else "FAILED", "code": verdict_code}
     logging.getLogger(__name__).info("contract run finished",
-                                     extra={"status": summary["execution"]["status"]})  # fmt: skip
+                                     extra={"status": summary["execution"]["status"],
+                                            "verdict": summary["verdict"]["status"]})  # fmt: skip
     return summary
 
 
+def run_verdict(summary: Mapping[str, Any]) -> tuple[bool, str]:
+    """The final supervised-run verdict, recomputed from the summary (never trusted from a
+    stored field): ``(passed, fixed code)``. Precedence: a stopped execution (its stop
+    code), unpublished evidence (the evidence code — a refusal or a write failure), a FAILED
+    contract row (``CONTRACT_ROWS_FAILED``); otherwise ``OK``."""
+    execution = summary.get("execution") or {}
+    if execution.get("status") != "COMPLETED":
+        return False, str(execution.get("stop_code") or "EXECUTION_NOT_COMPLETED")
+    evidence = summary.get("evidence") or {}
+    if evidence.get("written") is not True:
+        return False, str(evidence.get("code") or "EVIDENCE_NOT_WRITTEN")
+    if any(v.get("outcome") == "FAILED" for v in (summary.get("rows") or {}).values()):
+        return False, "CONTRACT_ROWS_FAILED"
+    return True, "OK"
+
+
 def render(summary: Mapping[str, Any], secrets: tuple[str, ...] = ()) -> str:
-    """Operator-facing text: execution status and the row table only."""
-    lines = [f"execution: {summary['execution']['status']} "
-             f"(stop: {summary['execution'].get('stop_code')})"]  # fmt: skip
+    """Operator-facing text: the run verdict, execution status and the row table only."""
+    passed, code = run_verdict(summary)
+    evidence = summary.get("evidence") or {}
+    lines = [f"run verdict: {'PASSED' if passed else 'FAILED'} ({code})",
+             f"execution: {summary['execution']['status']} "
+             f"(stop: {summary['execution'].get('stop_code')})",
+             f"evidence written: {evidence.get('written') is True}"]  # fmt: skip
+    if summary.get("rows"):
+        lines.append("contract rows (individual results, not the run verdict):")
     for row, value in summary.get("rows", {}).items():
         lines.append(f"{row:4s} {value['outcome']:13s} {value['code']}")
     return SecretRedactor(secrets).redact("\n".join(lines))
@@ -181,10 +216,10 @@ def fail_if_not_ok(summary: Mapping[str, Any]) -> None:
     """The pytest verdict: fixed codes only, no traceback (``pytrace=False``)."""
     import pytest  # noqa: PLC0415
 
-    status = summary["execution"]["status"]
-    failed = sorted(r for r, v in summary.get("rows", {}).items() if v["outcome"] == "FAILED")
-    if status != "COMPLETED" or failed:
-        pytest.fail(f"contract run {status}; failed rows: {failed}\n{render(summary)}",
+    passed, code = run_verdict(summary)
+    if not passed:
+        failed = sorted(r for r, v in summary.get("rows", {}).items() if v["outcome"] == "FAILED")
+        pytest.fail(f"contract run FAILED ({code}); failed rows: {failed}\n{render(summary)}",
                     pytrace=False)  # fmt: skip
 
 
@@ -195,13 +230,11 @@ def main() -> int:  # pragma: no cover - live entry point
     summary = run_supervised(os.environ)
     sys.stdout.write(render(summary) + "\n")
     sys.stdout.write(json.dumps({"evidence": summary.get("evidence")}) + "\n")
-    ok = summary["execution"]["status"] == "COMPLETED"
-    failed = any(v["outcome"] == "FAILED" for v in summary.get("rows", {}).values())
-    return 0 if ok and not failed else 1
+    return 0 if run_verdict(summary)[0] else 1
 
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
-__all__ = ["Path", "main", "render", "run_supervised"]
+__all__ = ["Path", "main", "render", "run_supervised", "run_verdict"]

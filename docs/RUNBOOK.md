@@ -84,7 +84,25 @@ positions and activity/order ids: never paste or share them. If the run prints
 `stop: SUMMARY_SANITIZATION_FAILED`, **nothing** was written and no row is verified; the
 `evidence.code` names the fixed reason (e.g. `EVIDENCE_JSON_MALFORMED` for a non-JSON
 successful response, `SUMMARY_FORBIDDEN_VALUE` for a summary leak). Do not re-run to
-"get past" it: report the code and stop.
+"get past" it: report the code and stop. Since Step 15B.5D (A§12.30) a run directory
+`contract-evidence/<run>/` appears only once complete (staged, verified, renamed in one
+step). `stop: EVIDENCE_WRITE_FAILED` means a filesystem error (disk full, permissions):
+no evidence was published and no row is verified; `evidence.staging_removed: false`
+means a private `contract-evidence/.incomplete-<run>-<hex>/` was left behind — it is
+never a run, contains only sanitized data, and may be deleted after the cause is fixed.
+A `.incomplete-…` directory found after a crash is likewise not a run. A re-run after
+this failure is a new run and needs separate authorization. The first output line is the
+**run verdict** (`run verdict: PASSED (OK)` or `FAILED (<code>)`); the C1–C13 rows below
+it are individual contract results. The run fails whenever evidence was not published
+(`evidence written: False`) — including refusals such as `EVIDENCE_DESTINATION_EXISTS`
+(the run name already exists), `EVIDENCE_PATH_INVALID`, `EVIDENCE_ROOT_NOT_A_DIRECTORY`
+or `EVIDENCE_ROOT_NOT_GIT_IGNORED`; the rows are still shown for diagnosis but do **not**
+count as verified evidence. Publication uses an atomic no-replace rename (macOS
+`renamex_np`, Linux `renameat2`; A§12.30 ¶7): an existing `contract-evidence/<run>` —
+even an empty directory — is never replaced. On any other OS, on Linux with glibc older
+than 2.28, or on a filesystem without no-replace support (some network mounts) the run
+stops with `EVIDENCE_WRITE_FAILED` and publishes nothing: keep `contract-evidence/` on a
+local disk (APFS/ext4/xfs/btrfs).
 
 Status (2026-11-12): the first authorized run stopped safely in setup after one
 `GET /v2/account` because the response omitted `pattern_day_trader` (then a required

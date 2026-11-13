@@ -24,17 +24,24 @@ Shared supervision for the live read-only contract run (Step 15A.1: R1, R2, R5, 
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import errno
+import functools
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from secrets import token_hex
 from typing import Any, Final
 from urllib.parse import urlsplit
 
@@ -451,66 +458,259 @@ def assert_sanitized(summary: Mapping[str, Any], forbidden: Iterable[str]) -> st
 
 
 def _git_ignored(path: Path) -> bool:
-    result = subprocess.run(  # noqa: S603 - fixed argv
-        ["git", "check-ignore", "-q", str(path)],  # noqa: S607
-        cwd=REPO, capture_output=True, timeout=5, check=False,
-    )  # fmt: skip
+    """``False`` (fail closed) when Git says no **or** cannot answer (missing, timeout)."""
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv
+            ["git", "check-ignore", "-q", str(path)],  # noqa: S607
+            cwd=REPO, capture_output=True, timeout=5, check=False,
+        )  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return False
     return result.returncode == 0
 
 
+class EvidenceWriteError(EvidenceError):
+    """A filesystem operation failed while persisting evidence (Step 15B.5D). The message
+    is the fixed code only — never a path, errno text or content. ``staging_removed`` is
+    ``False`` when an incomplete ``.incomplete-*`` staging directory had to be left."""
+
+    CODE: Final = "EVIDENCE_WRITE_FAILED"
+
+    def __init__(self, *, staging_removed: bool) -> None:
+        super().__init__(self.CODE)
+        self.code = self.CODE
+        self.staging_removed = staging_removed
+
+
+class EvidenceCollisionError(EvidenceError):
+    """The run's destination appeared after the pre-check: ``rename`` refused to replace a
+    non-empty directory. A collision (``EVIDENCE_DESTINATION_EXISTS``), not an I/O fault."""
+
+    def __init__(self, *, staging_removed: bool) -> None:
+        super().__init__("EVIDENCE_DESTINATION_EXISTS")
+        self.staging_removed = staging_removed
+
+
+#: Staging directories start with this; run names may not start with ``.``, so a staging
+#: (or abandoned incomplete) directory can never be mistaken for a completed run.
+STAGING_PREFIX: Final = ".incomplete-"
+SUMMARY_NAME: Final = "summary.json"
+
+
+# ============================================================ atomic no-replace rename (15B.5D)
+#: macOS ``<stdio.h>`` (10.12+): ``int renamex_np(const char *from, const char *to,
+#: unsigned int flags)``; ``RENAME_EXCL`` fails with ``EEXIST`` if ``to`` exists.
+RENAME_EXCL: Final = 0x00000004
+#: Linux ``<linux/fs.h>`` / glibc ``<stdio.h>`` (kernel 3.15+, glibc 2.28+):
+#: ``int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
+#: unsigned int flags)``; ``RENAME_NOREPLACE`` fails with ``EEXIST`` if ``newpath`` exists.
+RENAME_NOREPLACE: Final = 0x00000001
+AT_FDCWD: Final = -100
+#: ``(src, dst) -> 0`` on success, ``-1`` with ``errno`` set on failure (C convention).
+NativeRename = Callable[[bytes, bytes], int]
+#: errno values that mean "the destination already exists" (a collision).
+COLLISION_ERRNOS: Final = frozenset({errno.EEXIST, errno.ENOTEMPTY})
+
+
+def resolve_noreplace_rename(platform: str, lib: Any = None) -> NativeRename | None:
+    """The platform's atomic no-replace rename, or ``None`` (unsupported OS or missing
+    symbol — the caller fails closed; there is no ordinary-rename fallback)."""
+    if platform == "darwin":
+        name = "renamex_np"
+    elif platform.startswith("linux"):
+        name = "renameat2"
+    else:
+        return None
+    try:
+        libc = lib if lib is not None else ctypes.CDLL(None, use_errno=True)
+    except OSError:  # pragma: no cover - the C library is always loadable on these OSes
+        return None
+    fn = getattr(libc, name, None)
+    if fn is None:
+        return None
+    fn.restype = ctypes.c_int
+    if name == "renamex_np":
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        return lambda src, dst: int(fn(src, dst, RENAME_EXCL))
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    return lambda src, dst: int(fn(AT_FDCWD, src, AT_FDCWD, dst, RENAME_NOREPLACE))
+
+
+@functools.cache
+def platform_noreplace_rename() -> NativeRename | None:
+    return resolve_noreplace_rename(sys.platform)
+
+
+def noreplace_rename(src: Path, dst: Path, native: NativeRename | None) -> None:
+    """Atomically rename ``src`` to ``dst`` iff ``dst`` does not exist at that instant
+    (empty directories and files included). ``OSError`` on failure: ``EEXIST`` for a
+    collision; ``ENOSYS`` when no native call is available; otherwise the native errno
+    (``EINVAL``/``ENOTSUP`` for a filesystem without no-replace support). The message is
+    ``strerror`` only — never a path."""
+    if native is None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+    src_b, dst_b = os.fsencode(src), os.fsencode(dst)
+    if b"\0" in src_b or b"\0" in dst_b:  # c_char_p would silently truncate at NUL
+        raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+    ctypes.set_errno(0)
+    if native(src_b, dst_b) != 0:
+        err = ctypes.get_errno() or errno.EIO
+        raise OSError(err, os.strerror(err))
+
+
+class FileOps:
+    """The filesystem operations evidence persistence uses — one seam, so fault-injection
+    tests can fail any single step without patching the global ``os`` module."""
+
+    def mkdir(self, path: Path) -> None:
+        os.mkdir(path, 0o700)
+
+    def chmod(self, path: Path, mode: int) -> None:
+        os.chmod(path, mode)
+
+    def open_new(self, path: Path) -> int:
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+
+    def write(self, fd: int, data: bytes) -> int:
+        return os.write(fd, data)
+
+    def fsync(self, fd: int) -> None:
+        os.fsync(fd)
+
+    def close(self, fd: int) -> None:
+        os.close(fd)
+
+    def lstat(self, path: Path) -> os.stat_result:
+        return os.lstat(path)
+
+    def fsync_dir(self, path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def rename(self, src: Path, dst: Path) -> None:
+        """Atomic **no-replace** publication (renamex_np / renameat2); never os.rename."""
+        noreplace_rename(src, dst, platform_noreplace_rename())
+
+    def rmtree(self, path: Path) -> None:
+        shutil.rmtree(path)  # never follows symlinks
+
+
+def _raw_name(n: int, ex: Exchange) -> str:
+    return f"{n:03d}-{ex.host.split('.')[0]}{ex.path.replace('/', '_')}.json"
+
+
 class EvidenceWriter:
-    """Raw bodies → ``<root>/<run>/raw/`` and ``summary.json`` beside them. Directories
-    0700, files 0600 (``O_EXCL | O_NOFOLLOW``); symlinks and existing destinations are
-    refused; by default the root must be Git-ignored."""
+    """Raw bodies → ``<root>/<run>/raw/`` and ``summary.json`` beside them, published
+    atomically (Step 15B.5D): everything is sanitized in memory, written and fsynced into a
+    private ``<root>/.incomplete-<run>-<random>/`` staging directory, verified, and only
+    then renamed to ``<root>/<run>``. Directories 0700, files 0600 (``O_EXCL |
+    O_NOFOLLOW``); symlinks and existing destinations are refused; by default the root
+    must be Git-ignored. Any filesystem failure is :class:`EvidenceWriteError`
+    (``EVIDENCE_WRITE_FAILED``) and staging is removed where possible."""
 
     def __init__(self, root: Path = EVIDENCE_ROOT, *, run: str | None = None,
-                 require_git_ignored: bool = True) -> None:  # fmt: skip
+                 require_git_ignored: bool = True, fs: FileOps | None = None) -> None:  # fmt: skip
         self.root = root
         self.run = run or datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
         self.require_git_ignored = require_git_ignored
+        self.fs = fs or FileOps()
 
     @property
     def dir(self) -> Path:
         return self.root / self.run
 
-    def _prepare(self) -> Path:
-        if not self.root.is_absolute() or "/" in self.run or self.run in {"", ".", ".."}:
+    def _check(self) -> None:
+        """Refusals that need no write (unchanged codes)."""
+        if (not self.root.is_absolute() or "/" in self.run or self.run in {"", ".", ".."}
+                or self.run.startswith(".")):  # fmt: skip
             raise EvidenceError("EVIDENCE_PATH_INVALID")
         if self.root.is_symlink() or (self.root.exists() and not self.root.is_dir()):
             raise EvidenceError("EVIDENCE_ROOT_NOT_A_DIRECTORY")
         if self.require_git_ignored and not _git_ignored(self.root / "probe"):
             raise EvidenceError("EVIDENCE_ROOT_NOT_GIT_IGNORED")
-        self.root.mkdir(mode=0o700, exist_ok=True)
-        os.chmod(self.root, 0o700)
-        try:
-            os.mkdir(self.dir, 0o700)
-        except FileExistsError:
-            raise EvidenceError("EVIDENCE_DESTINATION_EXISTS") from None
-        os.chmod(self.dir, 0o700)
-        os.mkdir(self.dir / "raw", 0o700)
-        os.chmod(self.dir / "raw", 0o700)
-        if any(stat.S_ISLNK(os.lstat(p).st_mode) for p in (self.root, self.dir, self.dir / "raw")):
-            raise EvidenceError("EVIDENCE_SYMLINK")  # pragma: no cover - checked above
-        return self.dir
+        if os.path.lexists(self.dir):
+            raise EvidenceError("EVIDENCE_DESTINATION_EXISTS")
 
-    @staticmethod
-    def _write(path: Path, text: str) -> None:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(path, 0o600)
+    def _private_dir(self, path: Path) -> None:
+        self.fs.mkdir(path)
+        self.fs.chmod(path, 0o700)
+
+    def _write_file(self, path: Path, data: bytes) -> None:
+        fd = self.fs.open_new(path)
+        try:
+            view = memoryview(data)
+            while view:
+                written = self.fs.write(fd, view.tobytes())
+                if written <= 0:
+                    raise OSError("short write")
+                view = view[written:]
+            self.fs.fsync(fd)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                self.fs.close(fd)
+            raise
+        self.fs.close(fd)
+        self.fs.chmod(path, 0o600)
+
+    def _verify(self, staging: Path, files: list[tuple[Path, bytes]]) -> None:
+        for path, data in files:
+            st = self.fs.lstat(staging / path)
+            if (not stat.S_ISREG(st.st_mode) or st.st_size != len(data)
+                    or stat.S_IMODE(st.st_mode) != 0o600):  # fmt: skip
+                raise OSError("evidence file incomplete")
+        for d in (staging, staging / "raw"):
+            st = self.fs.lstat(d)
+            if not stat.S_ISDIR(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o700:
+                raise OSError("evidence directory not private")
+
+    def _publish(self, files: list[tuple[Path, bytes]]) -> Path:
+        staging: Path | None = None
+        try:
+            if not self.root.exists():
+                self._private_dir(self.root)
+            self.fs.chmod(self.root, 0o700)
+            staging = self.root / f"{STAGING_PREFIX}{self.run}-{token_hex(8)}"
+            self._private_dir(staging)
+            self._private_dir(staging / "raw")
+            for path, data in files:
+                self._write_file(staging / path, data)
+            self.fs.fsync_dir(staging / "raw")
+            self.fs.fsync_dir(staging)
+            self._verify(staging, files)
+            try:
+                self.fs.rename(staging, self.dir)  # the single publication step
+            except OSError as exc:
+                if exc.errno in COLLISION_ERRNOS:
+                    raise EvidenceCollisionError(staging_removed=self._cleanup(staging)) from None
+                raise
+            staging = None
+            self.fs.fsync_dir(self.root)
+        except OSError:
+            raise EvidenceWriteError(staging_removed=self._cleanup(staging)) from None
+        return self.dir / SUMMARY_NAME
+
+    def _cleanup(self, staging: Path | None) -> bool:
+        if staging is None or not os.path.lexists(staging):
+            return True
+        try:
+            self.fs.rmtree(staging)
+        except OSError:
+            return False
+        return not os.path.lexists(staging)
 
     def write(self, exchanges: Iterable[Exchange], summary: Mapping[str, Any],
               forbidden: Iterable[str], *, secrets: Iterable[str] = ()) -> Path:  # fmt: skip
-        """Everything is sanitized and verified first; a :class:`SanitizationError`
-        leaves nothing on disk."""
+        """Everything is sanitized and verified first (a :class:`SanitizationError` leaves
+        nothing on disk), then published atomically (an :class:`EvidenceWriteError`
+        never leaves a directory that looks like a completed run)."""
         items = list(exchanges)
         text = assert_sanitized(summary, list(forbidden))
         identities = identity_values(items, secrets)
-        raw = [(f"{n:03d}-{ex.host.split('.')[0]}{ex.path.replace('/', '_')}.json",
-                sanitize_body(ex, identities)) for n, ex in enumerate(items)]  # fmt: skip
-        target = self._prepare()
-        for name, body in raw:
-            self._write(target / "raw" / name, body)
-        self._write(target / "summary.json", text)
-        return target / "summary.json"
+        files = [(Path("raw") / _raw_name(n, ex), sanitize_body(ex, identities).encode())
+                 for n, ex in enumerate(items)]  # fmt: skip
+        files.append((Path(SUMMARY_NAME), text.encode()))
+        self._check()
+        return self._publish(files)
