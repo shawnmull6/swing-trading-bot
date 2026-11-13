@@ -95,6 +95,12 @@ LAST_RECONCILIATION_RUN: Final = "reconciliation.last_run_id"
 RECON_ACTOR: Final = "reconciler"
 
 
+class HeadCheck(StrEnum):
+    STABLE = "STABLE"
+    CHANGED = "CHANGED"
+    READ_FAILED = "READ_FAILED"
+
+
 class Severity(StrEnum):
     MISMATCH = "MISMATCH"
     INCONCLUSIVE = "INCONCLUSIVE"
@@ -209,6 +215,7 @@ class Observation:
     inception_at: datetime | None = None
     windows: list[_Window] = field(default_factory=list)
     head_stable: bool = False
+    head_check: str = ""
     ingest: list[SyncReport] = field(default_factory=list)
     read_failures: list[Finding] = field(default_factory=list)
 
@@ -292,9 +299,27 @@ class Reconciler:
             self._read_broker(baseline, obs)
             self._adopt_from_list(obs, now)
             self._pf.resolve_settlements(now=now)
-            if self._head_stable(now):
+            result, error = self._head_check(now)
+            obs.head_check = result.value
+            if result is HeadCheck.STABLE:
                 obs.head_stable = True
                 break
+            if result is HeadCheck.READ_FAILED:
+                # Step 15A.1 (O2): a failed head read cannot prove stability, and repeating
+                # the whole observation (full-history re-scan included) would multiply
+                # requests exactly when the broker is rate-limiting or failing. Stop here:
+                # the run is INCONCLUSIVE; nothing below treats it as complete.
+                obs.read_failures.append(
+                    finding(
+                        Category.RETRIEVAL,
+                        "READ_FAILED",
+                        Severity.INCONCLUSIVE,
+                        "activity head re-check",
+                        error=error,
+                    )
+                )
+                break
+            # HeadCheck.CHANGED: new activity appeared; repeat (bounded, unchanged policy).
         return obs
 
     def _rescans(
@@ -426,8 +451,9 @@ class Reconciler:
                     source=EventSource.RECOVERY,
                 )
 
-    def _head_stable(self, now: datetime) -> bool:
-        """Re-read the activity head; True when nothing new has been posted."""
+    def _head_check(self, now: datetime) -> tuple[HeadCheck, str | None]:
+        """Re-read the activity head: STABLE (nothing new), CHANGED (new activity was
+        posted during the observation) or READ_FAILED (the head could not be read)."""
         after = now - self._config.oms.activity_overlap
         try:
             head = collect_window(
@@ -437,8 +463,10 @@ class Reconciler:
                 now=now,
                 posting_lag=self._config.rescan.posting_lag,
             )
-        except BrokerError:
-            return False
+        except BrokerError as exc:
+            return HeadCheck.READ_FAILED, type(exc).__name__
+        if not head.tail_confirmed:  # pragma: no cover - collect_window raises instead
+            return HeadCheck.READ_FAILED, "tail not confirmed"
         with self._db.read() as s:
             new = [
                 a
@@ -448,7 +476,7 @@ class Reconciler:
                 )
                 is None
             ]
-        return head.tail_confirmed and not new
+        return (HeadCheck.CHANGED if new else HeadCheck.STABLE), None
 
     # =============================================================== judge
     def _judge(
@@ -940,6 +968,7 @@ class Reconciler:
             "observed_at": obs.at.isoformat(),
             "attempts": obs.attempts,
             "head_stable": obs.head_stable,
+            "head_check": obs.head_check,
             "baseline": None
             if baseline is None
             else {

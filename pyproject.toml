@@ -91,6 +91,7 @@ xfail_strict = true
 filterwarnings = ["error"]
 markers = [
     "alpaca_paper: read-only contract tests against the Alpaca paper API (opt-in via RUN_ALPACA_PAPER_TESTS=1)",
+    "perf: opt-in benchmarks (RUN_PERF=1); results reported, never enforced",
 ]
 
 [tool.coverage.run]

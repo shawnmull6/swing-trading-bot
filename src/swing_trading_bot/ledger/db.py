@@ -256,6 +256,7 @@ class Database:
         _refuse_unsupported_mode(mode)
         if not path.is_file():
             raise DatabaseNotFoundError(f"database not found: {path}")
+        require_sqlite_header(path)
         conn = _connect(path, busy_timeout_ms)
         try:
             app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
@@ -407,6 +408,22 @@ class Database:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+SQLITE_HEADER: Final = b"SQLite format 3\x00"
+
+
+def require_sqlite_header(path: Path) -> None:
+    """Refuse a file that is not already a SQLite database **before** connecting: SQLite
+    would otherwise initialise an empty file (``PRAGMA journal_mode = WAL`` writes a
+    header), so even a refused open would modify it."""
+    try:
+        with path.open("rb") as f:
+            header = f.read(len(SQLITE_HEADER))
+    except OSError as exc:
+        raise DatabaseNotFoundError(f"cannot read {path}: {exc.strerror}") from None
+    if header != SQLITE_HEADER:
+        raise DatabaseCorruptError(f"{path} is not a SQLite database (empty or garbage file)")
 
 
 def _stored_mode(conn: sqlite3.Connection) -> RuntimeMode | None:

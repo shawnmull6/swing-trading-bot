@@ -32,10 +32,11 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 
 _SCRUBBED_PREFIXES = ("ALPACA_", "APCA_")
 _SCRUBBED_NAMES = frozenset(
-    {"TRADING_MODE", "TRADING_ENABLED", "INITIAL_CAPITAL", "MAX_CAPITAL_ALLOCATION"}
+    {"TRADING_MODE", "TRADING_ENABLED", "INITIAL_CAPITAL", "MAX_CAPITAL_ALLOCATION", "STB_ENV_FILE"}
 )
 
 CONTRACT_TESTS_ENABLED = os.environ.get("RUN_ALPACA_PAPER_TESTS") == "1"
+PERF_TESTS_ENABLED = os.environ.get("RUN_PERF") == "1"
 
 
 class NetworkAccessBlockedError(RuntimeError):
@@ -51,12 +52,13 @@ def _blocked(*_args: Any, **_kwargs: Any) -> NoReturn:
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     del config
-    if CONTRACT_TESTS_ENABLED:
-        return
-    skip = pytest.mark.skip(reason="contract test: set RUN_ALPACA_PAPER_TESTS=1 to run")
+    skip_contract = pytest.mark.skip(reason="contract test: set RUN_ALPACA_PAPER_TESTS=1 to run")
+    skip_perf = pytest.mark.skip(reason="benchmark: set RUN_PERF=1 to run")
     for item in items:
-        if "alpaca_paper" in item.keywords:
-            item.add_marker(skip)
+        if "alpaca_paper" in item.keywords and not CONTRACT_TESTS_ENABLED:
+            item.add_marker(skip_contract)
+        if "perf" in item.keywords and not PERF_TESTS_ENABLED:
+            item.add_marker(skip_perf)
 
 
 PRODUCTION_DATA_DIR = (Path(__file__).resolve().parents[1] / "data").resolve()
@@ -91,7 +93,9 @@ def _protect_production_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _scrub_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def _scrub_environment(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if request.node.get_closest_marker("alpaca_paper") is not None and CONTRACT_TESTS_ENABLED:
+        return  # an operator-authorized live run selects its credential source explicitly
     for name in list(os.environ):
         if name.startswith(_SCRUBBED_PREFIXES) or name in _SCRUBBED_NAMES:
             monkeypatch.delenv(name, raising=False)

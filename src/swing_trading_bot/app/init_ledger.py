@@ -34,6 +34,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from swing_trading_bot.app.broker_factory import account_identity_problems
 from swing_trading_bot.app.config import (
     ACTIVITY_POSTING_LAG,
     CALENDAR_FETCH_AHEAD,
@@ -175,12 +176,7 @@ def gather_evidence(broker: ObserveBroker, now: datetime) -> InitEvidence:
     ev.activity_tail_confirmed = window.tail_confirmed
     ev.last_activity_id = window.activities[-1].activity_id if window.activities else None
     a, p = ev.account, ev.problems
-    if a.environment != "paper":
-        p.append(f"broker environment is {a.environment!r}, not 'paper'")
-    if not a.account_id.strip():
-        p.append("broker account id is blank")
-    if a.currency != "USD":
-        p.append(f"account currency {a.currency} is not supported")
+    p.extend(account_identity_problems(a, environment="paper"))
     if a.account_blocked or a.trading_blocked:
         p.append("broker account is restricted (account_blocked / trading_blocked)")
     if a.accrued_fees != ZERO or a.pending_reg_taf_fees != ZERO:

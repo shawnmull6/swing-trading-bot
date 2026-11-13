@@ -73,6 +73,9 @@ COMMAND_SAFETY: Final = (
                   _INSPECT),
     CommandSafety("audit", Broker.NONE, LedgerWrites.NONE, Recovery.NO, Halts.NONE, "none", _SH,
                   _INSPECT),
+    CommandSafety("broker-check", Broker.READ_ONLY, LedgerWrites.NONE, Recovery.NO, Halts.NONE,
+                  "none", None, "load credentials → GET account, config, clock → identity "
+                  "checks (no ledger, no balances)"),
     CommandSafety("init-ledger", Broker.READ_ONLY, LedgerWrites.CREATE, Recovery.NO,
                   Halts.CREATES_INITIALIZED,
                   "--confirm-path, --confirm-account, --confirm-environment must match", _EX,
@@ -84,6 +87,8 @@ COMMAND_SAFETY: Final = (
                   "→ reopen"),
     CommandSafety("backup", Broker.NONE, LedgerWrites.NEW_FILE, Recovery.NO, Halts.NONE,
                   "PATH must not exist", _SH, "open (no migration) → online backup → verify"),
+    CommandSafety("verify-ledger", Broker.NONE, LedgerWrites.NONE, Recovery.NO, Halts.NONE,
+                  "none", _SH, "detect mode → history + integrity → read-only invariants"),
     CommandSafety("sync", Broker.READ_ONLY, LedgerWrites.OPERATIONAL, Recovery.YES,
                   Halts.MAY_CREATE,
                   "none", _EX, "preflight → calendar → recovery lookups → sync → escalate "

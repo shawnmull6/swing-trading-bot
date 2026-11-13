@@ -1,9 +1,10 @@
 # Swing Trading Bot — Architecture
 
 Status: **Revision 3 — architecture approved; all decisions (D1–D15, U1–U9) final.
-M1 steps 1–13.2 implemented; step 14 (runtime & CLI, §12.20) approved;
-step 14.1 (broker-outage breaker, §12.21) implemented and awaiting review; step 15 not
-started.** Decision log: `docs/M1_PLAN.md` §2.
+M1 steps 1–13.2 implemented; steps 14 and 14.1 approved (§12.20,
+§12.21); step 15 phase A accepted (§12.22); step 15A.1 (live-run harness hardening and
+reconciliation retry safety, §12.23) implemented and awaiting review; the live read-only
+contract run (phase B) has not been performed.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -30,7 +31,7 @@ Scope: the core infrastructure delivered in Milestone M1 and the seams later mil
 
 ---
 
-## 2. Repository state (inspected 2026-11-09)
+## 2. Repository state (inspected 2026-11-09; historical — see §12 for the as-built system)
 
 | Item | State |
 |---|---|
@@ -38,7 +39,7 @@ Scope: the core infrastructure delivered in Milestone M1 and the seams later mil
 | Runtime deps | `alpaca-py 0.45.0`, numpy, pandas, pydantic 2, python-dotenv, pyyaml |
 | Dev deps | pytest, pytest-cov, mypy, ruff (+ `hypothesis` approved, D13) |
 | Package | `src/swing_trading_bot/__init__.py` — hello-world `main()` |
-| Scripts | `scripts/check_connection.py` — read-only account check |
+| Scripts | `scripts/check_connection.py` — read-only account check (removed in step 15; replaced by `broker-check`) |
 | Config | `.env` (gitignored): `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `TRADING_MODE`, `TRADING_ENABLED`, `INITIAL_CAPITAL`, `MAX_CAPITAL_ALLOCATION` |
 | Tests / config / data | empty `tests/unit`, `tests/integration`, `config/`, `data/` (gitignored) |
 | Operator item | `alpaca.txt` at repo root (gitignored, not read) — operator cleaning up (D15) |
@@ -48,7 +49,7 @@ Scope: the core infrastructure delivered in Milestone M1 and the seams later mil
 ## 3. Verified Alpaca / alpaca-py behavior (source inspection of alpaca-py 0.45.0)
 
 These facts come from reading the installed SDK, not from live calls. Items marked
-**CT** still require a contract test against the paper API (M1_PLAN §6.3).
+**CT** still require a contract test against the paper API (M1_PLAN §5.3; matrix in §12.22).
 
 | # | Finding | Design consequence |
 |---|---|---|
@@ -108,6 +109,8 @@ only.
 ## 5. Broker ports and execution modes
 
 ### 5.1 Two ports instead of one
+
+*Sketch; the authoritative signatures are in `broker/ports.py` (§12.9–12.10).*
 
 ```python
 class BrokerReadPort(Protocol):
@@ -378,6 +381,9 @@ Every run is stored with a JSON diff in `reconciliation_runs`.
 
 ### 8.4 Account-activity pagination and cursor
 
+*Superseded in part: ingestion uses overlapping time windows, `activities.complete_through`
+and re-scan policies rather than a stored cursor (§12.10–12.13, §12.17, §12.19).*
+
 Endpoint: `GET /v2/account/activities` (V3), called with `direction=asc`,
 `page_size=100`, and `page_token` = id of the last activity already processed. Alpaca
 activity ids are documented as time-ordered strings (`<timestamp>::<uuid>`); this
@@ -471,7 +477,7 @@ decision and needs its own contract tests.
 ## 10. Restart, duplicates, ambiguity, API failures
 
 ### 10.1 Startup sequence
-1. Exclusive file lock `data/bot.lock`; a second instance exits.
+1. Exclusive OS lock on `<ledger>.lock` (one per ledger, §12.20); a second instance exits.
 2. Open DB, migrate, verify the ledger mode, run invariants (violation → persistent halt).
 3. Startup gate set.
 4. Preflight (read-only): account status, `trading_blocked`/`account_blocked`, account
@@ -521,8 +527,8 @@ filled then canceled order leaves exactly the broker-reported qty.
 ### 10.5 Brokerage API failures
 | Failure | Behavior |
 |---|---|
-| Read timeout / 429 / 5xx | bounded backoff with jitter, aware of the SDK's own 3×3 s retries (V2) |
-| Repeated failures → circuit open | transient block; escalate to persistent halt after a configurable outage duration |
+| Read timeout / 429 / 5xx | bounded exponential backoff (no jitter), honouring `Retry-After`; the SDK's retry loop is never used (§12.10) |
+| Repeated failures → circuit open | transient block `BROKER_OUTAGE_ACTIVE`; ≥ 3 failed cycles ≥ 60 s apart over ≥ 30 min → `BROKER_OUTAGE` (§12.21) |
 | Submit timeout / drop / 5xx / 504 | `SUBMIT_AMBIGUOUS` → §10.3 |
 | Definitive 4xx rejection | `REJECTED`, release reservation |
 | Duplicate client id response | treated as "order exists" → lookup → adopt; never as rejection |
@@ -601,6 +607,8 @@ writes `BEGIN IMMEDIATE`. `data/ledger.sqlite3`; simulation ledgers under `data/
 `cli backup` uses the online backup API.
 
 ### 12.2 Schema (migration `0001_init.sql`, sketch)
+
+*Sketch only; the migrations 0001–0007 are authoritative (§12.5 onwards).*
 
 ```sql
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -2228,13 +2236,141 @@ of 0 (correction to §12.20 ¶7).
 3. `BROKER_OUTAGE_ACTIVE` does not block risk-reducing exits by itself (live broker
    failures already do, via `EXIT_BLOCKING`); exits do not exist in M1.
 
+### 12.22 Step 15 Phase A: read-only connectivity, contract suite and hardening (as built)
+
+Offline only: no Alpaca request, no real credentials and no real ledger were touched.
+**No schema change.**
+
+**1. Credential loading** (`app/credentials.py`; D15-1, D15-2). Exactly one source:
+process environment (`ALPACA_*`, `TRADING_*`, capital settings) **or** `STB_ENV_FILE`
+(absolute path). Both present → refused; neither → refused; no `.env` discovery. A file
+must be a regular file (not a symlink), owned by the current user, without group/other
+permission bits, not tracked by Git (`git ls-files --error-unmatch`), and contain only the
+known names. Values stay `SecretStr`; errors name variables, never values. Loading is lazy
+— only a broker-backed command loads credentials — and the loaded secret values are
+registered with every active log redactor (`observability.logging.register_secrets`) and
+redacted from CLI output. Nothing credential-related is written to the ledger.
+
+**2. Production broker factory** (`app/broker_factory.py`, `commands.production_dependencies`
+is now the CLI default). It constructs only `AlpacaPaperReadAdapter` over
+`AlpacaReadTransport`. Transport hardening (`broker/alpaca_http.py`):
+* `ALLOWED_ORIGINS` — exactly `https://paper-api.alpaca.markets` and
+  `https://data.alpaca.markets`; `verify_allowlist()` refuses to start if the SDK's base
+  URLs ever differ, and the SDK's live host can never be listed;
+* `session.trust_env = False` (no environment proxies, CA overrides or `.netrc`);
+* redirects are not followed and a response from another host is refused;
+* the transport's only public method is `get_json` (HTTP GET); no SDK `TradingClient`.
+
+**What proves paper mode:** the transport can reach only the paper host, so any
+authenticated response is from a paper account. The `PA` account-number prefix is reported
+by contract checks but never used as proof. **Strict identity**
+(`account_identity_problems`): canonical lowercase UUID account id, status `ACTIVE`,
+currency USD, expected environment label. `init-ledger` refuses on any problem; the runtime
+preflight treats one as an identity failure (persistent `RECON_ACCOUNT` before any
+ingestion), in addition to the recorded-identity match. Structural tests (AST: no
+`TradingClient`, no `alpaca.trading` import, no write-verb call in `broker/`; the factory
+constructs exactly the two read classes; the transport exposes only `get_json`) and
+runtime tests (every request is HTTPS GET to an allowlisted host; a redirect to the live
+host is refused; `SimulationExecution` refuses the read adapter).
+
+**3. New commands.** `broker-check` — ledger-free, no lock, GET-only: environment, masked
+account id, status, restrictions, U6 protections, market open; never balances; exit 3 on
+uncertain identity (replaces `scripts/check_connection.py`, removed; D15-4).
+`verify-ledger PATH` — read-only verification of the live ledger or a backup (mode
+detection, migration history, full `integrity_check`, accounting invariants, halt state,
+masked identity); shared lock; never migrates (D15-8).
+
+**4. Fault-injection findings fixed.**
+* *An empty file at the ledger path was modified by a refused open*: `PRAGMA
+  journal_mode = WAL` initialises an empty file. Every open, migration, mode detection,
+  backup and verification now checks the 16-byte SQLite header first
+  (`db.require_sqlite_header`; a bad header is `DatabaseCorruptError`, matching the
+  existing contract) and never connects to a non-database file.
+* *Unreadable outage state* (`sync_state['broker.outage']`) now fails closed with a
+  `PersistenceError` (exit 9) instead of an unhandled decode error.
+
+**5. Contract suite** (`tests/contract/`). `checks.py` holds nine read-only checks shared
+by the offline replay (`test_contract_replay.py`, always runs, synthetic payloads labelled
+as such) and the opt-in live module (`test_alpaca_paper_read.py`, skipped; not run).
+The GET-only spy is now the budgeted session of §12.23. Live runs write raw
+responses only to the Git-ignored `contract-evidence/<run>/raw/` and a sanitized
+`summary.json` (booleans/enumerations only) that is checked against the account id, account
+number, balances and secrets before it is written; nothing is committed without approval.
+`matrix.py` separates what is verified offline, what needs a real read-only response, and
+what needs paper orders (rows C1–C13; reproduced in M1_PLAN §5.3).
+
+**6. Performance** (`tests/perf/`, opt-in `RUN_PERF=1`; results in `docs/PERFORMANCE.md`):
+the full-ledger fingerprint meets 250 ms at one year of 10-minute reconciliations (160 ms)
+but not at two (319 ms); the full-history re-scan exceeds half of an assumed 200/min rate
+limit above ≈ 6,000 activities. No optimisation was implemented (D15-9).
+
+**7. Deviations.** Identity validation requires a canonical UUID account id (Alpaca
+documents account ids as UUIDs; to be confirmed by the live run, C1). `verify-ledger` may
+create `<path>.lock` beside the verified file. `broker-check` takes no ledger lock.
+
+### 12.23 Step 15A.1: live-run harness hardening and reconciliation retry safety (as built)
+
+Offline only; no Alpaca request was made. **No schema change.** Supersedes the `spy.py`
+description in §12.22 ¶5.
+
+**O2 — head re-check failures no longer repeat the observation** (`oms/reconciler.py`).
+The §8.3 head re-check now has three results (`HeadCheck`): `STABLE` (done), `CHANGED`
+(new activity appeared → the existing bounded repeat, `max_snapshot_retries` = 3,
+unchanged) and `READ_FAILED` (the head could not be read). On `READ_FAILED` the observation
+stops: an INCONCLUSIVE `READ_FAILED` finding (subject "activity head re-check") is added
+next to `ACTIVITY_HEAD_UNSTABLE`, the run is INCONCLUSIVE (never CLEAN), and the evidence
+records `attempts` and `head_check`. Nothing else changed: ingestion stays idempotent,
+completeness markers advance only from complete forward windows, late/back-dated/conflicting
+activity detection is unchanged, the repeated-INCONCLUSIVE halt still applies, and the
+outage breaker keeps its approved sync-cycle scope. Before this change a failed head read
+repeated the whole observation — full-history re-scan included — up to three times.
+
+**Supervised live run** (`tests/contract/live_run.py`, `supervisor.py`, `outcomes.py`;
+`python -m tests.contract.live_run`, guarded by `RUN_ALPACA_PAPER_TESTS=1`; the pytest
+module `test_alpaca_paper_read.py` is a thin wrapper):
+* **R1 budgets.** One `RequestBudget` for the whole run — setup (the real CLI
+  `broker-check` through the same session) and every contract check: at most 120 actual
+  HTTP attempts (counted *before* sending, retries included) and 300 s on a monotonic clock.
+  Each request's connect/read timeouts are cut to the remaining time; retry backoff uses a
+  bounded sleep that refuses to sleep past the deadline. Exhaustion raises a
+  `BaseException` (`BudgetExhausted`) that the code under test cannot swallow; once
+  exhausted nothing more is sent; unrun checks are `NOT_RUN` → rows INCONCLUSIVE; a partial
+  sanitized summary is still written.
+* **R2 rate-limit evidence.** Only `X-RateLimit-Limit`, `-Remaining`, `-Reset` and
+  `Retry-After` are kept from responses. Per host: `OBSERVED` only when every response
+  carried all three X-RateLimit headers as integers, one consistent limit and
+  `remaining ≤ limit`; otherwise `UNVERIFIED` (`HEADERS_MISSING`, `HEADERS_MALFORMED`,
+  `LIMIT_INCONSISTENT`). No limit is ever assumed.
+* **R3 sanitized failures.** Checks contain no `assert`; they raise `ContractViolation` or
+  `InsufficientEvidence` with fixed codes. `run_check` maps every exception class to a fixed
+  code and discards its message and traceback; pytest assertion rewriting is disabled for
+  the live modules and the verdict uses `pytest.fail(..., pytrace=False)` with codes only.
+* **R4 outcomes.** Each of C1–C13 is VERIFIED (check passed *and* the real response
+  exercised the row), INCONCLUSIVE (broker error, insufficient evidence, not run, or not
+  exercisable on a flat account — e.g. C5, C7 with ≤ 10 activities, C9 without positions or
+  orders), FAILED (observed contradiction, including a payload that breaks the parsing
+  contract or a non-404 unknown-id lookup) or DEFERRED (C10–C13). Execution status
+  (`COMPLETED` / `STOPPED` + fixed stop code) is reported separately. The run stops on
+  authentication failure, persisting rate limiting, invalid identity, a write attempt or a
+  non-allowlisted destination, or budget/deadline exhaustion.
+* **R5 evidence.** `contract-evidence/` must be Git-ignored (checked with
+  `git check-ignore`); directories 0700, files 0600 created `O_EXCL | O_NOFOLLOW`; symlinked
+  roots, existing run directories and path traversal are refused. The sanitized summary is
+  checked against every secret and every identifier, account number, balance, position and
+  order/activity id seen in the raw bodies before anything is written.
+* **R6 redaction.** The redacting logger is installed before credentials are loaded; the
+  loaded values are registered with it and redacted from raw bodies, summaries and output.
+
 ---
 
 ## 13. Configuration & secrets
 * `Settings`: credentials as `SecretStr`; `TRADING_MODE: Literal["paper"]`;
   `TRADING_ENABLED: bool = False`; `INITIAL_CAPITAL = 5000`;
-  `MAX_CAPITAL_ALLOCATION = 5000`. Env values are read only by `init-ledger`; afterwards
-  the ledger's stored values are authoritative and drift is reported.
+  `MAX_CAPITAL_ALLOCATION = 5000`. After `init-ledger` the ledger's stored capital values
+  are authoritative. *As built:* credentials come only from an explicitly selected source
+  (environment **or** `STB_ENV_FILE`; §12.22); the CLI does not read `TRADING_ENABLED` or
+  capital settings in observe mode (capital uses the D8 constant), and env-drift
+  reporting is not implemented.
 * `config/risk.yaml` (limits in §11), `config/operating_policy.yaml` (§6.3).
 * Logging filter redacts loaded secret values and `*KEY*`/`*SECRET*` fields; tests
   assert no secret appears in captured logs.

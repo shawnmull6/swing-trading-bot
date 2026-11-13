@@ -72,9 +72,13 @@ def test_operational_commands_follow_their_documented_effects(e: CliEnv) -> None
 def test_safety_matrix_covers_every_command() -> None:
     commands = {c.command for c in COMMAND_SAFETY}
     assert commands >= INSPECTION_COMMANDS
-    assert all(c.lock is not None for c in COMMAND_SAFETY)
+    # Only the ledger-free broker-check takes no lock: it never opens a ledger.
+    assert [c.command for c in COMMAND_SAFETY if c.lock is None] == ["broker-check"]
     for c in COMMAND_SAFETY:
-        if c.command in INSPECTION_COMMANDS | {"status --broker", "backup"}:
+        if c.command == "broker-check":
+            assert c.ledger_writes.value == "none"
+            continue
+        if c.command in INSPECTION_COMMANDS | {"status --broker", "backup", "verify-ledger"}:
             assert c.lock is not None and c.lock.value == "shared"
         else:
             assert c.lock is not None and c.lock.value == "exclusive"
@@ -118,11 +122,17 @@ def test_simulation_module_is_imported_lazily_only_by_simulate() -> None:
         assert "swing_trading_bot.app.simulation" not in imported, path.name
 
 
-def test_app_never_loads_credentials_or_env_files() -> None:
+CREDENTIAL_OWNERS = {"dotenv": {"credentials.py"}, "os.environ": {"broker_factory.py"}}
+
+
+def test_credentials_are_loaded_only_by_the_explicit_loader() -> None:
     for path in APP.glob("*.py"):
         text = path.read_text()
-        for needle in ("load_settings", "dotenv", '".env"', "from_settings", "os.environ"):
+        for needle in ("load_settings", '".env"', "'.env'", "from_settings", "find_dotenv"):
             assert needle not in text, f"{path.name} uses {needle}"
+        for needle, owners in CREDENTIAL_OWNERS.items():
+            if needle in text:
+                assert path.name in owners, f"{path.name} uses {needle}"
 
 
 # ============================================================ simulation isolation

@@ -20,7 +20,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from swing_trading_bot.ledger.db import APPLICATION_ID
+from swing_trading_bot.ledger.db import APPLICATION_ID, require_sqlite_header
 from swing_trading_bot.ledger.errors import PersistenceError
 
 
@@ -108,6 +108,10 @@ def _fsync(path: Path) -> None:
 
 def verify_backup(destination: Path, *, digest: str, schema_version: int) -> None:
     try:
+        require_sqlite_header(destination)
+    except PersistenceError as exc:
+        raise BackupVerificationError(f"backup {destination}: {exc}") from None
+    try:
         conn = _open_readonly(destination)
     except sqlite3.Error as exc:
         raise BackupVerificationError(f"backup {destination} cannot be opened: {exc}") from None
@@ -137,6 +141,7 @@ def backup_database(source: Path, destination: Path) -> BackupReport:
     destination = destination.absolute()
     if not source.is_file():
         raise BackupError(f"source ledger not found: {source}")
+    require_sqlite_header(source)
     if destination.exists() or destination.is_symlink():
         raise BackupError(f"backup destination already exists: {destination}")
     if not destination.parent.is_dir():

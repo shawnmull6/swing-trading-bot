@@ -31,6 +31,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
+from swing_trading_bot.app.broker_factory import account_identity_problems
 from swing_trading_bot.app.config import (
     CALENDAR_FETCH_AHEAD,
     CALENDAR_FETCH_BACK,
@@ -94,7 +95,7 @@ from swing_trading_bot.oms.recovery import (
     recover_after_restart,
 )
 from swing_trading_bot.oms.sync import OrderSync, SyncReport, SyncStatus
-from swing_trading_bot.risk.gates import GateStatus, TradingGates
+from swing_trading_bot.risk.gates import EXPECTED_ENVIRONMENT, GateStatus, TradingGates
 
 _log = logging.getLogger(__name__)
 RUNTIME_ACTOR = "runtime"
@@ -325,6 +326,13 @@ def preflight(rt: Runtime) -> PreflightReport:
         report.identity_problem = "broker identity was never recorded (ledger not initialized)"
         return report
     account = report.account
+    uncertain = account_identity_problems(account, environment=EXPECTED_ENVIRONMENT[rt.mode])
+    if uncertain:
+        report.identity_problem = "connected account identity is uncertain: " + "; ".join(uncertain)
+        report.identity_mismatch = True
+        if halt_once(rt.db, HaltReason.RECON_ACCOUNT, report.identity_problem, at=now):
+            report.halted = HaltReason.RECON_ACCOUNT
+        return report
     if account.account_id != recorded_id or account.environment != recorded_env:
         report.identity_problem = (
             f"connected account {account.account_id}/{account.environment} differs from the "

@@ -52,6 +52,12 @@ BASE_URLS: Final[Mapping[Service, str]] = {
     "trading": BaseURL.TRADING_PAPER.value,
     "data": BaseURL.DATA.value,
 }
+ALLOWED_ORIGINS: Final[Mapping[Service, str]] = {
+    "trading": "https://paper-api.alpaca.markets",
+    "data": "https://data.alpaca.markets",
+}
+"""The exact, HTTPS-only hosts this transport may contact. The SDK's live trading URL is
+never among them; a change in the SDK constants is refused rather than followed."""
 CONNECT_TIMEOUT_S: Final = 5
 READ_TIMEOUT_S: Final = 20
 _MAX_ERROR_TEXT: Final = 300
@@ -59,6 +65,15 @@ _MAX_ERROR_TEXT: Final = 300
 
 class ReadOnlyHttp(Protocol):
     def get_json(self, service: Service, path: str, params: Mapping[str, str]) -> object: ...
+
+
+def verify_allowlist() -> None:
+    """Refuse to run if the SDK's base URLs no longer equal the HTTPS allowlist."""
+    for service, origin in ALLOWED_ORIGINS.items():
+        if not origin.startswith("https://") or BASE_URLS[service] != origin:
+            raise ValueError(f"Alpaca {service} base URL is not the allowlisted paper origin")
+    if any(o == BaseURL.TRADING_LIVE.value for o in ALLOWED_ORIGINS.values()):
+        raise ValueError("the live trading host must never be allowlisted")
 
 
 def _check_path(path: str) -> None:
@@ -116,6 +131,7 @@ class AlpacaReadTransport:
     ) -> None:
         if settings.trading_mode != "paper":  # pragma: no cover - Settings enforces it
             raise ValueError("Alpaca transport is paper-only")
+        verify_allowlist()
         api_key, secret = settings.secret_values()
         # Header construction from the SDK; the client object is not kept.
         self._headers: dict[str, str] = dict(
@@ -125,6 +141,8 @@ class AlpacaReadTransport:
             )._get_default_headers()
         )  # fmt: skip
         self._session = session if session is not None else requests.Session()
+        # Never pick up proxies, CA bundles or .netrc credentials from the environment.
+        self._session.trust_env = False
         self._timeout = (connect_timeout_s, read_timeout_s)
 
     def __repr__(self) -> str:
@@ -132,7 +150,7 @@ class AlpacaReadTransport:
 
     def get_json(self, service: Service, path: str, params: Mapping[str, str]) -> object:
         _check_path(path)
-        base = BASE_URLS[service]
+        base = ALLOWED_ORIGINS[service]
         url = f"{base}/{API_VERSION}{path}"
         context = f"GET {service}{path}"
         try:
@@ -149,6 +167,9 @@ class AlpacaReadTransport:
             raise ServiceUnavailableError(
                 f"{context}: {type(exc).__name__}", kind="network"
             ) from None
+        final = getattr(response, "url", None)
+        if final and not str(final).startswith(base + "/"):
+            raise InvalidBrokerDataError(f"{context}: response came from an unexpected host")
         raise_for_status(response, context)
         return decode_json(response.text)
 

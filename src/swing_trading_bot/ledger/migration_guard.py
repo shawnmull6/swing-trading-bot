@@ -35,6 +35,7 @@ from swing_trading_bot.ledger.db import (
     _connect,
     _stored_mode,
     _verify_physical_integrity,
+    require_sqlite_header,
 )
 from swing_trading_bot.ledger.errors import (
     DatabaseNotFoundError,
@@ -84,6 +85,7 @@ class MigrationReport:
 def _open_checked(path: Path, mode: RuntimeMode) -> sqlite3.Connection:
     if not path.is_file():
         raise DatabaseNotFoundError(f"database not found: {path}")
+    require_sqlite_header(path)
     conn = _connect(path, DEFAULT_BUSY_TIMEOUT_MS)
     try:
         app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
@@ -106,6 +108,26 @@ def _open_checked(path: Path, mode: RuntimeMode) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def detect_mode(path: Path) -> RuntimeMode:
+    """The mode recorded in an existing ledger file (read-only identity check)."""
+    if not path.is_file():
+        raise DatabaseNotFoundError(f"database not found: {path}")
+    require_sqlite_header(path)
+    conn = _connect(path, DEFAULT_BUSY_TIMEOUT_MS)
+    try:
+        app_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
+        if app_id != APPLICATION_ID:
+            raise ForeignDatabaseError(f"{path} is not a ledger of this application")
+        mode = _stored_mode(conn)
+    except sqlite3.Error as exc:
+        raise wrap_sqlite_error(exc, "open") from None
+    finally:
+        conn.close()
+    if mode is None:
+        raise IncompleteDatabaseError(f"{path} has no database identity")
+    return mode
 
 
 def plan_migration(path: Path, mode: RuntimeMode, migrations: Sequence[Migration]) -> MigrationPlan:

@@ -1,0 +1,211 @@
+{
+ "_notice": "SYNTHETIC test data written by hand for offline replay. NOT real Alpaca evidence.",
+ "activities": [
+  {
+   "_posted_hours_ago": 700,
+   "activity_type": "INT",
+   "date": "2026-10-10",
+   "net_amount": "0.42",
+   "description": "INT",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 672,
+   "activity_type": "CSD",
+   "date": "2026-10-11",
+   "net_amount": "100.00",
+   "description": "CSD",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 644,
+   "activity_type": "JNLC",
+   "date": "2026-10-12",
+   "net_amount": "-5.00",
+   "description": "JNLC",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 616,
+   "activity_type": "FEE",
+   "date": "2026-10-13",
+   "net_amount": "-0.01",
+   "description": "FEE",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 588,
+   "activity_type": "DIV",
+   "date": "2026-10-14",
+   "net_amount": "1.23",
+   "description": "DIV",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 560,
+   "activity_type": "CSW",
+   "date": "2026-10-15",
+   "net_amount": "-20.00",
+   "description": "CSW",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 532,
+   "activity_type": "INT",
+   "date": "2026-10-16",
+   "net_amount": "0.42",
+   "description": "INT",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 504,
+   "activity_type": "CSD",
+   "date": "2026-10-17",
+   "net_amount": "100.00",
+   "description": "CSD",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 476,
+   "activity_type": "JNLC",
+   "date": "2026-10-18",
+   "net_amount": "-5.00",
+   "description": "JNLC",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 448,
+   "activity_type": "FEE",
+   "date": "2026-10-19",
+   "net_amount": "-0.01",
+   "description": "FEE",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 420,
+   "activity_type": "DIV",
+   "date": "2026-10-20",
+   "net_amount": "1.23",
+   "description": "DIV",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 392,
+   "activity_type": "CSW",
+   "date": "2026-10-21",
+   "net_amount": "-20.00",
+   "description": "CSW",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 364,
+   "activity_type": "INT",
+   "date": "2026-10-22",
+   "net_amount": "0.42",
+   "description": "INT",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 336,
+   "activity_type": "CSD",
+   "date": "2026-10-23",
+   "net_amount": "100.00",
+   "description": "CSD",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 308,
+   "activity_type": "JNLC",
+   "date": "2026-10-24",
+   "net_amount": "-5.00",
+   "description": "JNLC",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 280,
+   "activity_type": "FEE",
+   "date": "2026-10-25",
+   "net_amount": "-0.01",
+   "description": "FEE",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 252,
+   "activity_type": "DIV",
+   "date": "2026-10-26",
+   "net_amount": "1.23",
+   "description": "DIV",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 224,
+   "activity_type": "CSW",
+   "date": "2026-10-27",
+   "net_amount": "-20.00",
+   "description": "CSW",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 196,
+   "activity_type": "INT",
+   "date": "2026-10-28",
+   "net_amount": "0.42",
+   "description": "INT",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 168,
+   "activity_type": "CSD",
+   "date": "2026-10-29",
+   "net_amount": "100.00",
+   "description": "CSD",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 140,
+   "activity_type": "JNLC",
+   "date": "2026-10-10",
+   "net_amount": "-5.00",
+   "description": "JNLC",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 112,
+   "activity_type": "FEE",
+   "date": "2026-10-11",
+   "net_amount": "-0.01",
+   "description": "FEE",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 84,
+   "activity_type": "DIV",
+   "date": "2026-10-12",
+   "net_amount": "1.23",
+   "description": "DIV",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 56,
+   "activity_type": "CSW",
+   "date": "2026-10-13",
+   "net_amount": "-20.00",
+   "description": "CSW",
+   "status": "executed"
+  },
+  {
+   "_posted_hours_ago": 30,
+   "activity_type": "FILL",
+   "transaction_time": "2026-11-08T15:01:00.574Z",
+   "type": "fill",
+   "price": "150.2501",
+   "qty": "4",
+   "side": "buy",
+   "symbol": "AAPL",
+   "leaves_qty": "0",
+   "cum_qty": "4",
+   "order_id": "oid-synthetic-1",
+   "order_status": "filled"
+  }
+ ]
+}

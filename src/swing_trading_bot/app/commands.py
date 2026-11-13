@@ -5,22 +5,29 @@ dependency and configuration checks first (nothing touched), then the ledger loc
 (exclusive for operations, shared for inspection and backup), then the database open
 (never migrating), then the operation, then close; the lock is released last.
 
-Broker access comes only from ``Dependencies.broker_factory``. Step 14 ships no
-production factory: loading real credentials and live read-only connectivity are Step
-15 work, so broker-backed commands refuse with a configuration error until then.
+Broker access comes only from ``Dependencies.broker_factory``. The production wiring
+(:func:`production_dependencies`) uses the read-only Alpaca factory with explicit
+credential loading (``app/credentials.py``): process environment *or* ``STB_ENV_FILE``,
+never an implicit ``.env``. Credentials are loaded only when a broker command runs.
 """
 
 from __future__ import annotations
 
 import argparse
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from swing_trading_bot.app.broker_factory import (
+    SessionFactory,
+    account_identity_problems,
+    mask_account_id,
+    production_broker_factory,
+)
 from swing_trading_bot.app.config import D8_CAPITAL, AppConfig
 from swing_trading_bot.app.exit_codes import ExitCode
 from swing_trading_bot.app.init_ledger import initialize_observe_ledger
@@ -46,12 +53,18 @@ from swing_trading_bot.app.views import (
     portfolio_view,
     status_view,
 )
+from swing_trading_bot.broker.alpaca_http import Sleeper
 from swing_trading_bot.domain.enums import RuntimeMode
+from swing_trading_bot.ledger.accounting_invariants import accounting_checker
 from swing_trading_bot.ledger.backup import backup_database
 from swing_trading_bot.ledger.db import Database, utc_now
 from swing_trading_bot.ledger.errors import DatabaseNotFoundError
-from swing_trading_bot.ledger.migration_guard import migrate_ledger, plan_migration
+from swing_trading_bot.ledger.integrity import integrity_report
+from swing_trading_bot.ledger.migration_guard import detect_mode, migrate_ledger, plan_migration
 from swing_trading_bot.ledger.migrator import Migration, packaged_migrations
+from swing_trading_bot.ledger.portfolio import market_date
+from swing_trading_bot.ledger.repositories import SyncStateRepository, TradingStateRepository
+from swing_trading_bot.ledger.sync_keys import BROKER_ACCOUNT_ID
 from swing_trading_bot.oms.order_manager import CrashHook
 
 
@@ -74,6 +87,29 @@ class Dependencies:
     max_capital_allocation: Decimal = D8_CAPITAL
     crash: CrashHook | None = None
     new_run_id: Callable[[], str] = _new_run_id
+    secret_values: list[str] = field(default_factory=list)
+    """Secret values loaded during this command, redacted from CLI output."""
+
+
+def production_dependencies(
+    environ: Mapping[str, str] | None = None,
+    *,
+    session_factory: SessionFactory | None = None,
+    clock: Callable[[], datetime] = utc_now,
+    sleep: Sleeper | None = None,
+) -> Dependencies:
+    """The real wiring: the read-only Alpaca factory with explicit credential loading.
+    Nothing is read until a broker-backed command actually needs the broker.
+    (``session_factory``/``clock``/``sleep`` exist for tests and the contract supervisor.)"""
+    secrets: list[str] = []
+    factory = production_broker_factory(
+        environ,
+        session_factory=session_factory,
+        on_loaded=lambda loaded: secrets.extend(loaded.settings.secret_values()),
+        clock=None if clock is utc_now else clock,
+        sleep=sleep,
+    )
+    return Dependencies(clock=clock, broker_factory=factory, secret_values=secrets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +336,76 @@ def cmd_rebaseline_approve(ctx: Context, args: argparse.Namespace) -> Outcome:
         ),
     )
     return Outcome(result.exit_code, _with_invariants(result.to_dict(), ok=ok))
+
+
+# ===================================================================== verify
+def cmd_verify_ledger(ctx: Context, args: argparse.Namespace) -> Outcome:
+    """Read-only verification of any ledger file — the live ledger or a backup before a
+    manual restore (D15-8). Never migrates, never writes to the ledger; takes a shared
+    lock (which may create ``<path>.lock`` beside the file)."""
+    path = Path(args.path).expanduser().absolute()
+    _require_ledger(path)
+    with LedgerLock(path, LockMode.SHARED, command=ctx.command):
+        mode = detect_mode(path)
+        plan = plan_migration(path, mode, ctx.migrations)  # app id, history, quick_check
+        result: dict[str, Any] = {
+            "ledger": str(path),
+            "mode": mode.value,
+            "schema_version": plan.current_version,
+            "pending_migrations": list(plan.pending),
+        }
+        if plan.pending:
+            result["note"] = "schema is older than this application: run migrate --backup"
+            return Outcome(ExitCode.REFUSED, result, hypothetical=mode is RuntimeMode.SIMULATE)
+        db = Database.open(path, mode, now=ctx.deps.clock(), migrations=ctx.migrations,
+                           auto_migrate=False)  # fmt: skip
+        try:
+            with db.read() as s:
+                integrity = integrity_report(s, full=True)
+                invariants = accounting_checker(lambda: market_date(ctx.deps.clock())).run(s)
+                state = TradingStateRepository().get(s)
+                recorded = SyncStateRepository().get(s, BROKER_ACCOUNT_ID)
+        finally:
+            db.close()
+    ok = integrity.ok and invariants.ok
+    result.update(
+        integrity_check_ok=integrity.ok,
+        integrity_problems=integrity.problems(),
+        invariants_ok=invariants.ok,
+        invariant_violations=sorted({v.invariant for v in invariants.violations}),
+        trading_state=state_dict(state),
+        recorded_account=None if recorded is None else mask_account_id(recorded),
+        verified=ok,
+    )
+    return Outcome(ExitCode.OK if ok else ExitCode.LEDGER, result,
+                   hypothetical=mode is RuntimeMode.SIMULATE)  # fmt: skip
+
+
+# ===================================================================== broker check
+def cmd_broker_check(ctx: Context, _args: argparse.Namespace) -> Outcome:
+    """Ledger-free, GET-only connectivity and identity check (replaces the old
+    ``scripts/check_connection.py``). Never shows balances or the full account id."""
+    broker = ctx.broker()
+    account = broker.get_account()
+    config = broker.get_account_config()
+    clock = broker.get_clock()
+    problems = account_identity_problems(account, environment="paper")
+    result = {
+        "environment": account.environment,
+        "account_id": mask_account_id(account.account_id),
+        "status": account.status,
+        "currency": account.currency,
+        "trading_blocked": account.trading_blocked,
+        "account_blocked": account.account_blocked,
+        "pattern_day_trader": account.pattern_day_trader,
+        "no_shorting": config.no_shorting,
+        "max_margin_multiplier": str(config.max_margin_multiplier),
+        "m2_account_protections": config.m2_protections_in_place,
+        "market_open": clock.is_open,
+        "identity_problems": problems,
+        "execution_available": False,
+    }
+    return Outcome(ExitCode.REFUSED if problems else ExitCode.OK, result)
 
 
 # ===================================================================== simulation

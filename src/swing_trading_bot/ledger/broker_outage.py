@@ -35,6 +35,7 @@ from typing import Any, Final
 from swing_trading_bot.domain.enums import HaltReason
 from swing_trading_bot.ledger.codec import ts_from_db, ts_to_db
 from swing_trading_bot.ledger.db import Session, Tx
+from swing_trading_bot.ledger.errors import PersistenceError
 from swing_trading_bot.ledger.repositories import SyncStateRepository, TradingStateRepository
 
 OUTAGE_STATE_KEY: Final = "broker.outage"
@@ -151,8 +152,19 @@ def next_failure_state(
 
 # ===================================================================== persistence
 def _raw(s: Session) -> dict[str, Any] | None:
+    """The stored state; an unreadable row fails closed (never silently "no outage")."""
     value = SyncStateRepository().get(s, OUTAGE_STATE_KEY)
-    return None if value is None else dict(json.loads(value))
+    if value is None:
+        return None
+    try:
+        raw = json.loads(value)
+        if not isinstance(raw, dict) or not isinstance(raw.get("active"), bool):
+            raise TypeError("malformed")
+        if raw["active"]:
+            OutageState.from_dict(raw["streak"])
+    except (ValueError, TypeError, KeyError):
+        raise PersistenceError(f"{OUTAGE_STATE_KEY} state is unreadable") from None
+    return dict(raw)
 
 
 def load_streak(s: Session) -> OutageState | None:

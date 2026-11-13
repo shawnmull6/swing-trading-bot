@@ -16,3 +16,6 @@ data/
 .coverage
 .coverage.*
 htmlcov/
+
+# Local, never-committed raw evidence from authorized contract runs (Step 15)
+contract-evidence/

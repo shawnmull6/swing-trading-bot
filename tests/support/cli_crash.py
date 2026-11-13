@@ -32,3 +32,30 @@ def run_during_outage(root: str, now_iso: str, command: str) -> None:
     account.down["*"] = lambda: ServiceUnavailableError("HTTP 503", status_code=503)
     code, _ = CliEnv(Path(root), account=account).run(command)
     os._exit(code)
+
+
+def run_paused(root: str, now_iso: str, command: str, point: str, barrier: object) -> None:
+    """Run ``command``; at ``point`` (inside the locked section) wait 1.5 s so concurrent
+    starters overlap. Exits with the command's exit code. ``barrier`` starts all together."""
+    import time  # noqa: PLC0415
+
+    def pause(reached: str) -> None:
+        if reached == point:
+            time.sleep(1.5)
+
+    barrier.wait(30)  # type: ignore[attr-defined]
+    account = FakeAlpacaAccount(clock=Clock(datetime.fromisoformat(now_iso)))
+    code, _ = CliEnv(Path(root), account=account, crash=pause).run(command)
+    os._exit(code)
+
+
+def backup_and_die(ledger: str, target: str) -> None:
+    """Start a backup and die after writing part of the copy (kill mid-backup)."""
+    from swing_trading_bot.ledger import backup as backup_module  # noqa: PLC0415
+
+    def half_copy(_source: object, destination: Path) -> None:
+        destination.write_bytes(Path(ledger).read_bytes()[:8192])
+        os._exit(CRASH_EXIT)
+
+    backup_module._copy = half_copy  # type: ignore[assignment]
+    backup_module.backup_database(Path(ledger), Path(target))

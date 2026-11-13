@@ -44,9 +44,14 @@ _STANDARD_RECORD_ATTRS: Final = frozenset(
 
 class SecretRedactor:
     def __init__(self, secrets: Iterable[str] = ()) -> None:
+        self._secrets: tuple[str, ...] = ()
+        self.add(secrets)
+
+    def add(self, secrets: Iterable[str]) -> None:
+        """Register more secret values (e.g. credentials loaded after start-up)."""
         # Longest first so overlapping secrets are fully masked.
-        self._secrets: tuple[str, ...] = tuple(
-            sorted({s for s in secrets if s}, key=len, reverse=True)
+        self._secrets = tuple(
+            sorted({*self._secrets, *(s for s in secrets if s)}, key=len, reverse=True)
         )
 
     def redact(self, text: str) -> str:
@@ -132,6 +137,7 @@ def configure_logging(
     """
     target = logger if logger is not None else logging.getLogger()
     redactor = SecretRedactor(secrets)
+    _ACTIVE_REDACTORS.append(redactor)
     handler = logging.StreamHandler(stream if stream is not None else sys.stderr)
     handler.addFilter(RedactingFilter(redactor))
     handler.setFormatter(JsonFormatter(redactor))
@@ -141,3 +147,14 @@ def configure_logging(
     target.setLevel(level)
     logging.captureWarnings(capture=True)
     return handler
+
+
+_ACTIVE_REDACTORS: list[SecretRedactor] = []
+
+
+def register_secrets(secrets: Iterable[str]) -> None:
+    """Add secret values to every redactor installed by :func:`configure_logging`, so
+    credentials loaded after start-up are masked in all later log output."""
+    values = tuple(secrets)
+    for redactor in _ACTIVE_REDACTORS:
+        redactor.add(values)

@@ -22,7 +22,7 @@ from tests.support.calendar_fixture import fixture_sessions, fixture_settlement_
 
 # Monday 2026-11-09 10:00 ET, inside a regular session of the fixture calendar.
 START = datetime(2026, 11, 9, 15, 0, tzinfo=UTC)
-ACCOUNT_ID = "paper-acct-0001"
+ACCOUNT_ID = "0f0e0d0c-0b0a-4908-8706-050403020100"  # synthetic UUID, not a real account
 READ_PATHS = frozenset(
     {
         "/account",
@@ -34,6 +34,7 @@ READ_PATHS = frozenset(
         "/orders:by_client_order_id",
         "/account/activities",
         "/stocks/trades/latest",
+        "/stocks/bars",
     }
 )
 
@@ -87,6 +88,7 @@ class FakeAlpacaAccount:
         self.transport.always(
             "data", "/stocks/trades/latest", self._guard("/stocks/trades/latest", self._trades)
         )
+        self.transport.always("data", "/stocks/bars", self._guard("/stocks/bars", self._bars))
 
     # ---------------------------------------------------------------- control
     def adapter(self) -> AlpacaPaperReadAdapter:
@@ -186,6 +188,28 @@ class FakeAlpacaAccount:
         ]
         return rows[:size]
 
+    def _bars(self, p: Mapping[str, str]) -> dict[str, Any]:
+        day = date.fromisoformat(p["start"])
+        midnight = datetime.combine(day, datetime.min.time(), tzinfo=MARKET_TZ)
+        t = midnight.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        return {
+            "bars": {
+                s: [
+                    {
+                        "t": t,
+                        "o": float(px),
+                        "h": float(px),
+                        "l": float(px),
+                        "c": float(px),
+                        "v": 1000,
+                    }
+                ]
+                for s in p["symbols"].split(",")
+                if (px := self.prices.get(s)) is not None
+            },
+            "next_page_token": None,
+        }
+
     def _trades(self, p: Mapping[str, str]) -> dict[str, Any]:
         wanted = p["symbols"].split(",")
         return {
@@ -195,3 +219,49 @@ class FakeAlpacaAccount:
                 if s in self.prices
             }
         }
+
+
+class AccountSession:
+    """A ``requests.Session`` stand-in serving a :class:`FakeAlpacaAccount` over the REAL
+    ``AlpacaReadTransport`` (so HTTP status mapping, headers and host checks run). It has
+    no write methods; every request is recorded without its headers' values."""
+
+    def __init__(self, account: FakeAlpacaAccount) -> None:
+        self.account = account
+        self.requests: list[tuple[str, str]] = []
+        self.header_names: set[str] = set()
+        self.trust_env = True
+
+    def get(self, url: str, *, params: Mapping[str, str], headers: Mapping[str, str],
+            timeout: object, allow_redirects: bool) -> Any:  # fmt: skip
+        import requests  # noqa: PLC0415
+
+        from swing_trading_bot.broker.errors import (  # noqa: PLC0415
+            AuthenticationError,
+            RateLimitedError,
+            ServiceUnavailableError,
+        )
+
+        assert allow_redirects is False and timeout
+        self.requests.append(("GET", url))
+        self.header_names.update(headers)
+        service = "data" if url.startswith("https://data.alpaca.markets/") else "trading"
+        path = url.split("/v2", 1)[1]
+        response = requests.Response()
+        response.url = url
+        try:
+            route: tuple[Any, str] = (service, path)
+            handler = self.account.transport._defaults[route]
+            body = handler(params) if callable(handler) else handler
+            response.status_code, response._content = 200, str(body).encode()
+        except AuthenticationError:
+            response.status_code, response._content = 401, b'{"message":"unauthorized"}'
+        except OrderNotFoundError:
+            response.status_code, response._content = 404, b'{"message":"not found"}'
+        except RateLimitedError:
+            response.status_code, response._content = 429, b'{"message":"rate limit"}'
+        except ServiceUnavailableError as exc:
+            if exc.kind == "timeout":
+                raise requests.Timeout("timed out") from None
+            response.status_code, response._content = 503, b'{"message":"unavailable"}'
+        return response

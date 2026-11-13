@@ -5,10 +5,12 @@ Status: **Revision 3 — architecture approved; all decisions final. Steps 1–1
 conditionally approved; step 13.1 (reconciliation hardening, §12.18) conditionally
 approved; step 13.2 (rebaseline accounting corrections: unverified dividends unresolved,
 event-specific acknowledgements, corrected cash equation) implemented and awaiting review
-(§12.19). Steps 13–13.2 committed. Step 14 (runtime & CLI, A§12.20) approved. Step 14.1
-(broker-outage circuit breaker, A§12.21) implemented and awaiting review. Position
+(§12.19). Steps 13–13.2 committed. Steps 14 and 14.1 approved (A§12.20, A§12.21). Step 15
+phase A accepted (A§12.22); step 15A.1 (harness budgets, sanitized outcomes, evidence
+permissions, head-check retry fix; A§12.23) implemented and awaiting review; phase B (live
+read-only contract run) not authorized yet. Position
 adjustments are not implemented (operational limitation). Live read-only contract checks
-not run. No Alpaca order submission; step 14.1 not committed until reviewed.**
+not run. No Alpaca order submission; step 15 not committed until reviewed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal
@@ -91,7 +93,7 @@ Each step lands with its tests; quality gates (§5.5) must pass at every step.
 | 13 | Reconciler | baselines, execution/order/position/cash checks, consistent-snapshot loop, INCONCLUSIVE escalation, two-step rebaseline workflow and audited adjustments (A§8.5) |
 | 14 | Runtime & CLI | lock, startup sequence, commands (§4.1) |
 | 14.1 | Broker-outage breaker | §10.5 escalation: ≥ 3 failed sync cycles ≥ 60 s apart spanning ≥ 30 min → `BROKER_OUTAGE`; durable streak; reset on a complete sync; gate `BROKER_OUTAGE_ACTIVE` (A§12.21) |
-| 15 | Hardening | fault-injection suite, read-only contract tests run once against paper, docs reconciled with code, `check_connection.py` replaced by `status --broker` |
+| 15 | Hardening | **A (done, offline):** explicit credential loading, production read-only factory, `broker-check`, `verify-ledger`, contract replay suite + matrix, fault-injection suite, benchmarks, runbook, docs. **A.1 (done, offline):** shared 120-request/300 s budget, rate-limit evidence, sanitized outcomes C1–C13, evidence permissions, head-check retry fix (O2). **B (not authorized):** one supervised live read-only contract run (`python -m tests.contract.live_run`) |
 
 ### 4.1 CLI (M1)
 ```
@@ -199,6 +201,12 @@ commands need the Step 15 credential loading (exit 7 until then).
 | **Mode isolation** | open production ledger in `simulate` mode | refused |
 
 ### 5.3 Contract tests against Alpaca paper (opt-in, read-only)
+
+*As built (A§12.22):* rows C1–C13 in `tests/contract/matrix.py` — each states what is
+verified offline (synthetic replay), what needs a real read-only response, and what needs
+paper orders. Credentials come only from the explicit loader (`STB_ENV_FILE` or the
+environment); the run is skipped unless `RUN_ALPACA_PAPER_TESTS=1` and needs operator
+authorization. The CT numbering below is historical.
 Marker `alpaca_paper`, enabled only with `RUN_ALPACA_PAPER_TESTS=1`. A spy wraps the
 underlying client and fails the test on any non-GET request.
 
@@ -255,7 +263,8 @@ M1 is complete when all of the following are demonstrated:
 7. **Gating:** startup gate, transient blocks and persistent halts behave per A§7,
    including restart persistence and resume refusal.
 8. **Contract tests:** §5.3 M1 items run once against paper and pass; findings recorded
-   in `ARCHITECTURE.md` §3 (CT items resolved or re-scoped).
+   in `ARCHITECTURE.md` §3 (CT items resolved or re-scoped). *Status: offline replay passes;
+   the live run (phase B) is outstanding — offline tests alone are not broker acceptance.*
 9. **Secrets:** captured logs across the full suite contain no secret values.
 10. **Quality gates** in §5.5 pass from a clean checkout without network access.
 11. **Docs:** ARCHITECTURE.md and this plan reflect the implementation.

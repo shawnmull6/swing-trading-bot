@@ -28,6 +28,7 @@ from swing_trading_bot.app.commands import (
     Outcome,
     cmd_audit,
     cmd_backup,
+    cmd_broker_check,
     cmd_halt,
     cmd_halts,
     cmd_init_ledger,
@@ -42,6 +43,8 @@ from swing_trading_bot.app.commands import (
     cmd_simulate,
     cmd_status,
     cmd_sync,
+    cmd_verify_ledger,
+    production_dependencies,
 )
 from swing_trading_bot.app.exit_codes import ExitCode
 from swing_trading_bot.app.lock import LockHeldError
@@ -50,7 +53,7 @@ from swing_trading_bot.broker.errors import BrokerError
 from swing_trading_bot.config.settings import SettingsError
 from swing_trading_bot.config.yaml_loader import ConfigFileError
 from swing_trading_bot.ledger.errors import PersistenceError
-from swing_trading_bot.observability.logging import configure_logging
+from swing_trading_bot.observability.logging import SecretRedactor, configure_logging
 
 _log = logging.getLogger("swing_trading_bot.cli")
 SCENARIO_CHOICES = (
@@ -75,7 +78,7 @@ def _nonblank(value: str) -> str:
     return value
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one declarative command table
     common = _Parser(add_help=False)
     common.add_argument("--data-dir", default="data", help="ledger directory (default: data)")
     common.add_argument("--config-dir", default="config", help="configuration directory")
@@ -112,7 +115,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backup", required=True, metavar="PATH", help="new backup file")
     p = add("backup", cmd_backup, "verified online backup", sim_target)
     p.add_argument("path", metavar="PATH")
+    p = add("verify-ledger", cmd_verify_ledger, "read-only verification of a ledger/backup")
+    p.add_argument("path", metavar="PATH")
 
+    add("broker-check", cmd_broker_check, "ledger-free, GET-only broker identity check")
     add("sync", cmd_sync, "read-only broker sync and recovery")
     add("reconcile", cmd_reconcile, "full reconciliation")
     p = add("halt", cmd_halt, "set an operator persistent halt")
@@ -215,7 +221,7 @@ def main(
         paths=DataPaths.at(Path(args.data_dir)),
         config_dir=Path(args.config_dir),
         actor=args.actor or f"operator:{getpass.getuser()}",
-        deps=deps or Dependencies(),
+        deps=deps if deps is not None else production_dependencies(),
     )
     log = {"command": ctx.command, "command_id": ctx.command_id}
     _log.info("command started", extra=log)
@@ -238,11 +244,11 @@ def main(
         envelope["hypothetical"] = True
     envelope["result"] = outcome.result
     if args.json:
-        out.write(json.dumps(envelope, indent=2, sort_keys=False, default=str) + "\n")
+        text = json.dumps(envelope, indent=2, sort_keys=False, default=str) + "\n"
     else:
-        if outcome.hypothetical:
-            out.write(HYPOTHETICAL_BANNER + "\n")
-        out.write("\n".join(_render(envelope)) + "\n")
+        banner = HYPOTHETICAL_BANNER + "\n" if outcome.hypothetical else ""
+        text = banner + "\n".join(_render(envelope)) + "\n"
+    out.write(SecretRedactor(ctx.deps.secret_values).redact(text))
     _log.info("command finished", extra={**log, "exit_code": int(outcome.code)})
     return int(outcome.code)
 
