@@ -222,6 +222,7 @@ DEFAULT_READ_POLICIES: Final[Mapping[str, ReadRetryPolicy]] = {
     "activities": _STD,
     "marks": _SNAPSHOT,  # marks are re-fetched often; stale beats slow
     "session_closes": _STD,
+    "daily_bars": _STD,
 }
 
 Sleeper = Callable[[timedelta], None]

@@ -26,7 +26,10 @@ from swing_trading_bot.broker.errors import InvalidBrokerDataError, UnknownBroke
 from swing_trading_bot.broker.models import (
     AccountConfigSnapshot,
     AccountSnapshot,
+    BarAdjustment,
+    BarFeed,
     BrokerActivity,
+    DailyBar,
     MarketClock,
 )
 from swing_trading_bot.domain.broker_status import BROKER_STATUS_RULES
@@ -426,3 +429,88 @@ def session_from_raw(raw: Raw) -> TradingSession:
         close_at=datetime.combine(day, _clock_time(raw, "close"), tzinfo=MARKET_TZ),
         settlement_date=settles,
     )
+
+
+def json_integer(raw: Raw, key: str) -> int:
+    """A JSON integer (counts such as bar volume). Rejects booleans, fractions, decimal
+    numbers and strings: a count arriving in any other shape is a payload error."""
+    value = _require(raw, key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidBrokerDataError(f"field {key!r} must be a JSON integer")
+    return value
+
+
+def opt_json_integer(raw: Raw, key: str) -> int | None:
+    return None if raw.get(key) is None else json_integer(raw, key)
+
+
+def opt_json_number(raw: Raw, key: str) -> Decimal | None:
+    return None if raw.get(key) is None else json_number(raw, key)
+
+
+def daily_bar_from_raw(
+    raw: Raw,
+    symbol: str,
+    *,
+    feed: BarFeed,
+    adjustment: BarAdjustment,
+    received_at: datetime,
+) -> DailyBar:
+    """One Alpaca ``/v2/stocks/bars`` daily bar (M2-2a). ``t`` dates the session in
+    America/New_York; ``o``/``h``/``l``/``c`` exact numbers; ``v`` a JSON integer;
+    ``vw``/``n`` optional. Any shape or consistency problem -> InvalidBrokerDataError."""
+    as_of = timestamp(raw, "t")
+    prices = {k: json_number(raw, k) for k in ("o", "h", "l", "c")}
+    volume = json_integer(raw, "v")
+    vwap = opt_json_number(raw, "vw")
+    trades = opt_json_integer(raw, "n")
+    try:
+        return DailyBar(
+            symbol=symbol,
+            session_date=as_of.astimezone(MARKET_TZ).date(),
+            open=prices["o"],
+            high=prices["h"],
+            low=prices["l"],
+            close=prices["c"],
+            volume=volume,
+            vwap=vwap,
+            trade_count=trades,
+            feed=feed,
+            adjustment=adjustment,
+            as_of=as_of,
+            received_at=received_at,
+        )
+    except ValueError as exc:
+        raise InvalidBrokerDataError(f"daily bar {symbol}: {exc}") from None
+
+
+def collect_daily_bars(
+    rows: Iterable[tuple[str, Raw, datetime]],
+    wanted: Sequence[str],
+    start: date,
+    end: date,
+    *,
+    feed: BarFeed,
+    adjustment: BarAdjustment,
+) -> dict[str, tuple[DailyBar, ...]]:
+    """Map (symbol, raw bar, received_at) rows into the BarSource result shared by every
+    implementation: each requested symbol a key, bars in strictly increasing session
+    order. An unrequested symbol, a bar outside ``[start, end]``, or a duplicate or
+    out-of-order session -> InvalidBrokerDataError (nothing is sorted or de-duplicated)."""
+    out: dict[str, list[DailyBar]] = {s: [] for s in wanted}
+    for symbol, raw, received in rows:
+        if symbol not in out:
+            raise InvalidBrokerDataError(f"bars: unrequested symbol {symbol!r}")
+        bar = daily_bar_from_raw(raw, symbol, feed=feed, adjustment=adjustment,
+                                 received_at=received)  # fmt: skip
+        if not start <= bar.session_date <= end:
+            raise InvalidBrokerDataError(
+                f"bars {symbol}: session {bar.session_date} outside {start}..{end}"
+            )
+        series = out[symbol]
+        if series and bar.session_date <= series[-1].session_date:
+            problem = "duplicate" if bar.session_date == series[-1].session_date else (
+                "out-of-order")  # fmt: skip
+            raise InvalidBrokerDataError(f"bars {symbol}: {problem} session {bar.session_date}")
+        series.append(bar)
+    return {symbol: tuple(bars) for symbol, bars in out.items()}

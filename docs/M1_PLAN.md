@@ -31,7 +31,9 @@ market-hours observation session is pending. M2 execution is **not authorized**.
 Position
 adjustments are not implemented (operational limitation). No Alpaca order submission.
 Step 16.2 (M2-1): account restriction and protection enforcement implemented offline
-(A§12.34); not live-verified; M2 execution still not authorized.**
+(A§12.34); not live-verified. Step 16.4 (M2-2a): historical daily-bar infrastructure
+implemented offline (A§12.35); official-close policy unchanged; M2 execution still not
+authorized.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

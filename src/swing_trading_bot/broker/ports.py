@@ -33,6 +33,9 @@ from swing_trading_bot.broker.models import (
     AccountConfigSnapshot,
     AccountSnapshot,
     ActivityPage,
+    BarAdjustment,
+    BarFeed,
+    DailyBar,
     MarketClock,
     SubmitOrderRequest,
 )
@@ -82,3 +85,24 @@ class BrokerExecutionPort(Protocol):
 @runtime_checkable
 class PriceMarkSource(Protocol):
     def get_marks(self, symbols: Sequence[str]) -> Mapping[str, PriceMark]: ...
+
+
+@runtime_checkable
+class BarSource(Protocol):
+    """Historical daily bars (M2-2a, A§12.35). Read-only.
+
+    Returns every requested symbol as a key, mapped to its bars in strictly increasing
+    session order (an empty tuple = no bars in range; never filled in). Malformed data,
+    a symbol that was not requested, a duplicate session or a bar outside
+    ``[start, end]`` raise ``InvalidBrokerDataError``. Completeness against the calendar
+    is judged by ``broker.bar_history``, not here."""
+
+    def get_daily_bars(
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        *,
+        feed: BarFeed,
+        adjustment: BarAdjustment,
+    ) -> Mapping[str, tuple[DailyBar, ...]]: ...

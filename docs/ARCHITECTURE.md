@@ -17,7 +17,8 @@ evidence publication and write-failure handling, §12.30) committed; live run #4
 (configuration errors, deep nesting, exact activity comparison, §12.31) committed;
 step 15B.8 (single-page activity guard for `init-ledger`) committed; a narrow M1
 initialization exception policy is recorded (§12.32); M2-1 account restriction and
-protection enforcement implemented offline (§12.34). Current M1 state (2026-11-13): the
+protection enforcement implemented offline (§12.34); M2-2a historical daily bars
+implemented offline (§12.35). Current M1 state (2026-11-13): the
 real observe ledger has been initialized; two live reconciliations were CLEAN and the
 `INITIALIZED` halt was cleared by an audited `resume`; the ledger runs in OBSERVE mode
 with trading disabled, and a three-cycle market-hours observation session is pending.
@@ -3400,6 +3401,106 @@ permission. SimBroker gained
   the configuration payload).
 * The M2-V1 account-id and `PAPER_ONLY` status checks and every other §12.32 ¶6 / M1_PLAN
   §9 criterion are unchanged by this step.
+
+### 12.35 M2-2a: historical daily bars (offline)
+
+**1. Status.** Offline implementation only (Step 16.4). No broker or market-data
+request, no ledger, schema or migration change, no new host, no runtime wiring: nothing
+in M1 OBSERVE calls the new interface (tested — `sync` and `status --broker` make no
+`/stocks/bars` request). Strategy signals and indicators are not implemented. **The risk
+policy is unchanged:** `get_official_closes` still raises without a request,
+`get_daily_bar_closes` (the C8 path) is unchanged, OBSERVE baselines accept `OFFICIAL`
+closes only, `session_closes` and its sources (`OFFICIAL`, `DAILY_BAR`, `SIM`) are
+untouched, and no `CONSOLIDATED_BAR` source exists. SIP behaviour is **not
+live-verified** (¶7).
+
+**2. Model** (`broker/models.py`). `DailyBar`: symbol, `session_date`, Decimal
+`open`/`high`/`low`/`close`, integer `volume`, optional Decimal `vwap` and integer
+`trade_count`, `feed` (`iex` | `sip`), `adjustment` (`raw` | `split`), `as_of` (the
+source timestamp `t`) and `received_at`. Construction refuses non-Decimal, non-finite or
+non-positive prices (binary floats never accepted), `low ≤ open ≤ high` /
+`low ≤ close ≤ high` violations, negative or boolean counts, other feeds or
+adjustments, naive timestamps, and an `as_of` that is not on `session_date` in
+America/New_York. A bar is an observation, never an official close. Split-adjusted bars
+are restated retroactively by the provider; they are for strategy history only and are
+never persisted.
+
+**3. Interface** (`broker/ports.py`). `BarSource.get_daily_bars(symbols, start, end, *,
+feed, adjustment) -> Mapping[str, tuple[DailyBar, ...]]`: every requested symbol is a key
+(empty tuple = no bars, never filled in), bars strictly increasing by session. Implemented
+by `AlpacaPaperReadAdapter` and `SimBroker`. No cache, scheduler or provider layer.
+
+**4. Alpaca request and mapping** (`broker/alpaca_read.py`, `broker/mapping.py`).
+* `GET data /v2/stocks/bars` with `symbols` (comma-joined), `timeframe=1Day`, `start`,
+  `end`, explicit `feed` and `adjustment`, `limit=10000`, `sort=asc`; `page_token` until
+  `next_page_token` is null (cap 20 pages); new read-retry policy `daily_bars` (standard).
+  The instance feed used for marks and C8 closes is not involved.
+* *Bounds (Step 16.4A review).* Whether Alpaca treats `start`/`end` as inclusive or
+  exclusive, and whether a bare date means UTC or market-time midnight, is not verified.
+  `bar_window(start, end)` therefore sends RFC 3339 timestamps one second before
+  `start`'s America/New_York midnight and one second before the market-time midnight
+  after `end`. Given bar `t` = session midnight in market time (C8, IEX), exactly the
+  sessions `start..end` fall inside under every inclusive/exclusive combination; offsets
+  come from each date, so daylight-saving changes cannot shift a session. Tests emulate
+  all four combinations for one session, several, Friday→Monday, both DST changes and
+  an early close. The C8 `get_daily_bar_closes` request keeps its live-verified
+  date-only bounds.
+* *Pagination and retries.* The whole response is consumed before anything is
+  returned; an error on any page (after bounded retries for 429/503/timeouts only, per
+  page, same token) means no result, never a partial one. A non-string, empty or
+  previously seen `next_page_token` (cycles included) and more than 20 pages fail closed.
+  Retries exist only in the GET-only read stack (`alpaca_http`, `alpaca_read`); the
+  execution capability never imports it, and there is still no Alpaca write path.
+* Pagination is shared with `get_daily_bar_closes` (`_bar_rows`); that method's request,
+  close-only parsing and skipping of other dates are byte-for-byte unchanged.
+* `daily_bar_from_raw`: `t` → session date in market time; `o`/`h`/`l`/`c`/`vw` exact
+  JSON numbers (`json_number`: Decimal or int, never float/bool); `v`/`n` JSON integers
+  only. `collect_daily_bars` (shared by both implementations) rejects an unrequested
+  symbol, a bar outside `[start, end]`, a duplicate or out-of-order session (nothing is
+  sorted or de-duplicated). Every fault → `InvalidBrokerDataError` (fail closed). The
+  GET-only transport and the two-host allowlist are unchanged. As before for C8, a
+  `bars` value of `null`/`{}` means no bars.
+
+**5. History validation** (`broker/bar_history.py`, pure). `assess_history(symbol, bars,
+*, calendar, now, requirement)` with `HistoryRequirement(lookback_sessions, feed,
+adjustment)`:
+* window = the last `lookback_sessions` **completed** sessions (`close_at ≤ now`, so an
+  early close counts after 13:00);
+* excluded, not faults: bars after the window (current or future session) and bars
+  observed before their session's close (`received_at < close_at`);
+* `MALFORMED` (data fault): wrong symbol, feed or adjustment; out-of-order or duplicate
+  sessions; a bar on a non-trading day; `as_of` not midnight America/New_York (the C8
+  observation for IEX);
+* `INSUFFICIENT_HISTORY` (consistent data, not enough of it): `NO_BARS`,
+  `HISTORY_STARTS_IN_WINDOW` (recent listing), `MISSING_SESSIONS` (suspension or data
+  gap), `LATEST_SESSION_MISSING`;
+* `INELIGIBLE` (valid data excluded by policy): with `require_volume` (default, the
+  initial liquid-equity strategy) a zero-volume window session. A zero-volume bar is a
+  valid broker payload, not a data fault (Step 16.4A);
+* `CALENDAR_UNAVAILABLE` when the calendar cannot answer; otherwise `ELIGIBLE` with
+  exactly one bar per window session. Precedence: calendar, malformed, insufficient,
+  ineligible.
+
+Each symbol is judged independently; an ineligible symbol gets no bars and nothing is
+invented. No indicators or support/resistance logic.
+
+**6. SimBroker and fixtures.** `SimBroker.load_daily_bars(symbol, rows, *, feed,
+adjustment)` scripts raw Alpaca-shaped rows; `get_daily_bars` maps them through the same
+`collect_daily_bars`, so malformed rows fail identically; `corrupt_next("get_daily_bars")`
+mutates each row of one call. `tests/support/bars_fixture.py` provides complete history,
+gaps, recent listings, a 2-for-1 split (raw vs split-adjusted), malformed OHLC, missing
+optional fields, multiple symbols, exact-JSON-number bodies, a paginating transport
+handler and early-close timing (2026-11-27). Tests: `tests/unit/test_daily_bars.py`,
+`tests/integration/test_daily_bar_history.py`.
+
+**7. Still requires an authorized read-only check before any use of SIP data.** That
+the bars endpoint accepts RFC 3339 `start`/`end` and returns exactly the bracketed
+sessions (one-session and multi-session requests); SIP
+historical daily-bar entitlement on this account and the error shape when not permitted;
+SIP bar `t` at midnight America/New_York (C8 verified IEX only); presence and JSON types
+of `v`, `vw`, `n` (integers vs numbers); `next_page_token` behaviour on multi-symbol,
+multi-day requests and the real page size; `adjustment=split` vs `raw` on a symbol with
+a split; whether a just-closed session's bar is revised later; data-host rate limits.
 
 ---
 

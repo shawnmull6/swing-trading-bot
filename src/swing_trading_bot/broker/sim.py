@@ -53,6 +53,7 @@ from swing_trading_bot.broker.mapping import (
     account_from_raw,
     activity_from_raw,
     clock_from_raw,
+    collect_daily_bars,
     order_from_raw,
     position_from_raw,
 )
@@ -60,6 +61,9 @@ from swing_trading_bot.broker.models import (
     AccountConfigSnapshot,
     AccountSnapshot,
     ActivityPage,
+    BarAdjustment,
+    BarFeed,
+    DailyBar,
     MarketClock,
     SubmitOrderRequest,
 )
@@ -251,6 +255,7 @@ class SimBroker:
         self._mutators: dict[str, deque[Mutator]] = {}
         self._calendars: dict[CalendarKind, CalendarFetch] = {}
         self._prices: dict[str, tuple[Decimal, datetime]] = {}
+        self._bars: dict[tuple[str, str, str], list[Raw]] = {}
         self.event_log: list[str] = []
         self._event_time: datetime | None = None
 
@@ -274,6 +279,20 @@ class SimBroker:
 
     def load_calendar(self, fetch: CalendarFetch) -> None:
         self._calendars[fetch.kind] = fetch
+
+    def load_daily_bars(
+        self,
+        symbol: str,
+        rows: Sequence[Raw],
+        *,
+        feed: BarFeed = "iex",
+        adjustment: BarAdjustment = "raw",
+    ) -> None:
+        """Script historical daily bars (M2-2a) as raw Alpaca-shaped rows (``t``, ``o``,
+        ``h``, ``l``, ``c``, ``v``, optional ``vw``/``n``), served in the given order and
+        mapped by the same code as the Alpaca adapter, so malformed rows fail the same
+        way. Replaces any rows already loaded for (symbol, feed, adjustment)."""
+        self._bars[(symbol, feed, adjustment)] = [dict(r) for r in rows]
 
     def set_price(self, symbol: str, price: Decimal) -> None:
         self._prices[symbol] = (price, self.clock.now())
@@ -495,6 +514,33 @@ class SimBroker:
             if sym in self._prices
             for price, as_of in [self._prices[sym]]
         }
+
+    def get_daily_bars(
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        *,
+        feed: BarFeed,
+        adjustment: BarAdjustment,
+    ) -> Mapping[str, tuple[DailyBar, ...]]:
+        """BarSource (M2-2a): the loaded rows whose ``t`` falls in ``[start, end]``
+        (America/New_York), through ``collect_daily_bars``. ``corrupt_next`` applies to
+        each raw row of one call."""
+        self._enter("get_daily_bars")
+        if start > end:
+            raise ValueError("start must not be after end")
+        received = self.clock.now()
+        wanted = list(dict.fromkeys(symbols))
+        mutate = self._mutators.get("get_daily_bars")
+        mutator = mutate.popleft() if mutate else None
+        rows: list[tuple[str, Raw, datetime]] = []
+        for symbol in wanted:
+            for raw in self._bars.get((symbol, feed, adjustment), []):
+                day = _bar_day(raw)
+                if day is None or start <= day <= end:
+                    rows.append((symbol, mutator(raw) if mutator else raw, received))
+        return collect_daily_bars(rows, wanted, start, end, feed=feed, adjustment=adjustment)
 
     # ====================================================== execution port
     def submit_order(self, request: SubmitOrderRequest) -> BrokerOrderSnapshot:
@@ -753,3 +799,15 @@ class SimBroker:
 
     def _log(self, message: str) -> None:
         self.event_log.append(f"{_iso(self._at())} {message}")
+
+
+def _bar_day(raw: Raw) -> date | None:
+    """Session date of a scripted bar row, or None when ``t`` is unusable (the row is then
+    served so that the shared mapper rejects it)."""
+    value = raw.get("t")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(MARKET_TZ).date()
+    except ValueError:
+        return None

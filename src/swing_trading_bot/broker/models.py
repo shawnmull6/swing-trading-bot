@@ -11,7 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import Final, Literal
 
+from swing_trading_bot.domain.calendar import MARKET_TZ
 from swing_trading_bot.domain.enums import OrderType, Side, TimeInForce
 from swing_trading_bot.domain.money import ZERO, is_whole
 
@@ -186,3 +188,74 @@ class DailyBarClose:
             raise ValueError("close must be positive")
         object.__setattr__(self, "as_of", _aware(self.as_of, "as_of"))
         object.__setattr__(self, "received_at", _aware(self.received_at, "received_at"))
+
+
+BarFeed = Literal["iex", "sip"]
+BarAdjustment = Literal["raw", "split"]
+BAR_FEEDS: Final[frozenset[str]] = frozenset({"iex", "sip"})
+BAR_ADJUSTMENTS: Final[frozenset[str]] = frozenset({"raw", "split"})
+
+
+def _bar_price(value: object, name: str) -> Decimal:
+    if not isinstance(value, Decimal) or not value.is_finite() or value <= ZERO:
+        raise ValueError(f"{name} must be a finite, positive Decimal")
+    return value
+
+
+def _bar_count(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class DailyBar:
+    """One historical daily bar (M2-2a, A§12.35): an OBSERVATION from the named feed,
+    never an official closing price. Prices are exact Decimals; nothing here uses binary
+    floating point.
+
+    ``as_of`` is the bar's source timestamp (Alpaca ``t``: the session start, observed as
+    midnight America/New_York for IEX in C8) and must fall on ``session_date`` in market
+    time; ``received_at`` is when it was observed. ``adjustment="split"`` prices are
+    restated for later splits and can change retroactively — they are for strategy
+    history only and are never persisted or used for risk baselines."""
+
+    symbol: str
+    session_date: date
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+    vwap: Decimal | None
+    trade_count: int | None
+    feed: BarFeed
+    adjustment: BarAdjustment
+    as_of: datetime
+    received_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.symbol or self.symbol != self.symbol.strip():
+            raise ValueError("symbol must be a non-empty string")
+        if isinstance(self.session_date, datetime):
+            raise ValueError("session_date must be a date, not a datetime")
+        o = _bar_price(self.open, "open")
+        h = _bar_price(self.high, "high")
+        lo = _bar_price(self.low, "low")
+        c = _bar_price(self.close, "close")
+        if not (lo <= o <= h and lo <= c <= h):
+            raise ValueError("inconsistent OHLC: need low <= open, close <= high")
+        _bar_count(self.volume, "volume")
+        if self.vwap is not None:
+            _bar_price(self.vwap, "vwap")
+        if self.trade_count is not None:
+            _bar_count(self.trade_count, "trade_count")
+        if self.feed not in BAR_FEEDS:
+            raise ValueError(f"unsupported bar feed {self.feed!r}")
+        if self.adjustment not in BAR_ADJUSTMENTS:
+            raise ValueError(f"unsupported bar adjustment {self.adjustment!r}")
+        as_of = _aware(self.as_of, "as_of")
+        object.__setattr__(self, "as_of", as_of)
+        object.__setattr__(self, "received_at", _aware(self.received_at, "received_at"))
+        if as_of.astimezone(MARKET_TZ).date() != self.session_date:
+            raise ValueError("as_of must fall on session_date in America/New_York")

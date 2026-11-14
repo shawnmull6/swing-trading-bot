@@ -24,6 +24,9 @@ activities                 ``/account/activities?direction=asc&page_size
 latest trades (marks)      data ``/stocks/trades/latest?symbols&feed``
 session closes             data ``/stocks/bars?symbols&timeframe=1Day&start&end
                            &feed&adjustment=raw&limit``
+daily bars (M2-2a)         data ``/stocks/bars?symbols&timeframe=1Day&start&end
+                           &feed=iex|sip&adjustment=raw|split&limit&sort=asc``
+                           (RFC 3339 bounds from :func:`bar_window`)
 =========================  ==================================================
 
 Every response is parsed exactly (``broker.mapping``); malformed data raises
@@ -33,8 +36,8 @@ id of the previous page as Alpaca documents (contract-test item).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import UTC, date, datetime, timedelta
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final, Self
 
@@ -59,6 +62,7 @@ from swing_trading_bot.broker.mapping import (
     account_from_raw,
     activity_from_raw,
     clock_from_raw,
+    collect_daily_bars,
     json_number,
     opt_decimal,
     order_from_raw,
@@ -69,9 +73,14 @@ from swing_trading_bot.broker.mapping import (
     timestamp,
 )
 from swing_trading_bot.broker.models import (
+    BAR_ADJUSTMENTS,
+    BAR_FEEDS,
     AccountConfigSnapshot,
     AccountSnapshot,
     ActivityPage,
+    BarAdjustment,
+    BarFeed,
+    DailyBar,
     DailyBarClose,
     MarketClock,
 )
@@ -84,6 +93,7 @@ from swing_trading_bot.domain.models import BrokerOrderSnapshot, BrokerPosition,
 ORDERS_PAGE_LIMIT: Final = 500
 MAX_ORDER_PAGES: Final = 50
 MAX_BAR_PAGES: Final = 20
+BARS_PAGE_LIMIT: Final = 10000
 FEEDS: Final = frozenset({"iex", "sip", "delayed_sip"})
 SOURCE: Final = "alpaca"
 ENVIRONMENT: Final = "paper"
@@ -101,6 +111,24 @@ def iso_param(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def bar_window(start: date, end: date) -> tuple[str, str]:
+    """RFC 3339 ``start``/``end`` query bounds for the daily bars of sessions
+    ``start..end`` (M2-2a review).
+
+    A daily bar's ``t`` is its session's midnight America/New_York (C8, IEX). The bounds
+    are one second before ``start``'s market-time midnight and one second before the
+    market-time midnight following ``end``, so exactly those sessions' bars fall inside
+    whether the provider treats either bound as inclusive or exclusive, and a bare date's
+    own interpretation (UTC vs market time) never matters. Offsets come from the
+    session dates themselves, so daylight-saving changes cannot shift a session."""
+    if start > end:
+        raise ValueError("start must not be after end")
+    second = timedelta(seconds=1)
+    lo = datetime.combine(start, time(0, 0), tzinfo=MARKET_TZ) - second
+    hi = datetime.combine(end + timedelta(days=1), time(0, 0), tzinfo=MARKET_TZ) - second
+    return iso_param(lo), iso_param(hi)
+
+
 def _as_list(payload: object, what: str) -> list[Mapping[str, Any]]:
     if not isinstance(payload, list) or not all(isinstance(x, dict) for x in payload):
         raise InvalidBrokerDataError(f"{what}: expected a JSON array of objects")
@@ -114,7 +142,8 @@ def _as_object(payload: object, what: str) -> Mapping[str, Any]:
 
 
 class AlpacaPaperReadAdapter:
-    """Implements BrokerReadPort and PriceMarkSource against Alpaca paper. Read-only."""
+    """Implements BrokerReadPort, PriceMarkSource and BarSource against Alpaca paper.
+    Read-only."""
 
     def __init__(
         self,
@@ -359,39 +388,87 @@ class AlpacaPaperReadAdapter:
         self, symbols: Sequence[str], session_date: date
     ) -> dict[str, DailyBarClose]:
         """Daily-bar close observations for ``session_date`` (missing symbols are absent).
-        Each carries its feed; for IEX this is IEX's last trade, not an official close."""
+        Each carries its feed; for IEX this is IEX's last trade, not an official close.
+        Unchanged by M2-2a (the C8 contract path): bars on other dates are skipped."""
         wanted = self._symbols(symbols)
         closes: dict[str, DailyBarClose] = {}
         if not wanted:
             return closes
+        params = {"symbols": ",".join(wanted), "timeframe": "1Day",
+                  "start": session_date.isoformat(), "end": session_date.isoformat(),
+                  "feed": self._feed, "adjustment": "raw", "limit": "1000"}  # fmt: skip
+        for symbol, bar, received in self._bar_rows("session_closes", params, wanted):
+            as_of = timestamp(bar, "t")
+            if as_of.astimezone(MARKET_TZ).date() != session_date:
+                continue
+            if symbol in closes:
+                raise InvalidBrokerDataError(f"bars: two daily bars for {symbol}")
+            closes[symbol] = DailyBarClose(
+                symbol, session_date, json_number(bar, "c"), as_of, received, self._feed
+            )
+        return closes
+
+    def get_daily_bars(
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        *,
+        feed: BarFeed,
+        adjustment: BarAdjustment,
+    ) -> Mapping[str, tuple[DailyBar, ...]]:
+        """Historical daily bars (M2-2a, :class:`~swing_trading_bot.broker.ports.BarSource`).
+
+        One multi-symbol request per page (``sort=asc``) with :func:`bar_window` bounds,
+        paginated to the end. Every
+        requested symbol is a key (empty tuple = no bars). Fails closed with
+        ``InvalidBrokerDataError`` on a malformed bar, an unrequested symbol, a bar outside
+        ``[start, end]``, a duplicate or out-of-order session, or a pagination fault.
+        Feed and adjustment are explicit per call; the instance feed used for marks and
+        ``get_daily_bar_closes`` is not involved."""
+        if feed not in BAR_FEEDS:
+            raise ValueError(f"unsupported bar feed {feed!r}")
+        if adjustment not in BAR_ADJUSTMENTS:
+            raise ValueError(f"unsupported bar adjustment {adjustment!r}")
+        lo, hi = bar_window(start, end)
+        wanted = self._symbols(symbols)
+        if not wanted:
+            return {}
+        params = {"symbols": ",".join(wanted), "timeframe": "1Day",
+                  "start": lo, "end": hi, "feed": feed,
+                  "adjustment": adjustment, "limit": str(BARS_PAGE_LIMIT),
+                  "sort": "asc"}  # fmt: skip
+        return collect_daily_bars(self._bar_rows("daily_bars", params, wanted), wanted,
+                                  start, end, feed=feed, adjustment=adjustment)  # fmt: skip
+
+    def _bar_rows(
+        self, op: str, params: Mapping[str, str], wanted: Sequence[str]
+    ) -> Iterator[tuple[str, Mapping[str, Any], datetime]]:
+        """Every (symbol, raw bar, received_at) of a paginated ``/stocks/bars`` response.
+        Rejects unrequested symbols, a non-list symbol entry, a non-string, empty or
+        previously seen page token and more than :data:`MAX_BAR_PAGES` pages. Callers
+        consume the whole generator before returning, so an error on any page means no
+        result at all (never a partial one)."""
         token: str | None = None
+        seen: set[str] = set()
         for _ in range(MAX_BAR_PAGES):
-            params = {"symbols": ",".join(wanted), "timeframe": "1Day",
-                      "start": session_date.isoformat(), "end": session_date.isoformat(),
-                      "feed": self._feed, "adjustment": "raw", "limit": "1000"}  # fmt: skip
+            page = dict(params)
             if token is not None:
-                params["page_token"] = token
-            payload = _as_object(self._get("session_closes", "data", "/stocks/bars", params),
-                                 "bars")  # fmt: skip
+                page["page_token"] = token
+            payload = _as_object(self._get(op, "data", "/stocks/bars", page), "bars")
             received = self._clock()
             bars = _as_object(payload.get("bars") or {}, "bars.bars")
             for symbol, rows in bars.items():
                 if symbol not in wanted:
                     raise InvalidBrokerDataError(f"bars: unrequested symbol {symbol!r}")
                 for bar in _as_list(rows, f"bars {symbol}"):
-                    as_of = timestamp(bar, "t")
-                    if as_of.astimezone(MARKET_TZ).date() != session_date:
-                        continue
-                    if symbol in closes:
-                        raise InvalidBrokerDataError(f"bars: two daily bars for {symbol}")
-                    closes[symbol] = DailyBarClose(
-                        symbol, session_date, json_number(bar, "c"), as_of, received, self._feed
-                    )
+                    yield symbol, bar, received
             next_token = payload.get("next_page_token")
             if next_token is None:
-                return closes
-            if not isinstance(next_token, str) or next_token == token:
+                return
+            if not isinstance(next_token, str) or not next_token or next_token in seen:
                 raise InvalidBrokerDataError("bars: invalid next_page_token")
+            seen.add(next_token)
             token = next_token
         raise InvalidBrokerDataError(f"bars exceeded {MAX_BAR_PAGES} pages")
 
