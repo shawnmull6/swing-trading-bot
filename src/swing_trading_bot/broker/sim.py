@@ -173,6 +173,12 @@ class SimConfig:
     suspend_trade: bool = False
     pattern_day_trader: bool | None = False
     """Reported as-is; ``None`` omits the field from the account payload (unknown)."""
+    account_blocked: bool = False
+    trade_suspended_by_user: bool | None = False
+    transfers_blocked: bool | None = False
+    closing_transactions_only: bool | None = False
+    """Restriction fields (M2-1), reported as-is like the observed paper payloads; ``None``
+    omits the key (not reported -> unknown)."""
 
 
 # ---------------------------------------------------------------- internal state
@@ -346,12 +352,14 @@ class SimBroker:
             "buying_power": _num(self._cash * self.config.margin_multiplier),  # never read
             "multiplier": _num(self.config.margin_multiplier),
             "trading_blocked": self.config.trading_blocked,
-            "account_blocked": False,
+            "account_blocked": self.config.account_blocked,
             "accrued_fees": "0",
             "pending_reg_taf_fees": "0",
         }
-        if self.config.pattern_day_trader is not None:
-            raw["pattern_day_trader"] = self.config.pattern_day_trader
+        for key in ("pattern_day_trader", "trade_suspended_by_user", "transfers_blocked"):
+            value = getattr(self.config, key)
+            if value is not None:
+                raw[key] = value
         return account_from_raw(
             self._mutate("get_account", raw), as_of=self.clock.now(), environment=ENVIRONMENT
         )
@@ -364,7 +372,7 @@ class SimBroker:
             "suspend_trade": self.config.suspend_trade,
             "fractional_trading": False,
         }
-        for key in ("pdt_check", "dtbp_check"):
+        for key in ("pdt_check", "dtbp_check", "closing_transactions_only"):
             value = getattr(self.config, key)
             if value is not None:
                 raw[key] = value

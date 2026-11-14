@@ -75,11 +75,14 @@ def test_mapping_reads_pdt_only_in_the_account_mapper() -> None:
 
 
 def test_mapper_uses_the_optional_boolean_for_pdt_only() -> None:
-    """Only ``pattern_day_trader`` goes through ``opt_boolean``; nothing else was relaxed."""
+    """Only ``pattern_day_trader`` and the three M2-1 restriction fields (A§12.34; unknown
+    there is fail-closed for entries, never false) go through ``opt_boolean``; nothing
+    else was relaxed."""
     tree = ast.parse((PKG / "broker" / "mapping.py").read_text())
     calls = [
         n for n in ast.walk(tree)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "opt_boolean"
     ]  # fmt: skip
     keys = [c.args[1].value for c in calls if isinstance(c.args[1], ast.Constant)]
-    assert keys == [TOKEN]
+    assert keys == [TOKEN, "trade_suspended_by_user", "transfers_blocked",
+                    "closing_transactions_only"]  # fmt: skip

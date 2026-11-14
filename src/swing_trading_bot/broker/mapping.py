@@ -332,6 +332,10 @@ def account_from_raw(raw: Raw, *, as_of: datetime, environment: str) -> AccountS
         account_blocked=boolean(raw, "account_blocked"),
         accrued_fees=decimal(raw, "accrued_fees"),
         pending_reg_taf_fees=decimal(raw, "pending_reg_taf_fees"),
+        # Restrictions (M2-1): absent/null -> None (unknown, never False); a present value
+        # must be a JSON boolean. Unknown is fail-closed for entries, not a payload error.
+        trade_suspended_by_user=opt_boolean(raw, "trade_suspended_by_user"),
+        transfers_blocked=opt_boolean(raw, "transfers_blocked"),
     )
 
 
@@ -345,6 +349,8 @@ def account_config_from_raw(raw: Raw) -> AccountConfigSnapshot:
         dtbp_check=opt_text(raw, "dtbp_check"),
         suspend_trade=boolean(raw, "suspend_trade"),
         fractional_trading=boolean(raw, "fractional_trading"),
+        # Restriction (M2-1): absent/null -> None (unknown); present must be a boolean.
+        closing_transactions_only=opt_boolean(raw, "closing_transactions_only"),
     )
 
 

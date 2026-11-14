@@ -88,11 +88,22 @@ from swing_trading_bot.ledger.sync_keys import BROKER_ACCOUNT_ID
 from swing_trading_bot.oms.lifecycle import EventSource, apply_snapshot
 from swing_trading_bot.oms.order_manager import CrashHook, OmsConfig
 from swing_trading_bot.oms.sync import OrderSync, SyncReport, SyncStatus
+from swing_trading_bot.risk.account_restrictions import RestrictionField, assess_restrictions
 from swing_trading_bot.risk.gates import EXPECTED_ENVIRONMENT
 
 LAST_PERIODIC_RESCAN: Final = "activities.last_periodic_rescan"
 LAST_RECONCILIATION_RUN: Final = "reconciliation.last_run_id"
 RECON_ACTOR: Final = "reconciler"
+_ADVISORY_RESTRICTIONS: Final = frozenset(
+    {
+        RestrictionField.TRADE_SUSPENDED_BY_USER,
+        RestrictionField.TRANSFERS_BLOCKED,
+        RestrictionField.SUSPEND_TRADE,
+        RestrictionField.CLOSING_TRANSACTIONS_ONLY,
+    }
+)
+"""Restrictions recorded as ADVISORY; status/trading_blocked/account_blocked keep the
+existing INCONCLUSIVE ``ACCOUNT_RESTRICTED`` finding (§12.17 ¶6)."""
 
 
 class HeadCheck(StrEnum):
@@ -571,6 +582,7 @@ class Reconciler:
                     )
                 )
         c = obs.account_config
+        out += self._restriction_advisories(obs)
         if c is not None and not c.m2_protections_in_place:
             out.append(
                 finding(
@@ -579,6 +591,35 @@ class Reconciler:
                     Severity.ADVISORY,
                     no_shorting=c.no_shorting,
                     max_margin_multiplier=c.max_margin_multiplier,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _restriction_advisories(obs: Observation) -> list[Finding]:
+        """M2-1 restriction fields beyond status/trading_blocked/account_blocked: recorded
+        as ADVISORY evidence only. They do not change ledger/broker agreement, and entry
+        enforcement happens on fresh reads in the gates and the pre-trade engine, so they
+        never make a run INCONCLUSIVE or MISMATCH (A§12.34)."""
+        r = assess_restrictions(obs.account, obs.account_config)
+        extra = [f for f in r.active_fields if f in _ADVISORY_RESTRICTIONS]
+        out: list[Finding] = []
+        if extra:
+            out.append(
+                finding(
+                    Category.ACCOUNT,
+                    "ACCOUNT_ORDER_RESTRICTION",
+                    Severity.ADVISORY,
+                    ", ".join(f"{f.value}=true" for f in extra),
+                )
+            )
+        if r.unreported:
+            out.append(
+                finding(
+                    Category.ACCOUNT,
+                    "ACCOUNT_RESTRICTION_UNREPORTED",
+                    Severity.ADVISORY,
+                    ", ".join(f.value for f in r.unreported),
                 )
             )
         return out

@@ -28,6 +28,7 @@ from swing_trading_bot.broker.alpaca_http import ReadOnlyHttp
 from swing_trading_bot.broker.alpaca_read import AlpacaPaperReadAdapter
 from swing_trading_bot.broker.errors import BrokerRequestError
 from swing_trading_bot.domain.calendar import MARKET_TZ, CalendarKind
+from swing_trading_bot.risk.account_restrictions import m2_account_state_problems
 
 Observation = dict[str, Any]
 ACCOUNT_MONEY_FIELDS = ("cash", "non_marginable_buying_power", "multiplier", "accrued_fees")
@@ -117,6 +118,11 @@ def check_account_restrictions(c: ContractContext) -> Observation:
         "suspend_trade": cfg.suspend_trade,
         "fractional_trading": cfg.fractional_trading,
         "m2_protections_in_place": cfg.m2_protections_in_place,
+        # M2-1: null = not reported (unknown), never false.
+        "trade_suspended_by_user": a.trade_suspended_by_user,
+        "transfers_blocked": a.transfers_blocked,
+        "closing_transactions_only": cfg.closing_transactions_only,
+        "m2_account_state_verified": not m2_account_state_problems(a, cfg),
     }
 
 

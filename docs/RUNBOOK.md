@@ -63,8 +63,18 @@ broker omits it (unknown — never treated as `false`). The configuration fields
 `pdt_check`/`dtbp_check` are optional too (not shown; recorded in a new ledger's broker
 baseline as JSON `null` when unreported; A§12.25); every other configuration field is
 still required. No gate, risk check, identity check,
-reconciliation or order decision uses it. The account's `trade_suspended_by_user` and
-`transfers_blocked` fields are **not** read or shown yet (open question, A§12.24).
+reconciliation or order decision uses it.
+
+Restriction fields (M2-1, A§12.34) are shown as reported: `trade_suspended_by_user`,
+`transfers_blocked`, `suspend_trade`, `closing_transactions_only` (`null` = not reported —
+**unknown, never false**), plus `new_entries_restricted` and `m2_entry_problems` (what
+would make a future paper-execution entry ineligible on account grounds, e.g. shorting
+enabled or a multiplier above 1). These never change `broker-check`'s exit code. A known
+restriction, or an unreported `trade_suspended_by_user` / `closing_transactions_only`,
+blocks new entries (`status --broker` gate codes `BROKER_ACCOUNT_RESTRICTED` /
+`BROKER_RESTRICTION_UNKNOWN`); reconciliation records them as advisories only. A
+non-boolean value is a payload error (exit 10). Do **not** change account settings to test
+these fields: that is a broker write and needs separate authorization.
 
 ### Supervised read-only contract run (operator-authorized only)
 
@@ -142,9 +152,13 @@ no settlement data covers it); otherwise they stay unsettled and new entries are
 
 ## 4. Ledger initialization (account-backed observe ledger)
 
-> **Do not run `init-ledger` against the real account until a separate, explicit
-> authorization is granted.** The M1 initialization exception (A§12.32) is a policy, not
-> an authorization; C5, C7 and C9 remain INCONCLUSIVE and M2 order execution is not
+> **Status (2026-11-13):** the real observe ledger has been initialized; two live
+> reconciliations were CLEAN and the `INITIALIZED` halt was cleared by an audited
+> `resume`; the ledger runs in OBSERVE mode with trading disabled, and a three-cycle
+> market-hours observation session is pending. `init-ledger` refuses while that ledger
+> exists. Any further initialization (another account, or re-creation) still needs
+> its own explicit authorization: the M1 initialization exception (A§12.32) is a policy,
+> not an authorization; C5, C7 and C9 remain INCONCLUSIVE and M2 order execution is not
 > authorized.
 
 Prerequisites: the dedicated paper account is **flat** (no positions, no open orders), not

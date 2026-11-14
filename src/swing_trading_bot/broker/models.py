@@ -43,6 +43,15 @@ class AccountSnapshot:
     account_blocked: bool
     accrued_fees: Decimal
     pending_reg_taf_fees: Decimal
+    trade_suspended_by_user: bool | None
+    """Account restriction (M2-1, A§12.34). Installed SDK: "the account is not allowed to
+    place orders". ``None`` = not reported (absent or ``null``) — **unknown, never
+    ``False``**; unknown blocks new entries (``risk.account_restrictions``)."""
+    transfers_blocked: bool | None
+    """Account restriction (M2-1). Installed SDK: money-transfer requests only. ``True``
+    blocks new entries as a conservative M2 policy — not a verified Alpaca order
+    restriction (a wider hold is not ruled out); never an exit blocker. ``None`` = not
+    reported (unknown)."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "as_of", _aware(self.as_of, "as_of"))
@@ -63,10 +72,18 @@ class AccountConfigSnapshot:
     """Same policy as :attr:`pdt_check`."""
     suspend_trade: bool
     fractional_trading: bool
+    closing_transactions_only: bool | None
+    """Account restriction (M2-1, A§12.34). Observed as a JSON boolean in the paper
+    ``/v2/account/configurations`` payload (Step 15B run #2) but **absent from the
+    installed SDK**; its meaning is not confirmed and is not inferred beyond "new
+    entries are not permitted while it is true". ``None`` = not reported (unknown, never
+    ``False``); unknown blocks new entries."""
 
     @property
     def m2_protections_in_place(self) -> bool:
-        """U6: required before M2 paper execution; reported only in M1."""
+        """U6: ``no_shorting`` and a margin multiplier of exactly 1. Required for M2 paper
+        execution (``risk.account_restrictions.m2_entry_problems``); reported only in M1.
+        Account *restrictions* are assessed separately."""
         return self.no_shorting and self.max_margin_multiplier == 1
 
 

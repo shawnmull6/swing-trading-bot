@@ -16,8 +16,12 @@ evidence publication and write-failure handling, §12.30) committed; live run #4
 (2026-11-13) PASSED with no FAILED row (C7 still INCONCLUSIVE); steps 15B.6A–15B.6C
 (configuration errors, deep nesting, exact activity comparison, §12.31) committed;
 step 15B.8 (single-page activity guard for `init-ledger`) committed; a narrow M1
-initialization exception policy is recorded (§12.32). Real-ledger initialization is not
-authorized; M2 execution is not authorized.** Decision log: `docs/M1_PLAN.md` §2.
+initialization exception policy is recorded (§12.32); M2-1 account restriction and
+protection enforcement implemented offline (§12.34). Current M1 state (2026-11-13): the
+real observe ledger has been initialized; two live reconciliations were CLEAN and the
+`INITIALIZED` halt was cleared by an audited `resume`; the ledger runs in OBSERVE mode
+with trading disabled, and a three-cycle market-hours observation session is pending.
+M2 execution is not authorized.** Decision log: `docs/M1_PLAN.md` §2.
 
 Scope: the core infrastructure delivered in Milestone M1 and the seams later milestones
 (signals, strategy, TradePlan lifecycle "RTH-01", paper execution) plug into.
@@ -2460,6 +2464,8 @@ mapper ignores:
   toggled (a configurations PATCH — a write, not authorized).
 * **Blocker:** verified enforcement of trading suspension (both flags, at every entry
   decision) is required **before any real broker order execution is enabled** (M2).
+* *Update (M2-1, §12.34):* both fields are now mapped (optional; unknown fails closed for
+  entries) and enforced offline; their live semantics remain unverified.
 
 **5. Still unverified / next steps.** C1–C9 (identity format, configuration values,
 clock/calendar, flat-account lists, unknown-id 404, activity pagination, market data,
@@ -2536,7 +2542,9 @@ orders"), `closing_transactions_only` (semantics **unconfirmed** — absent from
 not inferred from its name), `transfers_blocked` (SDK: money-transfer requests only).
 `suspend_trade` is not checked by reconciliation, `init-ledger` or exit readiness. These
 remain open; verified trading-suspension/closing-only enforcement at every entry decision
-is an **M2 blocker** (not implemented in 15B.4).
+is an **M2 blocker** (not implemented in 15B.4). *Update (M2-1, §12.34): mapped and
+enforced offline at every entry decision, reported by exit readiness and reconciliation;
+live semantics still unverified.*
 
 **6. Next.** Live run #3 is justified after review of 15B.4 and **requires separate,
 explicit authorization**. A mismatch inside a contract check is recorded as a FAILED row
@@ -3117,7 +3125,11 @@ below already existed. *Live validation:* incomplete — C5, C7 and C9 remain
 INCONCLUSIVE, C10–C13 DEFERRED. *Initialization:* **not authorized** — an `init-ledger`
 invocation needs a separate, explicit approval after a preflight review. *M2 execution:*
 **not authorized**. This section narrows §12.26 ¶7 for one operation only; it does not
-mark any contract row VERIFIED.
+mark any contract row VERIFIED. *Update (2026-11-13): initialization was subsequently
+authorized and performed — two live reconciliations were CLEAN and the `INITIALIZED`
+halt was cleared by an audited `resume`; the ledger runs in OBSERVE mode with trading
+disabled, and a three-cycle market-hours observation session is pending. The
+exception's expiry before M2 order execution (¶6) is unchanged.*
 
 **2. Scope.** The exception permits *considering* the initial creation of the M1
 observe-only virtual ledger while C5, C7 and C9 are INCONCLUSIVE, and only when all of
@@ -3261,6 +3273,133 @@ before and after storage fails closed / conflicts; duplicate retrieval across da
 coverage marker unset at init; rebaseline lists only the post-baseline activity; the
 baseline instant (observed → reflected; not observed → MISMATCH); legacy ledgers (cursor
 only → CLEAN; more history → MISMATCH). 12 of the 16 fail on the previous implementation.
+
+### 12.34 M2-1: account restriction and protection enforcement (offline)
+
+**1. Status.** Offline implementation only (Step 16.2). No broker request, no ledger,
+account-setting or schema change, no migration; no execution path added. `PAPER_EXECUTE`
+remains refused (`ledger/db.py`, `GateConfig`) and M2 execution is **not authorized**.
+Everything below is *implemented and tested offline*; field meanings come from the
+installed alpaca-py 0.45.0 docstrings and the field names/JSON types observed in live
+runs #1–#2 (§12.24, §12.25) — **no behaviour of these fields has been live-verified**.
+
+**2. Field mapping** (`broker/mapping.py`, `broker/models.py`). Three states per field:
+true, false, *unknown* (absent or `null` → `None`, never `false`); a present non-boolean
+value → `InvalidBrokerDataError` (exit 10 / persistent `BROKER_PAYLOAD` halt; `init-ledger`
+refuses).
+
+| Field | Endpoint | Observed live | SDK | Mapping |
+|---|---|---|---|---|
+| `trading_blocked`, `account_blocked` | `/v2/account` | bool | Optional[bool] | required (unchanged) |
+| `trade_suspended_by_user` | `/v2/account` | bool (runs #1–#2) | Optional[bool], "not allowed to place orders" | **new**, optional |
+| `transfers_blocked` | `/v2/account` | bool (runs #1–#2) | Optional[bool], "money transfers" | **new**, optional |
+| `suspend_trade` | `/account/configurations` | bool | bool, "unable to submit new orders" | required (unchanged) |
+| `closing_transactions_only` | `/account/configurations` | bool (run #2) | **absent** | **new**, optional |
+| `no_shorting`, `max_margin_multiplier` | `/account/configurations` | bool, str | bool, str | required (unchanged) |
+
+The new fields are optional (not required) so an omission by the broker cannot halt the
+M1 observe ledger as `BROKER_PAYLOAD`; it is instead an *unknown* state with the
+fail-closed consequences below. `shorting_enabled` (account) stays unmapped. The
+structural test `tests/unit/test_pdt_isolation.py` now allows exactly these three fields
+plus `pattern_day_trader` through `opt_boolean`.
+
+**3. Policy** (`risk/account_restrictions.py`, pure, no I/O; one interpretation shared by
+gates, pre-trade, exit readiness, reconciliation and `broker-check`).
+
+| Field | True blocks | Unknown |
+|---|---|---|
+| `status` ≠ `ACTIVE`, `trading_blocked`, `account_blocked` | entries; documented to prevent every order write | — (required) |
+| `trade_suspended_by_user` | entries; documented to prevent every order write | **blocks entries** |
+| `suspend_trade` | entries; documented to prevent every order write | — (required) |
+| `closing_transactions_only` | entries only (meaning unconfirmed; nothing inferred beyond that) | **blocks entries** |
+| `transfers_blocked` | entries only — a **conservative M2 policy**, not a verified Alpaca order restriction (SDK: money transfers only; a wider hold is not ruled out) | reported (M1); blocks M2 |
+
+A snapshot that could not be read leaves all its fields unknown and never permits an
+entry. Fail-closed rule for uncertain M2 entry eligibility: **an entry is eligible on
+account grounds only if every restriction field is reported and false, the account is
+`ACTIVE`, and U6 holds** (`m2_entry_problems`).
+
+**4. Entry enforcement.**
+* *Gates* (`risk/gates.py`, re-derived on every evaluation from fresh reads):
+  `BROKER_ACCOUNT_RESTRICTED` (transient) now lists every known restriction of both
+  snapshots; new transient `BROKER_RESTRICTION_UNKNOWN` for an unreported
+  `trade_suspended_by_user` / `closing_transactions_only`; new advisory
+  `BROKER_RESTRICTION_UNREPORTED` for an unreported `transfers_blocked`.
+  `BROKER_ACCOUNT_CONFIG_UNSUPPORTED` (startup: `suspend_trade`, `fractional_trading`) is
+  unchanged.
+* *M2 requirement* (`GateConfig.require_m2_account_protections`, default `False`): when
+  set, `ACCOUNT_PROTECTIONS_NOT_SET` becomes a startup-layer block (unchanged), an
+  unreadable configuration is itself `ACCOUNT_PROTECTIONS_NOT_SET` (previously no finding),
+  and new startup-layer `M2_ACCOUNT_STATE_UNVERIFIED` lists every active, unreported or
+  unavailable restriction field. A `PAPER_EXECUTE` `GateConfig` without the flag is
+  rejected (then refused anyway, M1). OBSERVE and SIMULATE never set it, so U6 stays
+  report-only in M1.
+* *Pre-trade* (`risk/pretrade.py`): account-level restrictions → `ACCOUNT_RESTRICTED`;
+  unreported `trade_suspended_by_user` → new `ACCOUNT_RESTRICTION_UNKNOWN`. Configuration-
+  level restrictions reach the engine through the required fresh gate status
+  (`GATE_BLOCKED`). `OrderManager.place_entry` re-reads both before any intent is written.
+* *`broker-check`* reports the four restriction fields (`null` = not reported),
+  `new_entries_restricted` and `m2_entry_problems`; its exit code still reflects identity
+  only.
+
+**5. Exit safety** (`risk/exits.py`; no exit execution exists). Entry prohibitions never
+suppress exits:
+* `closing_transactions_only=true` and `transfers_blocked=true` are reported as
+  entry-only restrictions (`BROKER_CLOSING_TRANSACTIONS_ONLY`, `BROKER_TRANSFERS_BLOCKED`);
+  the exit stays safe to attempt. Closing-only is also noted as semantically unconfirmed.
+* Only restrictions documented to prevent *every* order write make an exit unattemptable:
+  `trading_blocked`/`account_blocked`/non-`ACTIVE` (`BROKER_ACCOUNT_RESTRICTED`,
+  unchanged) and, new, `trade_suspended_by_user`/`suspend_trade` true
+  (`BROKER_ORDERS_SUSPENDED`). This reports that the broker would refuse; it cancels or
+  suppresses nothing, and already-resting broker orders are unaffected.
+* Unknown restriction fields and an unreadable configuration are reported in
+  `ExitReadiness.broker_eligibility_unverified` — never a failure (no weakening of
+  risk-reducing exits) and never evidence that the broker would accept an exit:
+  `broker_eligibility_confirmed` is true only when the exit is safe to attempt **and**
+  nothing is unverified (Step 16.2A). `safe_to_attempt` alone is not broker permission.
+* Gate-level `exits.permitted_in_principle` is unchanged: no new reason is exit-blocking.
+
+**6. Reconciliation and initialization.** Reconciliation judges ledger/broker agreement,
+which restrictions do not change: known `trade_suspended_by_user`, `transfers_blocked`,
+`suspend_trade` or `closing_transactions_only` → ADVISORY `ACCOUNT_ORDER_RESTRICTION`;
+unreported fields → ADVISORY `ACCOUNT_RESTRICTION_UNREPORTED`. Neither makes a run
+INCONCLUSIVE, so an operator-imposed suspension cannot escalate an observe ledger to
+`RECON_INCONCLUSIVE_REPEAT` or block `resume`; entry enforcement stays with the gates.
+`status`/`trading_blocked`/`account_blocked` keep the INCONCLUSIVE `ACCOUNT_RESTRICTED`
+finding. `init-ledger` refusals are unchanged (blocked/restricted account, fees, not
+flat, …); its preview reports the four fields, and new broker baselines record
+`closing_transactions_only` (JSON `null` when unreported) in `account_config_json`.
+Historical baselines are untouched. A malformed value refuses initialization (exit 10)
+and halts runtime commands (`BROKER_PAYLOAD`), as before for every payload error.
+
+**7. Tests.** `tests/unit/test_account_restrictions.py` (mapping: present/absent/null/
+true/false/malformed for every field, required fields still strict; policy truth tables;
+U6 and M2 eligibility; `GateConfig`; SimBroker payloads; structural: pure policy module,
+read adapter without write methods) and
+`tests/integration/test_account_restriction_paths.py` (gates in M1 and with the M2
+requirement, mid-session changes, pre-trade, `OrderManager` writes nothing, exit
+readiness, reconciliation advisories, observe CLI with the real adapter: observed shape
+unchanged, unreported field reported without halting, malformed → exit 10 /
+`BROKER_PAYLOAD`, `init-ledger` preview, `broker-check`). Step 16.2A added: a CLEAN
+reconciliation never overrides a restriction (gate and pre-trade still block, with the
+reconciliation requirement satisfied), and unknown exit eligibility is never confirmed
+permission. SimBroker gained
+`account_blocked`, `trade_suspended_by_user`, `transfers_blocked` and
+`closing_transactions_only` (`None` omits the key).
+
+**8. Remaining M2 blockers (live validation required; none resolved here).**
+* Semantics of `closing_transactions_only` (absent from the SDK), and whether it permits
+  exits; whether `trade_suspended_by_user` equals `suspend_trade` or also changes
+  `trading_blocked`/`status`; whether `transfers_blocked` signals anything beyond
+  transfers. Observing them requires toggling settings (a configurations PATCH — a
+  write, **not authorized**) or Alpaca documentation; the policy stays fail-closed until
+  then.
+* U6 on the real paper account (live run #4: shorting not disabled, multiplier ≠ 1): an
+  operator settings change, then a read-only C2 / `broker-check` verification (M2-L2).
+* Whether the paper API ever omits these fields (only two samples of `/v2/account`, one of
+  the configuration payload).
+* The M2-V1 account-id and `PAPER_ONLY` status checks and every other §12.32 ¶6 / M1_PLAN
+  §9 criterion are unchanged by this step.
 
 ---
 

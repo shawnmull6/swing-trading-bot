@@ -95,8 +95,10 @@ def test_init_records_json_null_for_unreported_fields(e: CliEnv) -> None:
     e.init()
     (cfg,) = configs(e)
     assert set(cfg) == {"no_shorting", "max_margin_multiplier", "pdt_check", "dtbp_check",
-                        "suspend_trade", "fractional_trading"}  # fmt: skip
+                        "suspend_trade", "fractional_trading",
+                        "closing_transactions_only"}  # fmt: skip  # M2-1 audit key
     assert cfg["pdt_check"] is None and cfg["dtbp_check"] is None
+    assert cfg["closing_transactions_only"] is False  # observed shape: reported, false
     assert e.run("verify-ledger", str(e.ledger))[0] == 0
 
 

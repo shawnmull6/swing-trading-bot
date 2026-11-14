@@ -67,6 +67,7 @@ from swing_trading_bot.ledger.portfolio import market_date
 from swing_trading_bot.ledger.repositories import SyncStateRepository, TradingStateRepository
 from swing_trading_bot.ledger.sync_keys import BROKER_ACCOUNT_ID
 from swing_trading_bot.oms.order_manager import CrashHook
+from swing_trading_bot.risk.account_restrictions import assess_restrictions, m2_entry_problems
 
 
 class BrokerNotConfiguredError(RuntimeError):
@@ -412,6 +413,7 @@ def cmd_broker_check(ctx: Context, _args: argparse.Namespace) -> Outcome:
     config = broker.get_account_config()
     clock = broker.get_clock()
     problems = account_identity_problems(account, environment="paper")
+    restrictions = assess_restrictions(account, config)  # reported; never changes the exit
     result = {
         "environment": account.environment,
         "account_id": mask_account_id(account.account_id),
@@ -424,6 +426,13 @@ def cmd_broker_check(ctx: Context, _args: argparse.Namespace) -> Outcome:
         "no_shorting": config.no_shorting,
         "max_margin_multiplier": str(config.max_margin_multiplier),
         "m2_account_protections": config.m2_protections_in_place,
+        # M2-1 restriction fields: JSON null = not reported (unknown, never false).
+        "trade_suspended_by_user": account.trade_suspended_by_user,
+        "transfers_blocked": account.transfers_blocked,
+        "suspend_trade": config.suspend_trade,
+        "closing_transactions_only": config.closing_transactions_only,
+        "new_entries_restricted": not restrictions.entries_permitted,
+        "m2_entry_problems": list(m2_entry_problems(account, config)),
         "market_open": clock.is_open,
         "identity_problems": problems,
         "execution_available": False,

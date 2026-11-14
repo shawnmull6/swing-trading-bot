@@ -34,8 +34,9 @@ MATRIX: tuple[Row, ...] = (
         "account_identity", ("test_checks_pass_on_synthetic_account",
                              "test_identity_violations_fail_closed")),
     Row("C2", "Account configuration and restrictions",
-        "restriction flags parsed; U6 protections reported",
-        "real no_shorting / max_margin_multiplier / suspend_trade values", "-",
+        "restriction flags parsed (true/false/unknown); U6 protections reported",
+        "real no_shorting / max_margin_multiplier / suspend_trade values; presence of "
+        "trade_suspended_by_user / transfers_blocked / closing_transactions_only (M2-1)", "-",
         "account_restrictions", ("test_checks_pass_on_synthetic_account",)),
     Row("C3", "Broker clock",
         "offset-aware timestamps required; is_open checked against the calendar",

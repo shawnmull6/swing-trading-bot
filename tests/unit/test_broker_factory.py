@@ -42,7 +42,7 @@ def account(**changes: Any) -> AccountSnapshot:
         "environment": "paper", "status": "ACTIVE", "currency": "USD", "cash": 0,
         "non_marginable_buying_power": 0, "multiplier": 1, "pattern_day_trader": None,
         "trading_blocked": False, "account_blocked": False, "accrued_fees": 0,
-        "pending_reg_taf_fees": 0,
+        "pending_reg_taf_fees": 0, "trade_suspended_by_user": False, "transfers_blocked": False,
     }  # fmt: skip
     base.update(changes)
     return AccountSnapshot(**base)

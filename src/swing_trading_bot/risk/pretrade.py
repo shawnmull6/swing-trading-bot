@@ -83,6 +83,7 @@ from swing_trading_bot.ledger.repositories import (
 )
 from swing_trading_bot.ledger.state_fingerprint import ledger_fingerprint
 from swing_trading_bot.ledger.sync_keys import BROKER_ACCOUNT_ID
+from swing_trading_bot.risk.account_restrictions import ENTRY_CRITICAL, assess_restrictions
 from swing_trading_bot.risk.gates import EXPECTED_ENVIRONMENT, GateStatus
 
 _SYMBOL_OK: Final = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.")
@@ -130,6 +131,7 @@ class RejectionCode(StrEnum):
     ACCOUNT_EVIDENCE_STALE = "ACCOUNT_EVIDENCE_STALE"
     ACCOUNT_MISMATCH = "ACCOUNT_MISMATCH"
     ACCOUNT_RESTRICTED = "ACCOUNT_RESTRICTED"
+    ACCOUNT_RESTRICTION_UNKNOWN = "ACCOUNT_RESTRICTION_UNKNOWN"
     LEDGER_INCONSISTENT = "LEDGER_INCONSISTENT"
     PORTFOLIO_MISSING = "PORTFOLIO_MISSING"
     PERSISTENT_HALT = "PERSISTENT_HALT"
@@ -505,8 +507,15 @@ class PreTradeRiskEngine:
             ev.reject(RejectionCode.ACCOUNT_EVIDENCE_STALE, account.as_of.isoformat())
         if account.environment != EXPECTED_ENVIRONMENT[self._config.mode]:
             ev.reject(RejectionCode.ACCOUNT_MISMATCH, f"environment {account.environment}")
-        if account.status != "ACTIVE" or account.trading_blocked or account.account_blocked:
-            ev.reject(RejectionCode.ACCOUNT_RESTRICTED, account.status)
+        # Account-level restrictions (M2-1, A§12.34); configuration-level ones
+        # (suspend_trade, closing_transactions_only) reach this engine through the
+        # required fresh gate status (BROKER_ACCOUNT_RESTRICTED / _UNKNOWN).
+        restrictions = assess_restrictions(account, None)
+        if restrictions.active:
+            ev.reject(RejectionCode.ACCOUNT_RESTRICTED, ", ".join(restrictions.active))
+        unknown = sorted(f.value for f in restrictions.unreported if f in ENTRY_CRITICAL)
+        if unknown:
+            ev.reject(RejectionCode.ACCOUNT_RESTRICTION_UNKNOWN, ", ".join(unknown))
 
     # ---------------------------------------------------------------- ledger
     def _check_ledger(self, s: Session, ev: _Evaluation) -> bool:

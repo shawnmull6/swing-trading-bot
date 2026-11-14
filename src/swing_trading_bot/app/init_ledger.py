@@ -115,6 +115,11 @@ class InitEvidence:
             "currency": None if a is None else a.currency,
             "trading_blocked": None if a is None else a.trading_blocked,
             "account_blocked": None if a is None else a.account_blocked,
+            # M2-1: reported only (null = not reported); none is an init refusal.
+            "trade_suspended_by_user": None if a is None else a.trade_suspended_by_user,
+            "transfers_blocked": None if a is None else a.transfers_blocked,
+            "suspend_trade": None if c is None else c.suspend_trade,
+            "closing_transactions_only": None if c is None else c.closing_transactions_only,
             "positions": self.positions,
             "open_orders": self.open_orders,
             "activities_in_lookback": self.activities,
@@ -383,6 +388,7 @@ def _build(
                     "dtbp_check": account_config.dtbp_check,
                     "suspend_trade": account_config.suspend_trade,
                     "fractional_trading": account_config.fractional_trading,
+                    "closing_transactions_only": account_config.closing_transactions_only,
                 },
                 activity_cursor_id=ev.last_activity_id,
             )

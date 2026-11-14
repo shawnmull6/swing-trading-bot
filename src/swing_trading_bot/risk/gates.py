@@ -64,6 +64,12 @@ from swing_trading_bot.ledger.sync_keys import (
     BROKER_ENVIRONMENT,
     LAST_SUCCESSFUL_SYNC,
 )
+from swing_trading_bot.risk.account_restrictions import (
+    ENTRY_CRITICAL,
+    assess_restrictions,
+    m2_account_state_problems,
+    u6_problems,
+)
 
 EXPECTED_ENVIRONMENT: Final = {RuntimeMode.OBSERVE: "paper", RuntimeMode.SIMULATE: "sim"}
 UNRESOLVED_ORDER_STATUSES: Final = (
@@ -99,6 +105,7 @@ class GateReason(StrEnum):
     BROKER_IDENTITY_MISMATCH = "BROKER_IDENTITY_MISMATCH"
     BROKER_ENVIRONMENT_MISMATCH = "BROKER_ENVIRONMENT_MISMATCH"
     BROKER_ACCOUNT_CONFIG_UNSUPPORTED = "BROKER_ACCOUNT_CONFIG_UNSUPPORTED"
+    M2_ACCOUNT_STATE_UNVERIFIED = "M2_ACCOUNT_STATE_UNVERIFIED"
     RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
     # persistent
     PERSISTENT_HALT = "PERSISTENT_HALT"
@@ -109,6 +116,7 @@ class GateReason(StrEnum):
     BROKER_AUTH_FAILED = "BROKER_AUTH_FAILED"
     BROKER_DATA_INVALID = "BROKER_DATA_INVALID"
     BROKER_ACCOUNT_RESTRICTED = "BROKER_ACCOUNT_RESTRICTED"
+    BROKER_RESTRICTION_UNKNOWN = "BROKER_RESTRICTION_UNKNOWN"
     MARKET_CLOSED = "MARKET_CLOSED"
     BROKER_SYNC_STALE = "BROKER_SYNC_STALE"
     BROKER_OUTAGE_ACTIVE = "BROKER_OUTAGE_ACTIVE"
@@ -136,6 +144,7 @@ class GateReason(StrEnum):
     UNMAPPED_BLOCKER = "UNMAPPED_BLOCKER"
     # advisories (non-blocking in M1)
     ACCOUNT_PROTECTIONS_NOT_SET = "ACCOUNT_PROTECTIONS_NOT_SET"
+    BROKER_RESTRICTION_UNREPORTED = "BROKER_RESTRICTION_UNREPORTED"
     CALENDAR_HORIZON_SHORT = "CALENDAR_HORIZON_SHORT"
 
 
@@ -278,10 +287,14 @@ class GateConfig:
     calendar_horizon_warning_days: int
     activity_posting_lag: timedelta
     reconciliation_max_age: timedelta
-    require_m2_account_protections: bool = False  # U6: report-only in M1
+    require_m2_account_protections: bool = False
+    """U6 protections and verified account state (M2-1, A§12.34). ``False`` keeps M1
+    OBSERVE/SIMULATE report-only; a PAPER_EXECUTE configuration must set it."""
 
     def __post_init__(self) -> None:
         if self.mode is RuntimeMode.PAPER_EXECUTE:
+            if not self.require_m2_account_protections:
+                raise ValueError("paper_execute requires require_m2_account_protections=True")
             raise ValueError("paper_execute is not available in M1")
 
 
@@ -501,6 +514,59 @@ class TradingGates:
                         f"{config.max_margin_multiplier} (U6: required before M2)",
                     )
                 )
+        out += self._m2_account(broker)
+        return out
+
+    def _m2_account(self, broker: _BrokerView) -> list[GateFinding]:
+        """M2-1: with ``require_m2_account_protections`` the U6 protections must be
+        verifiable and every restriction field reported and clear (startup layer)."""
+        if not self._config.require_m2_account_protections:
+            return []
+        st = GateLayer.STARTUP
+        out: list[GateFinding] = []
+        config = broker.config
+        if config is None:  # U6 cannot be verified: fail closed
+            out.append(
+                GateFinding(
+                    st, GateReason.ACCOUNT_PROTECTIONS_NOT_SET, "; ".join(u6_problems(None))
+                )
+            )
+        state = m2_account_state_problems(broker.account, config)
+        if state:
+            out.append(GateFinding(st, GateReason.M2_ACCOUNT_STATE_UNVERIFIED, "; ".join(state)))
+        return out
+
+    @staticmethod
+    def _restrictions(broker: _BrokerView) -> list[GateFinding]:
+        """Account restrictions (M2-1). A known restriction or an unreported entry-critical
+        field blocks new entries; an unreported ``transfers_blocked`` is advisory. Fields of
+        an unreadable snapshot are already covered by the read-failure finding."""
+        r = assess_restrictions(broker.account, broker.config)
+        out: list[GateFinding] = []
+        if r.active:
+            out.append(
+                GateFinding(
+                    GateLayer.TRANSIENT, GateReason.BROKER_ACCOUNT_RESTRICTED, ", ".join(r.active)
+                )
+            )
+        critical = sorted(f.value for f in r.unreported if f in ENTRY_CRITICAL)
+        if critical:
+            out.append(
+                GateFinding(
+                    GateLayer.TRANSIENT,
+                    GateReason.BROKER_RESTRICTION_UNKNOWN,
+                    "not reported: " + ", ".join(critical),
+                )
+            )
+        other = sorted(f.value for f in r.unreported if f not in ENTRY_CRITICAL)
+        if other:
+            out.append(
+                GateFinding(
+                    GateLayer.ADVISORY,
+                    GateReason.BROKER_RESTRICTION_UNREPORTED,
+                    "not reported: " + ", ".join(other),
+                )
+            )
         return out
 
     def _persistent(self, s: Session) -> list[GateFinding]:
@@ -527,19 +593,7 @@ class TradingGates:
             )
         if not c.trading_enabled:
             out.append(GateFinding(tr, GateReason.TRADING_DISABLED, "TRADING_ENABLED=false"))
-        account = broker.account
-        if account is not None and (
-            account.status != "ACTIVE" or account.trading_blocked or account.account_blocked
-        ):
-            out.append(
-                GateFinding(
-                    tr,
-                    GateReason.BROKER_ACCOUNT_RESTRICTED,
-                    f"status={account.status}, trading_blocked="
-                    f"{account.trading_blocked}, account_blocked="
-                    f"{account.account_blocked}",
-                )
-            )
+        out += self._restrictions(broker)
         if broker.clock is not None and not broker.clock.is_open:
             out.append(
                 GateFinding(
