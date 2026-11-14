@@ -3545,6 +3545,130 @@ the OMS and `submit_failure_state` are untouched. Tests:
 `tests/unit/test_forbidden_classification.py`,
 `tests/integration/test_daily_bar_boundaries.py`.
 
+### 12.37 Step 16.9 (M2-2b): reference-close infrastructure and loss-event safety (offline)
+
+**Status.** Implemented offline and tested on disposable ledgers only. Migration 0008 is
+**not** applied to the real ledger, and consolidated closes are **not** activated for real
+OBSERVE baselines. Because observe ledgers never migrate implicitly (§12.20), the real
+ledger refuses to open (exit 9, `MigrationRequiredError`) until the separately authorized,
+backed-up `migrate --backup` is run (RUNBOOK §11).
+
+**1. `CloseSource.CONSOLIDATED_BAR`** (`ledger/loss_limit_store.py`). The close of a **raw**
+consolidated SIP daily bar, recorded as a reference close; never `OFFICIAL` (equivalence
+to the official auction close is unverified, Step 16.8). `SessionClose` requires
+`feed='sip'` and `adjustment='raw'` for it, and `adjustment` is `NULL` for every other
+source. `as_of` is the bar's source timestamp (session midnight, market time) and
+`received_at` its observation time.
+
+**2. Migration 0008** (`0008_consolidated_reference_closes.sql`). Rebuilds
+`session_closes`: adds `CONSOLIDATED_BAR` to the allowed sources and the nullable
+`adjustment` column, and enforces source/feed/adjustment combinations with NULL-safe
+CHECKs. The 0004 `DAILY_BAR` feed check accepted a NULL feed, because a CHECK that
+evaluates to NULL passes; that is now rejected. Existing rows are copied unchanged
+(`OFFICIAL` is never relabelled). Append-only triggers are recreated. New append-only
+table `session_close_conflicts` with `UNIQUE (symbol, session_date, source,
+observed_close)`. Any violating legacy row rolls the whole migration back. Tests:
+`tests/integration/test_migration_0008.py`.
+
+**3. Acquisition** (`risk/reference_closes.py`, `ReferenceCloseRecorder`).
+* Runs once per sync cycle, after marks and before position verification. It does
+  **nothing** unless `LossLimitConfig.consolidated_closes_enabled` is set; that gate is
+  off by default, and `AppConfig.loss_limits(OBSERVE)` pins it off.
+* The reference sessions are those of the current daily and weekly baselines,
+  de-duplicated. The symbols are those the ledger held at that session's close. No
+  holdings, or every symbol already recorded, means no request.
+* It is eligible at or after **20:00 America/New_York on the session date**, for normal
+  and early-close sessions alike. Weekends and holidays are never reference sessions, so
+  the first cycle after the threshold (that evening or the next morning) records. There
+  is no scheduler.
+* One `get_daily_bars(held, d, d, feed="sip", adjustment="raw")`, outside any
+  transaction. A broker error records nothing. There is no IEX fallback and no
+  replacement or interpolated price.
+* **Admission** requires all of:
+  * exactly one bar, for that symbol and session;
+  * feed `sip` and adjustment `raw`;
+  * volume > 0;
+  * VWAP present and `|close − vwap| ≤ 10% × vwap`;
+  * the bar received at or after the threshold.
+
+  OHLC consistency is already enforced by `DailyBar`. Alpaca's daily VWAP and volume
+  include extended-hours trades (Step 16.8), so the VWAP check is only a coarse guard:
+  passing it does not show that the close is official or accurate.
+
+**4. Recording and conflicts.**
+* A close is inserted once per (symbol, session, source). An identical later observation
+  is a duplicate.
+* A different one is kept as a row in `session_close_conflicts`; the recorded close is
+  never changed, overwritten or rebaselined.
+* `LossLimitMonitor` reports `REFERENCE_CLOSE_CONFLICT`, which blocks entries via gate
+  reason `REFERENCE_CLOSE_CONFLICT`, while a conflict exists for the current daily or
+  weekly reference session. That state is stored, so it survives restarts.
+* There is no automatic clearing and no halt. The block ends only when that session is no
+  longer a baseline reference; the audit row is permanent.
+* A missing close leaves the baseline missing (`SESSION_BASELINE_MISSING`, existing).
+
+**5. Activation gate.**
+* With `consolidated_closes_enabled`, `baseline_close_sources` may include
+  `CONSOLIDATED_BAR`; without it, naming it raises an error, and `DAILY_BAR` stays
+  refused. There is no implicit fallback.
+* Real OBSERVE stays `(OFFICIAL,)` with the gate off; SIMULATE defaults also keep it off.
+  Only tests enable it.
+
+**6. Loss-event ordering** (`ledger/position_verification.py`, `app/runtime.py`).
+* *Before:* `sync_cycle` called `evaluate` straight after marks, valuing ledger quantities
+  at fresh prices with no broker comparison. An overnight split (broker ×N shares, price
+  ÷N) wrote permanent `DAILY_LOCKOUT` / `WEEKLY_HALT` events and halts before reconciliation
+  could detect the mismatch.
+* *Now:* the cycle runs `verify_positions` before `evaluate`. It makes one
+  `get_positions` GET (through `RecordingBroker`, outside any transaction), compares exact
+  whole-share quantities with the ledger positions, and stores the result in `sync_state`
+  (`positions.verification`).
+* `evaluate(now, verification=…)` writes new lockout, repeat or weekly events only when
+  the verification is `VERIFIED`, at most `quantity_verification_max_age` (default 2 min)
+  from `now`, and taken against the same ledger quantities used for valuation.
+  Otherwise it writes nothing irreversible and reports `loss_events_deferred`. Existing
+  events and halts are untouched and still block.
+* *Step 16.9A:* the quantity condition is checked **again inside the write transaction
+  that records the events**, so the check and the writes are atomic. A fill adopted, a
+  position changed or any other ledger quantity change after the verification (even
+  between valuation and write) defers the events. Both broker GETs (`verify_positions`,
+  reference-close bars) call `assert_no_transaction` first.
+
+| Result | Entries | New loss events | Halt |
+|---|---|---|---|
+| `VERIFIED` | per existing gates | written as before | as before |
+| `INCONCLUSIVE` (differences only on symbols with booked-fill lag) | blocked (`POSITION_QTY_UNVERIFIED`) | deferred | none |
+| `MISMATCH` (other difference, or a negative/fractional broker qty) | blocked (`POSITION_QTY_MISMATCH`) | deferred | existing `RECON_POSITION` (recovery: reconcile + audited resume) |
+| `UNAVAILABLE` (read failed) | blocked (`POSITION_QTY_UNVERIFIED`) | deferred | only the existing §10.5 read-error halts (auth, payload); transport failures count for the outage breaker |
+
+* A later `VERIFIED` result replaces the stored one. That is new evidence, not a waiver:
+  a mismatch also left a persistent halt that only the audited resume clears.
+* A genuine crash with matching quantities is recorded exactly as before.
+* Baselines (which use quantities at the *reference* close, from booked fills) are not
+  gated. M1 cost: one extra trading-host GET per cycle.
+
+**7. Discontinuities.** `LossLimitReport.discontinuities` lists held symbols whose fresh
+mark moved at least `discontinuity_diagnostic_pct` (30%) from the reference close.
+* It is shown in the cycle output.
+* It is never a blocker, never a split classification, never a quantity adjustment, and
+  never a second limit.
+* With an inception baseline there is no reference close, so nothing to compare.
+
+**Tests.**
+* `tests/integration/test_reference_closes.py`: admission; activation gate; threshold
+  timing; weekend, holiday and early close; missing data; conflicts and restart;
+  diagnostics.
+* `tests/integration/test_loss_event_safety.py`: real `sync_cycle` with SimBroker; 10:1,
+  2:1 and 3:2 splits; read failure; stale or foreign verification; existing
+  lockout/weekly; genuine crash; restart.
+* `tests/integration/test_migration_0008.py`.
+
+**Still live-unverified:**
+* SIP close vs official close (L2) and early-close sessions;
+* Alpaca's split-activity format and when a split reaches `/positions` vs the price
+  (pre-market);
+* the real cost and latency of the extra positions GET per cycle.
+
 ---
 
 ## 13. Configuration & secrets

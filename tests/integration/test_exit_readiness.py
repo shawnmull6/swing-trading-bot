@@ -21,7 +21,7 @@ from swing_trading_bot.domain.ids import new_client_order_id
 from swing_trading_bot.ledger.repositories import TradingStateRepository
 from swing_trading_bot.risk.exits import ExitFailure, ExitReadiness, ExitReadinessAssessor
 from tests.support.gates import Env, healthy_env, record_identity
-from tests.support.loss_limits import hold
+from tests.support.loss_limits import hold, verified
 from tests.support.portfolio import NOW, make_order, mark
 
 D = Decimal
@@ -63,7 +63,9 @@ def test_halt_and_loss_limits_are_entry_only(tmp_path: Path) -> None:
     held_on_both(env, "20")
     with env.db.transaction() as tx:
         env.pf.record_mark(tx, mark("AAPL", "87.00", as_of=NOW, received=NOW))
-    env.monitor.evaluate(now=NOW)  # daily lockout + weekly breach (+ persistent halt)
+    env.monitor.evaluate(
+        now=NOW, verification=verified(env.db, env.pf, NOW)
+    )  # daily lockout + weekly breach (+ persistent halt)
     with env.db.transaction() as tx:
         TradingStateRepository().halt(tx, HaltReason.OPERATOR, detail="x", actor="op", at=NOW)
     r = assessor(env).assess("AAPL", now=NOW)

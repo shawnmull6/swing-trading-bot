@@ -219,7 +219,8 @@ def test_official_closes_and_observe_baselines_are_unchanged() -> None:
     config = AppConfig.load(ROOT / "config")
     observe = config.loss_limits(RuntimeMode.OBSERVE)
     assert observe.baseline_close_sources == (CloseSource.OFFICIAL,)
-    assert {c.value for c in CloseSource} == {"OFFICIAL", "DAILY_BAR", "SIM"}
+    assert observe.consolidated_closes_enabled is False  # Step 16.9 gate stays off
+    assert {c.value for c in CloseSource} == {"OFFICIAL", "CONSOLIDATED_BAR", "DAILY_BAR", "SIM"}
 
 
 def test_observe_commands_never_request_bars(tmp_path: Path) -> None:

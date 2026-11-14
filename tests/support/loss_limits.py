@@ -13,6 +13,11 @@ from swing_trading_bot.ledger.db import Database
 from swing_trading_bot.ledger.loss_limit_store import CloseSource, SessionClose
 from swing_trading_bot.ledger.loss_limits import LossLimitConfig, LossLimitMonitor, LossLimitReport
 from swing_trading_bot.ledger.portfolio import VirtualPortfolio
+from swing_trading_bot.ledger.position_verification import (
+    PositionVerification,
+    VerificationStatus,
+    ledger_quantities,
+)
 from tests.support.portfolio import fill, finish, make_order, mark, reserve, seed_calendar
 
 RISK_YAML = Path(__file__).resolve().parents[2] / "config" / "risk.yaml"
@@ -46,6 +51,16 @@ def close(mon: LossLimitMonitor, symbol: str, day: date, price: str) -> None:
     )  # fmt: skip
 
 
+def verified(db: Database, pf: VirtualPortfolio, at: datetime) -> PositionVerification:
+    """A fresh VERIFIED position verification: a broker whose quantities equal the
+    ledger's at ``at`` (Step 16.9 precondition for writing loss events)."""
+    with db.read() as s:
+        pid = pf.portfolio(s).id
+        assert pid is not None
+        ledger = ledger_quantities(s, pid)
+    return PositionVerification(VerificationStatus.VERIFIED, at, ledger, dict(ledger))
+
+
 def evaluate_at(
     db: Database,
     pf: VirtualPortfolio,
@@ -53,9 +68,10 @@ def evaluate_at(
     now: datetime,
     prices: dict[str, str],
 ) -> LossLimitReport:
-    """Refresh the calendar and marks at ``now`` (marks one minute old), then evaluate."""
+    """Refresh the calendar and marks at ``now`` (marks one minute old), then evaluate
+    with a fresh matching position verification."""
     seed_calendar(db, now - timedelta(minutes=5))
     with db.transaction() as tx:
         for sym, price in prices.items():
             pf.record_mark(tx, mark(sym, price, as_of=now - timedelta(minutes=1), received=now))
-    return mon.evaluate(now=now)
+    return mon.evaluate(now=now, verification=verified(db, pf, now))

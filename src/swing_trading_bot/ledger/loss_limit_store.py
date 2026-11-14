@@ -1,9 +1,12 @@
-"""Repositories for official session closes, equity baselines and loss-limit events
-(migration 0003). All three tables are append-only; writes are idempotent."""
+"""Repositories for session closes, equity baselines and loss-limit events (migrations
+0003/0004/0008). Every table is append-only; writes are idempotent. Migration 0008 adds
+the ``CONSOLIDATED_BAR`` reference-close source and the ``session_close_conflicts``
+audit table (Step 16.9)."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -28,19 +31,28 @@ from swing_trading_bot.ledger.repositories import IngestResult, canonical_json
 
 
 class CloseSource(StrEnum):
-    """Provenance of a stored session close (migration 0004).
+    """Provenance of a stored session close (migrations 0004, 0008).
 
-    Only ``OFFICIAL`` (a verified official closing price) and ``SIM`` (simulation) may
-    value a baseline. ``DAILY_BAR`` is a market-data observation — for the IEX feed a
-    single-venue last trade — and is never presented as an official close.
+    * ``OFFICIAL`` — a verified official closing price (no source implemented yet).
+    * ``CONSOLIDATED_BAR`` — the close of a **raw** (unadjusted) consolidated SIP daily
+      bar, admitted by ``risk.reference_closes`` (Step 16.9). A reference close, never an
+      official one: its equivalence to the official auction close is unverified. It may
+      value a baseline only when ``LossLimitConfig.consolidated_closes_enabled`` is set
+      (default off; the real OBSERVE runtime keeps it off).
+    * ``DAILY_BAR`` — a market-data observation (for IEX a single-venue last trade);
+      never values a baseline.
+    * ``SIM`` — simulation input.
     """
 
     OFFICIAL = "OFFICIAL"
+    CONSOLIDATED_BAR = "CONSOLIDATED_BAR"
     DAILY_BAR = "DAILY_BAR"
     SIM = "SIM"
 
 
 DAILY_BAR_FEEDS = frozenset({"iex", "sip", "delayed_sip"})
+CONSOLIDATED_FEED = "sip"
+CONSOLIDATED_ADJUSTMENT = "raw"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,16 +64,25 @@ class SessionClose:
     as_of: datetime
     received_at: datetime
     feed: str | None = None
+    adjustment: str | None = None
+    """Only for ``CONSOLIDATED_BAR``, where it must be ``raw``; ``None`` otherwise."""
 
     def __post_init__(self) -> None:
         if self.close_price <= 0:
             raise ValueError("close price must be positive")
         if self.source is CloseSource.DAILY_BAR and self.feed not in DAILY_BAR_FEEDS:
             raise ValueError("a DAILY_BAR close must name its feed (iex, sip, delayed_sip)")
+        if self.source is CloseSource.CONSOLIDATED_BAR:
+            if self.feed != CONSOLIDATED_FEED:
+                raise ValueError("a CONSOLIDATED_BAR close must come from the sip feed")
+            if self.adjustment != CONSOLIDATED_ADJUSTMENT:
+                raise ValueError("a CONSOLIDATED_BAR close must be unadjusted (raw)")
+        elif self.adjustment is not None:
+            raise ValueError("only a CONSOLIDATED_BAR close carries an adjustment")
 
 
 class SessionClosesRepository:
-    _COLS = "symbol, session_date, close_price, source, as_of, received_at, feed"
+    _COLS = "symbol, session_date, close_price, source, as_of, received_at, feed, adjustment"
 
     def record(self, tx: Tx, close: SessionClose) -> IngestResult:
         """Insert once per (symbol, session, source); an identical re-record is
@@ -71,7 +92,7 @@ class SessionClosesRepository:
             same = (existing.close_price, existing.feed) == (close.close_price, close.feed)
             return IngestResult.DUPLICATE if same else IngestResult.CONFLICT
         tx.execute(
-            f"INSERT INTO session_closes ({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO session_closes ({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 close.symbol,
                 date_to_db(close.session_date),
@@ -80,6 +101,7 @@ class SessionClosesRepository:
                 ts_to_db(close.as_of),
                 ts_to_db(close.received_at),
                 close.feed,
+                close.adjustment,
             ),
         )
         return IngestResult.INSERTED
@@ -112,7 +134,73 @@ class SessionClosesRepository:
             as_of=ts_from_db(row[4]),
             received_at=ts_from_db(row[5]),
             feed=opt_str_from_db(row[6]),
+            adjustment=opt_str_from_db(row[7]),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CloseConflict:
+    """A later observation of a recorded close that differs from it (Step 16.9). The
+    recorded close is never changed; the conflict is kept as durable audit evidence and
+    blocks new entries while it affects a current baseline."""
+
+    symbol: str
+    session_date: date
+    source: CloseSource
+    recorded_close: Decimal
+    observed_close: Decimal
+    observed_as_of: datetime
+    observed_received_at: datetime
+    detected_at: datetime
+
+
+class SessionCloseConflictsRepository:
+    _COLS = (
+        "symbol, session_date, source, recorded_close, observed_close, observed_as_of, "
+        "observed_received_at, detected_at"
+    )
+
+    def record(self, tx: Tx, conflict: CloseConflict) -> bool:
+        """Append once per (symbol, session, source, observed close); True when new."""
+        inserted = tx.execute(
+            f"INSERT INTO session_close_conflicts ({self._COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (symbol, session_date, source, observed_close) DO NOTHING",
+            (
+                conflict.symbol,
+                date_to_db(conflict.session_date),
+                conflict.source.value,
+                dec_to_db(conflict.recorded_close),
+                dec_to_db(conflict.observed_close),
+                ts_to_db(conflict.observed_as_of),
+                ts_to_db(conflict.observed_received_at),
+                ts_to_db(conflict.detected_at),
+            ),
+        )
+        return inserted == 1
+
+    def for_sessions(self, s: Session, sessions: Iterable[date]) -> list[CloseConflict]:
+        days = sorted({date_to_db(d) for d in sessions})
+        if not days:
+            return []
+        marks = ", ".join("?" for _ in days)
+        rows = s.fetch_all(
+            f"SELECT {self._COLS} FROM session_close_conflicts "
+            f"WHERE session_date IN ({marks}) ORDER BY session_date, symbol, id",
+            tuple(days),
+        )
+        return [
+            CloseConflict(
+                symbol=str_from_db(r[0]),
+                session_date=date_from_db(r[1]),
+                source=CloseSource(str_from_db(r[2])),
+                recorded_close=dec_from_db(r[3]),
+                observed_close=dec_from_db(r[4]),
+                observed_as_of=ts_from_db(r[5]),
+                observed_received_at=ts_from_db(r[6]),
+                detected_at=ts_from_db(r[7]),
+            )
+            for r in rows
+        ]
 
 
 class SnapshotKind(StrEnum):

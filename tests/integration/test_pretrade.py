@@ -19,7 +19,7 @@ from swing_trading_bot.domain.enums import (
 from swing_trading_bot.domain.fees import FeeModel
 from swing_trading_bot.ledger.repositories import OrdersRepository, ReconciliationRunsRepository
 from swing_trading_bot.risk.pretrade import Constraint, RejectionCode
-from tests.support.loss_limits import et, hold
+from tests.support.loss_limits import et, hold, verified
 from tests.support.portfolio import NOW, fill, finish, make_order, reserve
 from tests.support.pretrade import ENGINE_CONFIG, FEES, RiskEnv, codes, proposal, risk_env
 
@@ -243,7 +243,7 @@ def test_daily_lockout_blocks_new_risk(renv: RiskEnv) -> None:
     later = NOW + timedelta(minutes=5)
     renv.env.refresh(later)
     renv.set_marks({"AAPL": "85.00", "MSFT": "50.00"}, at=later)  # -$150 = -3% > 2%
-    renv.env.monitor.evaluate(now=later)
+    renv.env.monitor.evaluate(now=later, verification=verified(renv.env.db, renv.env.pf, later))
     d = renv.evaluate(proposal(), at=later)
     assert {C.DAILY_LOSS_LOCKOUT, C.GATE_BLOCKED} <= codes(d)
 
@@ -253,7 +253,7 @@ def test_weekly_breach_halts_new_risk(renv: RiskEnv) -> None:
     later = NOW + timedelta(minutes=5)
     renv.env.refresh(later)
     renv.set_marks({"AAPL": "85.00", "MSFT": "50.00"}, at=later)  # -$300 = -6% > 5%
-    renv.env.monitor.evaluate(now=later)
+    renv.env.monitor.evaluate(now=later, verification=verified(renv.env.db, renv.env.pf, later))
     d = renv.evaluate(proposal(), at=later)
     assert {C.WEEKLY_LIMIT_ACTIVE, C.PERSISTENT_HALT} <= codes(d)
 

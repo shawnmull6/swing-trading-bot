@@ -29,7 +29,7 @@ from tests.support.alpaca_fake import ACCOUNT, CLOCK, CONFIG, FakeTransport, js
 from tests.support.calendar_fixture import trading_fetch
 from tests.support.gates import GATE_CONFIG, Env, healthy_env, record_identity, resume
 from tests.support.loss_limits import CONFIG as LOSS_CONFIG
-from tests.support.loss_limits import close, et, hold
+from tests.support.loss_limits import close, et, hold, verified
 from tests.support.portfolio import CONFIG as PF_CONFIG
 from tests.support.portfolio import NOW, fill, make_order, mark, new_ledger, seed_calendar
 
@@ -288,7 +288,9 @@ def test_daily_lockout_expires_at_next_session_open(tmp_path: Path) -> None:
     hold(env.db, env.pf, "AAPL", "20", "100.00", at=NOW)
     with env.db.transaction() as tx:
         env.pf.record_mark(tx, mark("AAPL", "94.00", as_of=NOW, received=NOW))
-    env.monitor.evaluate(now=NOW)  # 120 loss on 5000: lockout
+    env.monitor.evaluate(
+        now=NOW, verification=verified(env.db, env.pf, NOW)
+    )  # 120 loss on 5000: lockout
     env.gates.run_startup(now=NOW)
     assert "DAILY_LOSS_LOCKOUT" in codes(env, NOW)
     close(env.monitor, "AAPL", MON, "94.00")
@@ -307,7 +309,7 @@ def test_weekly_restriction_survives_manual_resume(tmp_path: Path) -> None:
     hold(env.db, env.pf, "AAPL", "20", "100.00", at=NOW)
     with env.db.transaction() as tx:
         env.pf.record_mark(tx, mark("AAPL", "87.00", as_of=NOW, received=NOW))
-    env.monitor.evaluate(now=NOW)  # 260 >= 250 weekly
+    env.monitor.evaluate(now=NOW, verification=verified(env.db, env.pf, NOW))  # 260 >= 250 weekly
     env.gates.run_startup(now=NOW)
     assert {"WEEKLY_LIMIT_ACTIVE", "PERSISTENT_HALT"} <= codes(env, NOW)
     env.refresh(NOW + timedelta(seconds=5))

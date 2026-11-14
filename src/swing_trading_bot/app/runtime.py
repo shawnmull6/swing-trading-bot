@@ -15,8 +15,14 @@ Order of operations for a sync cycle (``sync`` and the operational commands):
 3. recovery (``recover_after_restart``): forced lookups of unresolved orders, then
    activity and order synchronization, then escalation — never a send;
 4. marks for held symbols (plus any explicitly requested symbols);
-5. loss-limit evaluation (baselines, lockouts, halts);
-6. ``broker.last_successful_sync`` is written only when the synchronization was OK.
+5. consolidated reference closes (Step 16.9; only when explicitly enabled — never in
+   the real OBSERVE runtime today — so normally no request);
+6. position verification (Step 16.9): one broker positions GET, outside any
+   transaction, compared exactly with the ledger and stored; a confirmed mismatch
+   raises the existing ``RECON_POSITION`` halt;
+7. loss-limit evaluation (baselines, lockouts, halts); new loss events only with the
+   fresh VERIFIED result of step 6;
+8. ``broker.last_successful_sync`` is written only when the synchronization was OK.
 
 No step clears a persistent halt; only :func:`resume` can, through the guarded
 ``resume_after_clean_reconciliation``.
@@ -45,10 +51,14 @@ from swing_trading_bot.broker.models import (
     AccountConfigSnapshot,
     AccountSnapshot,
     ActivityPage,
+    BarAdjustment,
+    BarFeed,
+    DailyBar,
     MarketClock,
 )
 from swing_trading_bot.broker.ports import (
     MAX_ACTIVITY_PAGE_SIZE,
+    BarSource,
     BrokerReadPort,
     PriceMarkSource,
 )
@@ -68,6 +78,14 @@ from swing_trading_bot.ledger.codec import date_from_db, ts_from_db, ts_to_db
 from swing_trading_bot.ledger.db import Database, Session, assert_no_transaction
 from swing_trading_bot.ledger.loss_limits import LossLimitMonitor, LossLimitReport
 from swing_trading_bot.ledger.portfolio import VirtualPortfolio
+from swing_trading_bot.ledger.position_verification import (
+    PositionVerification,
+    PositionVerificationStore,
+    VerificationStatus,
+    compare_positions,
+    fill_lag_symbols,
+    ledger_quantities,
+)
 from swing_trading_bot.ledger.repositories import (
     OrdersRepository,
     PositionsRepository,
@@ -96,14 +114,16 @@ from swing_trading_bot.oms.recovery import (
 )
 from swing_trading_bot.oms.sync import OrderSync, SyncReport, SyncStatus
 from swing_trading_bot.risk.gates import EXPECTED_ENVIRONMENT, GateStatus, TradingGates
+from swing_trading_bot.risk.reference_closes import ReferenceCloseOutcome, ReferenceCloseRecorder
 
 _log = logging.getLogger(__name__)
 RUNTIME_ACTOR = "runtime"
 Clock = Callable[[], datetime]
 
 
-class ObserveBroker(BrokerReadPort, PriceMarkSource, Protocol):
-    """What the runtime reads from: the read port plus price marks. No execution."""
+class ObserveBroker(BrokerReadPort, PriceMarkSource, BarSource, Protocol):
+    """What the runtime reads from: the read port, price marks and daily bars. No
+    execution."""
 
 
 class RecordingBroker:
@@ -168,6 +188,19 @@ class RecordingBroker:
     def get_marks(self, symbols: Sequence[str]) -> Mapping[str, PriceMark]:
         return self._call(lambda: self.inner.get_marks(symbols))
 
+    def get_daily_bars(
+        self,
+        symbols: Sequence[str],
+        start: date,
+        end: date,
+        *,
+        feed: BarFeed,
+        adjustment: BarAdjustment,
+    ) -> Mapping[str, tuple[DailyBar, ...]]:
+        return self._call(
+            lambda: self.inner.get_daily_bars(symbols, start, end, feed=feed, adjustment=adjustment)
+        )
+
 
 @dataclass(slots=True)
 class Runtime:
@@ -183,6 +216,7 @@ class Runtime:
     recovery: AmbiguousOrderRecovery
     reconciler: Reconciler
     rebaseliner: Rebaseliner
+    reference_closes: ReferenceCloseRecorder
 
     def now(self) -> datetime:
         return self.clock()
@@ -206,7 +240,8 @@ def build_runtime(
     broker = RecordingBroker(source)
     mode = db.identity.mode
     pf = VirtualPortfolio(db, config.portfolio())
-    monitor = LossLimitMonitor(db, pf, config.loss_limits(mode))
+    loss_config = config.loss_limits(mode)
+    monitor = LossLimitMonitor(db, pf, loss_config)
     gates = TradingGates(
         db, pf, monitor, broker, config.gates(mode, trading_enabled=trading_enabled)
     )
@@ -225,6 +260,7 @@ def build_runtime(
         recovery=AmbiguousOrderRecovery(db, pf, broker, oms),
         reconciler=reconciler,
         rebaseliner=Rebaseliner(db, pf, reconciler, crash=crash),
+        reference_closes=ReferenceCloseRecorder(db, pf, broker, loss_config),
     )
 
 
@@ -467,6 +503,8 @@ class CycleReport:
     sync: SyncReport | None = None
     marks: MarkRefresh | None = None
     loss: LossLimitReport | None = None
+    reference_closes: tuple[ReferenceCloseOutcome, ...] = ()
+    positions: PositionVerification | None = None
     last_successful_sync: datetime | None = None
     outage: OutageUpdate | None = None
     failure_categories: tuple[str, ...] = ()
@@ -529,7 +567,36 @@ class CycleReport:
                 "lockout_active": self.loss.lockout_active,
                 "weekly_breach_active": self.loss.weekly_breach_active,
                 "problems": list(self.loss.problems),
+                "loss_events_deferred": self.loss.loss_events_deferred,
+                "discontinuities": [
+                    {
+                        "symbol": g.symbol,
+                        "prior_close": str(g.prior_close),
+                        "price": str(g.price),
+                        "pct": str(g.pct),
+                    }
+                    for g in self.loss.discontinuities
+                ],
             },
+            "positions": None
+            if self.positions is None
+            else {
+                "status": self.positions.status.value,
+                "verified_at": self.positions.verified_at.isoformat(),
+                "differences": list(self.positions.differences),
+            },
+            "reference_closes": [
+                {
+                    "session": None if o.session_date is None else o.session_date.isoformat(),
+                    "status": o.status.value,
+                    "symbols": list(o.symbols),
+                    "recorded": list(o.recorded),
+                    "conflicts": list(o.conflicts),
+                    "rejected": {k: v.value for k, v in o.rejected.items()},
+                    "error": o.error,
+                }
+                for o in self.reference_closes
+            ],
             "last_successful_sync": None
             if self.last_successful_sync is None
             else self.last_successful_sync.isoformat(),
@@ -580,11 +647,45 @@ def _run_cycle(rt: Runtime, report: CycleReport, extra_marks: Iterable[str]) -> 
     report.escalated = list(recovery.escalated)
     report.sync = synced
     report.marks = record_marks(rt, extra_marks)
-    report.loss = rt.monitor.evaluate(now=now)
+    report.reference_closes = rt.reference_closes.run(now=now)
+    report.positions = verify_positions(rt)
+    report.loss = rt.monitor.evaluate(now=now, verification=report.positions)
     if synced.status is SyncStatus.OK:
         with rt.db.transaction() as tx:
             SyncStateRepository().set(tx, LAST_SUCCESSFUL_SYNC, ts_to_db(now), now)
         report.last_successful_sync = now
+
+
+def verify_positions(rt: Runtime) -> PositionVerification:
+    """Step 16.9: compare broker and ledger quantities exactly, store the result, and
+    apply the existing halt policies. The broker GET happens outside any transaction;
+    the comparison and the store each use their own short transaction."""
+    assert_no_transaction("broker positions read for verification")
+    error: BrokerError | None = None
+    broker: list[BrokerPosition] | None
+    try:
+        broker = rt.broker.get_positions()
+    except BrokerError as exc:  # recorded by RecordingBroker for the outage breaker
+        broker, error = None, exc
+    at = rt.now()
+    with rt.db.read() as s:
+        pid = rt.pf.portfolio(s).id
+        if pid is None:  # pragma: no cover - stored rows always have ids
+            raise RuntimeError("portfolio without id")
+        ledger = ledger_quantities(s, pid)
+        lagging = fill_lag_symbols(s)
+    detail = "" if error is None else f"positions read failed: {type(error).__name__}"
+    verification = compare_positions(ledger, broker, lag_symbols=lagging, at=at,
+                                     unavailable_detail=detail)  # fmt: skip
+    with rt.db.transaction() as tx:
+        PositionVerificationStore().save(tx, verification)
+    if error is not None and (reason := read_error_halt(error)) is not None:
+        halt_once(rt.db, reason, f"positions read failed: {type(error).__name__}: {error}",
+                  at=at)  # fmt: skip
+    if verification.status is VerificationStatus.MISMATCH:
+        halt_once(rt.db, HaltReason.RECON_POSITION,
+                  f"cycle position verification: {verification.detail}", at=at)  # fmt: skip
+    return verification
 
 
 def cycle_complete(report: CycleReport) -> bool:

@@ -79,8 +79,11 @@ class AppConfig:
         cfg = LossLimitConfig.from_risk_limits(self.risk, calendar_max_age=self.calendar_max_age)
         if mode is RuntimeMode.OBSERVE:
             # D14-8: account-backed baselines accept verified official closes only;
-            # simulated closes exist only in simulation ledgers.
-            cfg = replace(cfg, baseline_close_sources=(CloseSource.OFFICIAL,))
+            # simulated closes exist only in simulation ledgers. Step 16.9: consolidated
+            # SIP reference closes stay disabled (no acquisition, no baseline use) until
+            # official-close equivalence is validated and activation is approved.
+            cfg = replace(cfg, baseline_close_sources=(CloseSource.OFFICIAL,),
+                          consolidated_closes_enabled=False)  # fmt: skip
         return cfg
 
     def gates(self, mode: RuntimeMode, *, trading_enabled: bool) -> GateConfig:

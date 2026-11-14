@@ -37,6 +37,7 @@ EXPECTED_TABLES = {
     "calendar_fetches",
     "settlement_days",
     "session_closes",
+    "session_close_conflicts",
     "settlement_resolutions",
     "schema_migrations",
     "database_identity",

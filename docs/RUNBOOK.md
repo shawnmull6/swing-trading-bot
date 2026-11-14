@@ -343,6 +343,13 @@ uv run swing-trading-bot migrate --backup /backups/pre-migration.sqlite3
 It verifies history and integrity, writes and verifies the backup, then applies all pending
 migrations in one transaction (all or nothing). The backup path must not exist.
 
+**Pending: migration 0008 (Step 16.9, not yet authorized).** The code now packages
+migration 8 (`CONSOLIDATED_BAR` reference closes, `session_close_conflicts`). The real
+ledger is at version 7, so every command that opens it exits 9 until an operator runs the
+backed-up `migrate` above. That needs explicit authorization. Migrating does **not**
+activate consolidated baselines: OBSERVE stays `OFFICIAL`-only, with the gate off
+(ARCHITECTURE §12.37).
+
 ## 12. Lock contention
 
 Each ledger has `<ledger>.lock`, held with an OS lock for the whole command (exclusive for

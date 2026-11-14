@@ -27,12 +27,25 @@ Limits
 
 Blocks here apply to **new entries only**. Risk-reducing exits remain conceptually
 permissible during lockouts and halts (exit execution is not implemented in M1).
+
+Step 16.9 (ARCHITECTURE §12.37)
+-------------------------------
+* New loss events (lockout, repeat, weekly) are written only with a fresh ``VERIFIED``
+  broker-vs-ledger quantity verification taken against the same ledger quantities the
+  valuation used (``ledger/position_verification.py``). Otherwise they are deferred —
+  never written with unverified quantities — and entries are blocked by the stored
+  verification result. Existing events are never touched.
+* ``CONSOLIDATED_BAR`` reference closes may value baselines only when
+  ``consolidated_closes_enabled`` is set (default off). A recorded close conflict on a
+  current baseline's reference session blocks entries (``REFERENCE_CLOSE_CONFLICT``).
+* Large moves between a held symbol's reference close and its fresh mark are reported
+  as diagnostics only (``discontinuities``); they are not a risk limit.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -58,6 +71,7 @@ from swing_trading_bot.ledger.codec import dec_from_db, str_from_db, ts_to_db
 from swing_trading_bot.ledger.db import Database, Session, Tx
 from swing_trading_bot.ledger.loss_limit_store import (
     BaselineBasis,
+    CloseConflict,
     CloseSource,
     EquitySnapshot,
     EquitySnapshotsRepository,
@@ -65,10 +79,18 @@ from swing_trading_bot.ledger.loss_limit_store import (
     LossEventKind,
     LossLimitEventsRepository,
     SessionClose,
+    SessionCloseConflictsRepository,
     SessionClosesRepository,
     SnapshotKind,
 )
 from swing_trading_bot.ledger.portfolio import PortfolioSnapshot, VirtualPortfolio
+from swing_trading_bot.ledger.position_verification import (
+    DEFAULT_MAX_AGE,
+    PositionVerification,
+    PositionVerificationStore,
+    VerificationStatus,
+    ledger_quantities,
+)
 from swing_trading_bot.ledger.repositories import IngestResult, TradingStateRepository
 
 LOSS_LIMIT_ACTOR = "loss_limits"
@@ -87,10 +109,27 @@ class LossLimitConfig:
     baseline_close_sources: tuple[CloseSource, ...] = (CloseSource.OFFICIAL, CloseSource.SIM)
     """Close sources allowed to value a baseline, in preference order. DAILY_BAR
     observations (e.g. IEX) are never substituted for an official close."""
+    consolidated_closes_enabled: bool = False
+    """Explicit gate (default OFF) for raw SIP ``CONSOLIDATED_BAR`` reference closes: it
+    enables their acquisition and lets ``baseline_close_sources`` name them. The real
+    OBSERVE runtime keeps it off until official-close equivalence is validated."""
+    quantity_verification_max_age: timedelta = DEFAULT_MAX_AGE
+    """How old a VERIFIED position verification may be when loss events are written."""
+    discontinuity_diagnostic_pct: Decimal = Decimal("0.30")
+    """Reference-close-to-mark move reported as a diagnostic. Not a risk limit."""
 
     def __post_init__(self) -> None:
         if CloseSource.DAILY_BAR in self.baseline_close_sources:
             raise ValueError("daily-bar observations cannot value baselines")
+        if (
+            CloseSource.CONSOLIDATED_BAR in self.baseline_close_sources
+            and not self.consolidated_closes_enabled
+        ):
+            raise ValueError("CONSOLIDATED_BAR closes require consolidated_closes_enabled")
+        if self.quantity_verification_max_age <= timedelta(0):
+            raise ValueError("quantity_verification_max_age must be positive")
+        if self.discontinuity_diagnostic_pct <= ZERO:
+            raise ValueError("discontinuity_diagnostic_pct must be positive")
 
     @classmethod
     def from_risk_limits(cls, r: RiskLimits, *, calendar_max_age: timedelta) -> LossLimitConfig:
@@ -114,6 +153,16 @@ class LossBlocker(StrEnum):
     DAILY_LOSS_LOCKOUT = "DAILY_LOSS_LOCKOUT"
     WEEKLY_LIMIT_ACTIVE = "WEEKLY_LIMIT_ACTIVE"
     GAP_STRESS_PORTFOLIO_EXCEEDED = "GAP_STRESS_PORTFOLIO_EXCEEDED"
+    POSITION_QTY_UNVERIFIED = "POSITION_QTY_UNVERIFIED"
+    POSITION_QTY_MISMATCH = "POSITION_QTY_MISMATCH"
+    REFERENCE_CLOSE_CONFLICT = "REFERENCE_CLOSE_CONFLICT"
+
+
+_VERIFICATION_BLOCKERS: dict[VerificationStatus, LossBlocker] = {
+    VerificationStatus.MISMATCH: LossBlocker.POSITION_QTY_MISMATCH,
+    VerificationStatus.INCONCLUSIVE: LossBlocker.POSITION_QTY_UNVERIFIED,
+    VerificationStatus.UNAVAILABLE: LossBlocker.POSITION_QTY_UNVERIFIED,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +194,14 @@ class LossLimitReport:
     gap_stress: GapStressReport | None
     blockers: tuple[LossBlocker, ...]
     problems: tuple[str, ...] = field(default_factory=tuple)
+    discontinuities: tuple[GapObservation, ...] = field(default_factory=tuple)
+    """Held symbols whose fresh mark moved at least ``discontinuity_diagnostic_pct`` from
+    the reference close. Diagnostic only (a split, a data fault or a genuine move)."""
+    position_verification: PositionVerification | None = None
+    """The latest stored broker-vs-ledger quantity verification."""
+    reference_close_conflicts: tuple[CloseConflict, ...] = field(default_factory=tuple)
+    loss_events_deferred: str | None = None
+    """Why ``evaluate`` wrote no new loss events although measures were available."""
 
     RISK_REDUCING_EXITS_PERMITTED: ClassVar[bool] = True
     """Loss-limit blocks and halts stop new entries only (exits are not built in M1)."""
@@ -152,6 +209,27 @@ class LossLimitReport:
     @property
     def blocks_new_entries(self) -> bool:
         return bool(self.blockers)
+
+
+def before_pid(portfolio: VirtualPortfolio, s: Session) -> int:
+    pid = portfolio.portfolio(s).id
+    if pid is None:  # pragma: no cover - stored rows always have ids
+        raise RuntimeError("portfolio without id")
+    return pid
+
+
+def quantities_at_close(s: Session, portfolio_id: int, close_at: datetime) -> dict[str, Decimal]:
+    """Ledger quantity per symbol held at ``close_at`` (from booked fills; zero omitted)."""
+    qty: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    for sym, side, q in s.fetch_all(
+        "SELECT f.symbol, f.side, f.qty FROM fills f JOIN orders o "
+        "ON o.client_order_id = f.client_order_id "
+        "WHERE o.portfolio_id = ? AND f.filled_at <= ?",
+        (portfolio_id, ts_to_db(close_at)),
+    ):
+        amount = dec_from_db(q)
+        qty[str_from_db(sym)] += amount if Side(str_from_db(side)) is Side.BUY else -amount
+    return {k: v for k, v in sorted(qty.items()) if v != ZERO}
 
 
 def current_session_for(calendar: TradingCalendar, now: datetime) -> TradingSession:
@@ -185,6 +263,8 @@ class LossLimitMonitor:
         self._pf = portfolio
         self._config = config
         self._closes = SessionClosesRepository()
+        self._conflicts = SessionCloseConflictsRepository()
+        self._verifications = PositionVerificationStore()
         self._snapshots = EquitySnapshotsRepository()
         self._events = LossLimitEventsRepository()
         self._state = TradingStateRepository()
@@ -228,15 +308,7 @@ class LossLimitMonitor:
                 (pid, close_ts))),
             ZERO,
         )  # fmt: skip
-        qty: dict[str, Decimal] = defaultdict(lambda: ZERO)
-        for sym, side, q in s.fetch_all(
-            "SELECT f.symbol, f.side, f.qty FROM fills f JOIN orders o "
-            "ON o.client_order_id = f.client_order_id "
-            "WHERE o.portfolio_id = ? AND f.filled_at <= ?",
-            (pid, close_ts),
-        ):
-            amount = dec_from_db(q)
-            qty[str_from_db(sym)] += amount if Side(str_from_db(side)) is Side.BUY else -amount
+        qty = quantities_at_close(s, pid, ref.close_at)
         marks: list[dict[str, Any]] = []
         missing: list[str] = []
         market_value = ZERO
@@ -324,27 +396,59 @@ class LossLimitMonitor:
         return self._snapshots.insert_once(tx, candidate)
 
     # ---------------------------------------------------------- evaluation
-    def evaluate(self, *, now: datetime) -> LossLimitReport:
+    def evaluate(
+        self, *, now: datetime, verification: PositionVerification | None = None
+    ) -> LossLimitReport:
         """Establish baselines, measure mark-to-market equity, record breaches (once) and
-        set persistent halts where required. Returns the resulting report."""
+        set persistent halts where required. Returns the resulting report.
+
+        New loss events are written only when ``verification`` is a fresh ``VERIFIED``
+        broker-vs-ledger comparison of exactly the ledger quantities valued here
+        (Step 16.9). Otherwise nothing irreversible is written and the reason is
+        reported as ``loss_events_deferred``; existing events still apply."""
         _, _, baseline_problems = self.establish_baselines(now=now)
         with self._db.read() as s:
             before = self._build(s, now, baseline_problems)
-        self._record_breaches(before, now)
+            valued = ledger_quantities(s, before_pid(self._pf, s))
+        deferred: str | None
+        if verification is None:
+            deferred = "no position verification for this evaluation"
+        else:
+            deferred = verification.permits_loss_events(
+                now=now, ledger_qty=valued, max_age=self._config.quantity_verification_max_age
+            )
+        if deferred is None and verification is not None:
+            # re-checked inside the write transaction: atomic with the event writes
+            deferred = self._record_breaches(before, now, verification)
         with self._db.read() as s:
-            return self._build(s, now, baseline_problems)
+            after = self._build(s, now, baseline_problems)
+        if deferred is None:
+            return after
+        problems = (*after.problems, f"loss events not recorded: {deferred}")
+        return replace(after, loss_events_deferred=deferred, problems=problems)
 
     def report(self, s: Session, *, now: datetime) -> LossLimitReport:
         """Read-only status: never writes baselines, events or halts."""
         return self._build(s, now, ())
 
-    def _record_breaches(self, r: LossLimitReport, now: datetime) -> None:
+    def _record_breaches(
+        self, r: LossLimitReport, now: datetime, verification: PositionVerification
+    ) -> str | None:
+        """Write the breaches of ``r`` (once). Returns why nothing was written when the
+        ledger quantities, read again inside this write transaction, are no longer the
+        ones ``verification`` confirmed (a fill, adjustment or other change since)."""
         if r.equity is None or r.current_session is None:
-            return
+            return None
         with self._db.transaction() as tx:
             pid = self._pf.portfolio(tx).id
             if pid is None:  # pragma: no cover
                 raise RuntimeError("portfolio without id")
+            changed = verification.permits_loss_events(
+                now=now, ledger_qty=ledger_quantities(tx, pid),
+                max_age=self._config.quantity_verification_max_age,
+            )  # fmt: skip
+            if changed is not None:
+                return changed
             evidence = {"equity": r.equity, "gaps": [
                 {"symbol": g.symbol, "qty": g.qty_at_close, "prior_close": g.prior_close,
                  "price": g.price, "pnl": g.pnl} for g in r.gaps]}  # fmt: skip
@@ -374,6 +478,7 @@ class LossLimitMonitor:
                                f"{self._config.weekly_pct} of {r.weekly.baseline}",
                         actor=LOSS_LIMIT_ACTOR, at=now,
                     )  # fmt: skip
+        return None
 
     def _check_repeat(
         self, tx: Tx, pid: int, r: LossLimitReport, now: datetime, evidence: dict[str, Any]
@@ -443,6 +548,7 @@ class LossLimitMonitor:
             blockers.append(LossBlocker.CALENDAR_UNAVAILABLE)
         if snap.equity is None:
             blockers.append(LossBlocker.EQUITY_UNKNOWN)
+        verification = self._verification_findings(s, blockers, problems)
         lockouts = self._events.list(s, pid, LossEventKind.DAILY_LOCKOUT)
         lockout_session = lockouts[-1].applies_to if lockouts else None
         if ctx is None or calendar is None:
@@ -464,7 +570,7 @@ class LossLimitMonitor:
                 lockout_active=lockout_session is not None, lockout_session=lockout_session,
                 weekly_breach_active=weekly_active, recent_lockouts=(), window=None, gaps=(),
                 gap_stress=None, blockers=tuple(dict.fromkeys(blockers)),
-                problems=tuple(problems),
+                problems=tuple(problems), position_verification=verification,
             )  # fmt: skip
         current = ctx.current.session_date
         daily_base = self._snapshots.get(s, pid, SnapshotKind.SESSION_BASELINE, current)
@@ -496,6 +602,7 @@ class LossLimitMonitor:
         stress = self._stress(daily_base, snap)
         if stress is not None and stress.portfolio_exceeded:
             blockers.append(LossBlocker.GAP_STRESS_PORTFOLIO_EXCEEDED)
+        conflicts = self._conflict_findings(s, ctx, blockers, problems)
         return LossLimitReport(
             as_of=now, current_session=current, week_start=ctx.week_start,
             daily_baseline=daily_base, weekly_baseline=weekly_base, equity=snap.equity,
@@ -503,7 +610,42 @@ class LossLimitMonitor:
             lockout_session=lockout_session, weekly_breach_active=weekly_active,
             recent_lockouts=recent, window=window, gaps=gaps, gap_stress=stress,
             blockers=tuple(dict.fromkeys(blockers)), problems=tuple(problems),
+            discontinuities=self._discontinuities(gaps), position_verification=verification,
+            reference_close_conflicts=conflicts,
         )  # fmt: skip
+
+    def _discontinuities(self, gaps: tuple[GapObservation, ...]) -> tuple[GapObservation, ...]:
+        """Diagnostic only: reference-close-to-mark moves at or above the threshold."""
+        threshold = self._config.discontinuity_diagnostic_pct
+        return tuple(g for g in gaps if abs(g.pct) >= threshold)
+
+    def _verification_findings(
+        self, s: Session, blockers: list[LossBlocker], problems: list[str]
+    ) -> PositionVerification | None:
+        """The stored position verification; a non-VERIFIED one blocks new entries."""
+        verification = self._verifications.latest(s)
+        if verification is not None and verification.status in _VERIFICATION_BLOCKERS:
+            blockers.append(_VERIFICATION_BLOCKERS[verification.status])
+            problems.append(
+                f"position quantities {verification.status.value}: {verification.detail}"
+            )
+        return verification
+
+    def _conflict_findings(
+        self, s: Session, ctx: SessionContext, blockers: list[LossBlocker], problems: list[str]
+    ) -> tuple[CloseConflict, ...]:
+        """Recorded close conflicts on the current baselines' reference sessions block new
+        entries; they never expire on their own while those sessions are referenced."""
+        sessions = {ctx.reference.session_date, ctx.week_reference.session_date}
+        conflicts = tuple(self._conflicts.for_sessions(s, sessions))
+        if conflicts:
+            blockers.append(LossBlocker.REFERENCE_CLOSE_CONFLICT)
+            problems.extend(
+                f"reference close conflict {c.symbol} {c.session_date} ({c.source.value}): "
+                f"recorded {c.recorded_close}, later observed {c.observed_close}"
+                for c in conflicts
+            )
+        return conflicts
 
     def _lockout_cleared(
         self,
