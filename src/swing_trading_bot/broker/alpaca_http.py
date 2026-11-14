@@ -37,9 +37,12 @@ from alpaca.common.rest import RESTClient
 
 from swing_trading_bot.broker.errors import (
     AuthenticationError,
+    AuthFailureKind,
     BrokerError,
     BrokerRequestError,
+    DataEntitlementKind,
     InvalidBrokerDataError,
+    MarketDataEntitlementError,
     OrderNotFoundError,
     RateLimitedError,
     ServiceUnavailableError,
@@ -62,6 +65,19 @@ never among them; a change in the SDK constants is refused rather than followed.
 CONNECT_TIMEOUT_S: Final = 5
 READ_TIMEOUT_S: Final = 20
 _MAX_ERROR_TEXT: Final = 300
+MAX_FORBIDDEN_BODY_BYTES: Final = 2048
+"""A 403 body longer than this is not inspected (classified unresolved)."""
+KNOWN_ENTITLEMENT_MESSAGES: Final[Mapping[str, tuple[DataEntitlementKind, str]]] = {
+    "subscription does not permit querying recent sip data": (
+        DataEntitlementKind.RECENT_DATA_WINDOW,
+        "sip",
+    ),
+}
+"""Normalized ``message`` values of a data-host 403 known to name a subscription limit,
+mapped to (kind, feed). Only the publicly reported recent-SIP wording is listed (Step
+16.5A); Step 16.5 did not capture the body, so even it is not live-verified. No pattern
+matching: any other message stays an unresolved AuthenticationError. Add an entry only
+from captured live evidence."""
 
 
 class ReadOnlyHttp(Protocol):
@@ -110,13 +126,68 @@ def _error_text(response: requests.Response) -> str:
     return response.text[:_MAX_ERROR_TEXT].replace("\n", " ")
 
 
-def raise_for_status(response: requests.Response, context: str) -> None:
+def _forbidden_message(response: requests.Response) -> tuple[str | None, str]:
+    """(normalized ``message``, evidence label) from a 403 body, bounded and fail-closed:
+    the body is inspected only if it is at most :data:`MAX_FORBIDDEN_BODY_BYTES`, UTF-8,
+    a JSON object with a string ``message``; anything else is an evidence label only.
+    The raw body is never returned, logged or attached to an error."""
+    raw = response.content or b""
+    if not raw.strip():
+        return None, "no_body"
+    if len(raw) > MAX_FORBIDDEN_BODY_BYTES:
+        return None, "oversized_body"
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None, "malformed_body"
+    message = doc.get("message") if isinstance(doc, dict) else None
+    if not isinstance(message, str):
+        return None, "no_message"
+    return " ".join(message.split()).lower().rstrip("."), "unrecognized_message"
+
+
+def classify_forbidden(
+    response: requests.Response, context: str, service: Service | None
+) -> BrokerError:
+    """The error for an HTTP 403 (Step 16.5A).
+
+    Only a data-host 403 whose normalized body ``message`` is listed in
+    :data:`KNOWN_ENTITLEMENT_MESSAGES` becomes a
+    :class:`MarketDataEntitlementError` (blocks the data operation; says nothing about
+    the trading credentials). Every other 403 — trading host, no/oversized/malformed
+    body, unrecognized message — stays an :class:`AuthenticationError` of kind
+    ``FORBIDDEN_UNRESOLVED`` (fail closed, AUTH halt as before). Error messages carry
+    only fixed text, the listed feed and an evidence label; never the body."""
+    if service != "data":
+        return AuthenticationError(f"{context}: HTTP 403 (unresolved: trading host)",
+                                   status_code=403, evidence="trading_host")  # fmt: skip
+    message, evidence = _forbidden_message(response)
+    known = KNOWN_ENTITLEMENT_MESSAGES.get(message) if message is not None else None
+    if known is None:
+        return AuthenticationError(f"{context}: HTTP 403 (unresolved: {evidence})",
+                                   status_code=403, evidence=evidence)  # fmt: skip
+    kind, feed = known
+    return MarketDataEntitlementError(
+        f"{context}: HTTP 403: market data not permitted ({kind}, feed {feed})",
+        kind=kind, feed=feed,
+    )  # fmt: skip
+
+
+def raise_for_status(
+    response: requests.Response, context: str, service: Service | None = None
+) -> None:
+    """Map a non-2xx response to the error taxonomy. ``service`` is the host the request
+    went to; 403 classification depends on it (only the data host can produce a
+    market-data entitlement error)."""
     status = response.status_code
     if 200 <= status < 300:
         return
     detail = f"{context}: HTTP {status}: {_error_text(response)}"
-    if status in (401, 403):
-        raise AuthenticationError(f"{context}: HTTP {status}", status_code=status)
+    if status == 401:
+        raise AuthenticationError(f"{context}: HTTP 401", status_code=401,
+                                  kind=AuthFailureKind.CREDENTIALS_REJECTED)  # fmt: skip
+    if status == 403:
+        raise classify_forbidden(response, context, service)
     if status == 404:
         raise OrderNotFoundError(detail, status_code=status)
     if status == 429:
@@ -180,7 +251,7 @@ class AlpacaReadTransport:
         final = getattr(response, "url", None)
         if final and not str(final).startswith(base + "/"):
             raise InvalidBrokerDataError(f"{context}: response came from an unexpected host")
-        raise_for_status(response, context)
+        raise_for_status(response, context, service)
         return decode_json(response.text)
 
 

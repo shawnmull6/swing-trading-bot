@@ -554,7 +554,8 @@ filled then canceled order leaves exactly the broker-reported qty.
 | Submit timeout / drop / 5xx / 504 | `SUBMIT_AMBIGUOUS` → §10.3 |
 | Definitive 4xx rejection | `REJECTED`, release reservation |
 | Duplicate client id response | treated as "order exists" → lookup → adopt; never as rejection |
-| 401 / 403 | persistent halt `AUTH`, no retries |
+| 401; 403 not proven to be a data entitlement limit | persistent halt `AUTH`, no retries (403 kind `FORBIDDEN_UNRESOLVED`, §12.36) |
+| 403 from the data host naming a subscription limit | `MarketDataEntitlementError`: the data read fails, no retries, no `AUTH` halt (§12.36) |
 | Unmapped status / float where Decimal string expected / schema surprise | persistent halt |
 
 ---
@@ -3435,16 +3436,16 @@ by `AlpacaPaperReadAdapter` and `SimBroker`. No cache, scheduler or provider lay
   `end`, explicit `feed` and `adjustment`, `limit=10000`, `sort=asc`; `page_token` until
   `next_page_token` is null (cap 20 pages); new read-retry policy `daily_bars` (standard).
   The instance feed used for marks and C8 closes is not involved.
-* *Bounds (Step 16.4A review).* Whether Alpaca treats `start`/`end` as inclusive or
-  exclusive, and whether a bare date means UTC or market-time midnight, is not verified.
-  `bar_window(start, end)` therefore sends RFC 3339 timestamps one second before
-  `start`'s America/New_York midnight and one second before the market-time midnight
-  after `end`. Given bar `t` = session midnight in market time (C8, IEX), exactly the
-  sessions `start..end` fall inside under every inclusive/exclusive combination; offsets
-  come from each date, so daylight-saving changes cannot shift a session. Tests emulate
-  all four combinations for one session, several, Friday→Monday, both DST changes and
-  an early close. The C8 `get_daily_bar_closes` request keeps its live-verified
-  date-only bounds.
+* *Bounds (Step 16.4A review; corrected in Step 16.5A, §12.36).* Whether Alpaca treats
+  `start`/`end` as inclusive or exclusive, and whether a bare date means UTC or
+  market-time midnight, is not verified. `bar_window(start, end)` therefore sends RFC
+  3339 timestamps one second before `start`'s America/New_York midnight and one second
+  after `end`'s America/New_York midnight. Given bar `t` = session midnight in market
+  time (C8 for IEX, Step 16.5 for SIP), exactly the sessions `start..end` fall inside
+  under every inclusive/exclusive combination; offsets come from each date, so
+  daylight-saving changes cannot shift a session. Tests emulate all four combinations
+  for one session, several, Friday→Monday, weekend-only, both DST changes and an early
+  close. The C8 `get_daily_bar_closes` request keeps its live-verified date-only bounds.
 * *Pagination and retries.* The whole response is consumed before anything is
   returned; an error on any page (after bounded retries for 429/503/timeouts only, per
   page, same token) means no result, never a partial one. A non-string, empty or
@@ -3493,14 +3494,56 @@ optional fields, multiple symbols, exact-JSON-number bodies, a paginating transp
 handler and early-close timing (2026-11-27). Tests: `tests/unit/test_daily_bars.py`,
 `tests/integration/test_daily_bar_history.py`.
 
-**7. Still requires an authorized read-only check before any use of SIP data.** That
-the bars endpoint accepts RFC 3339 `start`/`end` and returns exactly the bracketed
-sessions (one-session and multi-session requests); SIP
-historical daily-bar entitlement on this account and the error shape when not permitted;
-SIP bar `t` at midnight America/New_York (C8 verified IEX only); presence and JSON types
-of `v`, `vw`, `n` (integers vs numbers); `next_page_token` behaviour on multi-symbol,
-multi-day requests and the real page size; `adjustment=split` vs `raw` on a symbol with
-a split; whether a just-closed session's bar is revised later; data-host rate limits.
+**7. Live status (Step 16.5, SIP_READ_PARTIALLY_VALIDATED).** Verified: a one-session,
+three-symbol SIP `raw` request with RFC 3339 bounds returned exactly the requested
+session; SIP bar `t` is midnight America/New_York; `o`/`h`/`vw` arrive as decimal
+numbers, `l`/`c` as integers when the price is whole, `v`/`n` as integers. A
+five-session request whose `end` lay ~3.5 h in the future was refused with HTTP 403
+(body not captured); see §12.36. Still unverified: multi-session, weekend and DST
+windows with the corrected bounds; the 403 body and the exact recent-data cutoff;
+`next_page_token` behaviour on multi-symbol, multi-day requests and the real page size;
+`adjustment=split` vs `raw`; IEX vs SIP closes; whether a just-closed session's bar is
+revised later; data-host rate limits; equivalence to the official close.
+
+### 12.36 Step 16.5A: daily-bar bounds and 403 classification (offline)
+
+**Root cause (Step 16.5 evidence).** The pre-16.5A upper bound was one second before the
+America/New_York midnight *after* `end`. For the latest completed session that instant
+is up to ~24 h in the future; request 2 (`end=2026-11-14T04:59:59Z`, sent at
+~01:30Z) got HTTP 403 seconds after request 1 (same credentials, bounds entirely in the
+past) succeeded. The likeliest reading — unverified, the body was not captured — is the
+free plan's refusal to serve recent SIP data, triggered by the future bound rather than
+by the sessions asked for. The transport then mapped the 403 to `AuthenticationError`,
+which in runtime use would have become a persistent `AUTH` halt.
+
+**Bounds.** `bar_window` now returns (`start` midnight − 1 s, `end` midnight + 1 s) in
+market time, each converted to UTC from its own date (§12.35 item 4). For any session
+whose bar timestamp has passed, the upper bound is in the past (one second after that
+midnight). This does not establish SIP entitlement or how recent the data a plan may
+query; those are separate concerns. The C8 close lookup is unchanged.
+
+**403 classification** (`broker/alpaca_http.classify_forbidden`, GET transport only):
+
+| Response | Error | Handling |
+|---|---|---|
+| 401 (either host) | `AuthenticationError`, kind `CREDENTIALS_REJECTED` | `AUTH` halt (unchanged) |
+| 403, trading host | `AuthenticationError`, kind `FORBIDDEN_UNRESOLVED`, evidence `trading_host` | `AUTH` halt (unchanged) |
+| 403, data host, body `message` normalizes to exactly `subscription does not permit querying recent sip data` | `MarketDataEntitlementError`, kind `RECENT_DATA_WINDOW`, feed `sip` | the data read fails; not retried; no halt |
+| 403, data host, anything else (empty, > 2 KiB, not UTF-8/JSON, no string `message`, other wording) | `AuthenticationError`, kind `FORBIDDEN_UNRESOLVED`, evidence label | `AUTH` halt (fail closed, unchanged) |
+
+Normalization: whitespace collapsed, lower-cased, trailing `.` removed; then an exact
+lookup in `KNOWN_ENTITLEMENT_MESSAGES` (no pattern matching). The single entry is the
+publicly reported Alpaca wording and is **not live-verified** for this account; entries
+are added only from captured live evidence. Error messages carry fixed text, the listed
+feed and an evidence label; never the body, headers, keys or
+account identifiers. `MarketDataEntitlementError` is not read-retryable, is not an
+`AuthenticationError`, maps to no persistent halt (`read_error_halt` → None) and to no
+outage category; it surfaces as a failed read (CLI exit `BROKER_UNAVAILABLE`, mark
+refresh error, gate/exit `BROKER_UNAVAILABLE`/`BROKER_UNREACHABLE`), so the dependent
+operation stays blocked. M1 marks and C8 closes use the IEX feed; order-write semantics,
+the OMS and `submit_failure_state` are untouched. Tests:
+`tests/unit/test_forbidden_classification.py`,
+`tests/integration/test_daily_bar_boundaries.py`.
 
 ---
 

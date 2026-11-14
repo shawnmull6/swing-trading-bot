@@ -68,8 +68,62 @@ class AmbiguousSubmissionError(BrokerError):
     order_state = OrderState.UNKNOWN
 
 
+class AuthFailureKind(StrEnum):
+    """What the response evidence proves about a 401/403 (Step 16.5A)."""
+
+    CREDENTIALS_REJECTED = "CREDENTIALS_REJECTED"
+    """HTTP 401: the API key/secret were not accepted (invalid, expired or revoked)."""
+    FORBIDDEN_UNRESOLVED = "FORBIDDEN_UNRESOLVED"
+    """HTTP 403 without recognized evidence of its cause. Treated as an authentication
+    failure (fail closed); the cause is explicitly unknown."""
+
+
 class AuthenticationError(BrokerError):
-    """401/403. Never retried; leads to a persistent halt (AUTH)."""
+    """401, or a 403 not proven to be a market-data entitlement limit. Never retried;
+    leads to a persistent halt (AUTH). ``kind`` records what the evidence proves and
+    ``evidence`` (403 only) why a 403 stayed unresolved; neither changes handling."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        kind: AuthFailureKind | None = None,
+        evidence: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.kind = kind if kind is not None else (
+            AuthFailureKind.CREDENTIALS_REJECTED if status_code == 401
+            else AuthFailureKind.FORBIDDEN_UNRESOLVED
+        )  # fmt: skip
+        self.evidence = evidence
+
+
+class DataEntitlementKind(StrEnum):
+    """Which market-data restriction a recognized 403 names (Step 16.5A)."""
+
+    RECENT_DATA_WINDOW = "RECENT_DATA_WINDOW"
+    """The subscription does not include the feed's most recent data (a time window)."""
+
+
+class MarketDataEntitlementError(BrokerError):
+    """A market-data GET refused by the data host with HTTP 403 whose body names a
+    subscription restriction (Step 16.5A). The dependent data operation fails (never
+    retried, never substituted); it is **not** evidence that the trading credentials are
+    invalid, so it is not an :class:`AuthenticationError` and never an AUTH halt. Only a
+    recognized body produces this error; any other 403 stays an AuthenticationError."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: DataEntitlementKind,
+        feed: str | None = None,
+        status_code: int | None = 403,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.kind = kind
+        self.feed = feed
 
 
 class RateLimitedError(BrokerError):

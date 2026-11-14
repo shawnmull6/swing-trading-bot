@@ -70,7 +70,8 @@ def sim(now: datetime = AFTER_CLOSE) -> SimBroker:
 # ============================================================ interface
 def test_both_implementations_are_bar_sources() -> None:
     a, _ = adapter()
-    assert isinstance(a, BarSource) and isinstance(a, BrokerReadPort)
+    assert isinstance(a, BarSource)
+    assert isinstance(a, BrokerReadPort)
     assert isinstance(a, PriceMarkSource)
     assert isinstance(sim(), BarSource)
 
@@ -85,7 +86,7 @@ def test_request_carries_explicit_feed_adjustment_and_range() -> None:
     assert (service, path) == ("data", "/stocks/bars")
     assert params == {"symbols": "AAPL,MSFT", "timeframe": "1Day",
                       "start": "2026-10-01T03:59:59Z",  # 1 s before 2026-10-01 00:00 EDT
-                      "end": "2026-12-01T04:59:59Z",  # 1 s before 2026-12-01 00:00 EST
+                      "end": "2026-11-30T05:00:01Z",  # 1 s after 2026-11-30 00:00 EST
                       "feed": "sip", "adjustment": "split",
                       "limit": "10000", "sort": "asc"}  # fmt: skip
 
@@ -425,7 +426,7 @@ def test_split_adjusted_requirement_accepts_only_adjusted_bars() -> None:
 def test_requirement_must_be_positive() -> None:
     for bad in (0, -1, True):
         with pytest.raises(ValueError, match="lookback_sessions"):
-            HistoryRequirement(bad, "sip", "raw")  # type: ignore[arg-type]
+            HistoryRequirement(bad, "sip", "raw")
 
 
 # ============================================================ zero volume (16.4A)

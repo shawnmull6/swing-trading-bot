@@ -113,19 +113,27 @@ def iso_param(value: datetime) -> str:
 
 def bar_window(start: date, end: date) -> tuple[str, str]:
     """RFC 3339 ``start``/``end`` query bounds for the daily bars of sessions
-    ``start..end`` (M2-2a review).
+    ``start..end`` (M2-2a; corrected in Step 16.5A).
 
-    A daily bar's ``t`` is its session's midnight America/New_York (C8, IEX). The bounds
-    are one second before ``start``'s market-time midnight and one second before the
-    market-time midnight following ``end``, so exactly those sessions' bars fall inside
-    whether the provider treats either bound as inclusive or exclusive, and a bare date's
-    own interpretation (UTC vs market time) never matters. Offsets come from the
-    session dates themselves, so daylight-saving changes cannot shift a session."""
+    A daily bar's ``t`` is its session's midnight America/New_York (observed for IEX in
+    C8 and for SIP in Step 16.5). The bounds bracket exactly the bar timestamps of the
+    requested dates: one second before ``start``'s market-time midnight and one second
+    after ``end``'s market-time midnight. Every requested bar lies strictly inside and
+    every other bar at least 23 hours outside, so the result is the same whether the
+    provider treats either bound as inclusive or exclusive, and a bare date's
+    interpretation never matters. Each bound takes its UTC offset from its own date, so
+    daylight-saving changes cannot shift a session.
+
+    The upper bound is only one second past the last bar's timestamp, so for a completed
+    session it is never in the future (Step 16.5: the previous bound, one second before
+    the *following* midnight, reached up to ~24 h ahead, and a request whose end lay
+    after the current time was refused with HTTP 403). This says nothing about which
+    feeds or how recent data the subscription permits; that is a separate check."""
     if start > end:
         raise ValueError("start must not be after end")
     second = timedelta(seconds=1)
     lo = datetime.combine(start, time(0, 0), tzinfo=MARKET_TZ) - second
-    hi = datetime.combine(end + timedelta(days=1), time(0, 0), tzinfo=MARKET_TZ) - second
+    hi = datetime.combine(end, time(0, 0), tzinfo=MARKET_TZ) + second
     return iso_param(lo), iso_param(hi)
 
 

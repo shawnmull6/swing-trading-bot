@@ -275,7 +275,8 @@ def test_app_config_keeps_m1_modes_report_only() -> None:
 @pytest.mark.parametrize("key", [*ACCOUNT_OPTIONAL, *CONFIG_OPTIONAL])
 @pytest.mark.parametrize("value", [None, True, False])
 def test_sim_reports_or_omits_restrictions(key: str, value: bool | None) -> None:
-    sim = SimBroker(SimClock(NOW), SimConfig(**{key: value}))
+    overrides: dict[str, Any] = {key: value}  # one parametrized restriction field
+    sim = SimBroker(SimClock(NOW), SimConfig(**overrides))
     snap = sim.get_account_config() if key in CONFIG_OPTIONAL else sim.get_account()
     assert getattr(snap, key) is value
 
