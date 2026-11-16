@@ -296,6 +296,8 @@ def order_from_raw(raw: Raw) -> BrokerOrderSnapshot:
             filled_qty=decimal(raw, "filled_qty"),
             filled_avg_price=opt_decimal(raw, "filled_avg_price"),
             limit_price=opt_decimal(raw, "limit_price"),
+            # Absent or null -> None; a present value must be an exact decimal string.
+            stop_price=opt_decimal(raw, "stop_price"),
             broker_status=status,
             submitted_at=opt_timestamp(raw, "submitted_at"),
             updated_at=timestamp(raw, "updated_at"),

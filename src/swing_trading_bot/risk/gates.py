@@ -185,6 +185,29 @@ EXIT_BLOCKING: Final = frozenset(
 )
 """Conditions under which even a risk-reducing exit could not be done safely."""
 
+ENTRY_ONLY: Final = frozenset(
+    {
+        GateReason.DAILY_LOSS_LOCKOUT,
+        GateReason.WEEKLY_LIMIT_ACTIVE,
+        GateReason.NO_BUYING_CAPACITY,
+        GateReason.CAPITAL_CEILING_EXCEEDED,
+        GateReason.NEGATIVE_AVAILABLE_CASH,
+        GateReason.GAP_STRESS_PORTFOLIO_EXCEEDED,
+        GateReason.SESSION_BASELINE_MISSING,
+        GateReason.WEEK_BASELINE_MISSING,
+        GateReason.EQUITY_UNKNOWN,
+        GateReason.UNRESOLVED_SETTLEMENT,
+        GateReason.REFERENCE_CLOSE_CONFLICT,
+    }
+)
+"""Policy P3 (M2-3, ARCHITECTURE §12.41): restrictions on *new risk* only — loss limits,
+capital and cash, gap stress, loss baselines. They never block a protective exit of a
+verified position. Every other blocking finding (identity, environment, account
+restrictions, broker, ledger integrity, reconciliation, unresolved orders, unbooked
+fills, position verification, stale marks, market closed, ``TRADING_DISABLED`` and any
+``PERSISTENT_HALT``, whatever its reason) applies to all orders, protective exits
+included. Unknown or newly added reasons are all-order by default (fail closed)."""
+
 
 @dataclass(frozen=True, slots=True, order=True)
 class GateFinding:
@@ -236,6 +259,12 @@ class GateStatus:
     @property
     def persistent_halt(self) -> bool:
         return any(f.reason is GateReason.PERSISTENT_HALT for f in self.findings)
+
+    @property
+    def protective_exit_blockers(self) -> tuple[GateFinding, ...]:
+        """Blocking findings that also refuse a protective exit (P3): all except
+        :data:`ENTRY_ONLY` reasons."""
+        return tuple(f for f in self.blocking if f.reason not in ENTRY_ONLY)
 
     @property
     def exits(self) -> ExitStatus:

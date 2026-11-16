@@ -37,8 +37,12 @@ authorized. Step 16.11 (M2-3): TradePlan contract and sell-side OMS foundation
 implemented offline (A§12.38); Step 16.11A hardening (trade-instance identity, durable
 plan record, `sell_share_holds` invariant) and recommended P1–P8 policy and migration
 0009 design (A§12.39); Step 16.11B finalization (A§12.40): unprotected TARGET sells
-refused outside isolated offline tests; no migration, stop orders not implemented, P1–P8
-proposed only.**
+refused outside isolated offline tests. Step 16.12 (A§12.41): durable protective stops in
+simulation under the approved P1–P8 simulation policies; **migration 0009 packaged, real
+ledger not migrated** (observe commands exit 9 until an authorized backed-up `migrate`);
+TARGET execution still blocked; linked exits and trailing orchestration not
+implemented. Step 16.12A (A§12.42): regular-session stop simulation, potential vs
+confirmed protection gaps, ownership/evidence constraints.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

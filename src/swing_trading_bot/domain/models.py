@@ -137,6 +137,7 @@ class BrokerOrderSnapshot(DomainModel):
     filled_qty: NonNegativeDecimal
     filled_avg_price: PositiveDecimal | None = None
     limit_price: PositiveDecimal | None = None
+    stop_price: PositiveDecimal | None = None
     broker_status: str = Field(min_length=1)
     submitted_at: UtcDatetime | None = None
     updated_at: UtcDatetime

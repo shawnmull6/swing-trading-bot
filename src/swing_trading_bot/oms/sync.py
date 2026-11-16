@@ -67,6 +67,7 @@ from swing_trading_bot.oms.lifecycle import (
     read_error_halt,
 )
 from swing_trading_bot.oms.order_manager import CrashHook, OmsConfig
+from swing_trading_bot.oms.protection import refresh_protection
 
 _REFRESH: tuple[OrderStatus, ...] = (
     OrderStatus.ACCEPTED,
@@ -126,12 +127,22 @@ class OrderSync:
         self._activities(report, now)
         if report.status is not SyncStatus.HALTED:
             self._refresh_orders(report, now)
+            self._refresh_protection(now)
         invariants = self._pf.check_invariants(now=now)
         if not invariants.ok:
             report.mark(SyncStatus.HALTED, "ledger invariants violated")
         return report
 
     # ------------------------------------------------------------ activities
+    def _refresh_protection(self, now: datetime) -> None:
+        """Keep every plan's protection gap in line with the orders just refreshed
+        (M2-3, P7). A no-op on ledgers without protective stops (e.g. OBSERVE)."""
+        with self._db.read() as s:
+            plans = self._orders.plans_with_protective_stops(s)
+        for plan_id in plans:
+            with self._db.transaction() as tx:
+                refresh_protection(tx, plan_id, at=now)
+
     def _activities(self, report: SyncReport, now: datetime) -> None:
         with self._db.read() as s:
             marker = complete_through(s)

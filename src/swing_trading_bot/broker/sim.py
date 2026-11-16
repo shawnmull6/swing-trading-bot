@@ -204,6 +204,8 @@ class _Order:
     visible_at: datetime
     filled_qty: Decimal = ZERO
     notional: Decimal = ZERO
+    stop_price: Decimal | None = None
+    triggered: bool = False
 
     @property
     def leaves(self) -> Decimal:
@@ -326,6 +328,67 @@ class SimBroker:
     def schedule_broker_cancel(self, client_order_id: str, *, after: timedelta) -> None:
         order = self._order_for_script(client_order_id)
         self._schedule(after, lambda: self._finish(order.broker_id, "canceled"))
+
+    def market_trade(
+        self,
+        symbol: str,
+        price: Decimal,
+        *,
+        liquidity: Decimal | None = None,
+        activity_delay: timedelta | None = None,
+    ) -> list[str]:
+        """Simulate a trade print at ``price`` now (M2-3 protective stops).
+
+        **Session eligibility.** Ordinary equity stops are simulated as regular-session
+        orders: a print outside a regular session of the loaded trading calendar
+        (pre-market, after-hours, weekend) is recorded as the latest price but triggers
+        and executes nothing — a GTC stop simply stays working. The first eligible print
+        of the next session is the executable price: a gap through the stop fills there,
+        not at the stop. (Alpaca's actual extended-hours and halt behavior is unverified.)
+
+        During a regular session, every visible, working SELL ``STOP`` order for
+        ``symbol`` whose stop price is at or above ``price`` triggers and executes **at
+        ``price``**, oldest first. A triggered stop behaves as a market order and keeps
+        executing on later eligible prints. ``liquidity`` caps the shares executed by this
+        print across all stops (partial fills). Orders in ``pending_cancel`` still
+        trigger: a cancel request does not stop an execution that wins the race. Returns
+        the client ids that executed. ``STOP_LIMIT`` orders are not simulated.
+        """
+        if price <= ZERO or (liquidity is not None and liquidity <= ZERO):
+            raise SimScriptError("trade price and liquidity must be positive")
+        self._tick()
+        self.set_price(symbol, price)
+        if not self.in_regular_session(self.clock.now()):
+            self._log(f"PRINT {symbol} {price} outside the regular session: no stop eligible")
+            return []
+        delay = self.config.activity_delay if activity_delay is None else activity_delay
+        remaining = liquidity
+        executed: list[str] = []
+        for o in self._visible_orders():
+            if (o.symbol != symbol or o.side is not Side.SELL or o.order_type is not OrderType.STOP
+                    or o.status in TERMINAL or o.stop_price is None):  # fmt: skip
+                continue
+            if not (o.triggered or price <= o.stop_price):
+                continue
+            if not o.triggered:
+                o.triggered = True
+                self._log(f"STOP {o.client_order_id} triggered at {price} (stop {o.stop_price})")
+            qty = o.leaves if remaining is None else min(o.leaves, remaining)
+            if qty <= ZERO:
+                continue
+            self._fill(o.broker_id, qty, price, delay)
+            executed.append(o.client_order_id)
+            if remaining is not None:
+                remaining -= qty
+        return executed
+
+    def in_regular_session(self, at: datetime) -> bool:
+        """Whether ``at`` falls inside a regular session of the loaded trading calendar
+        (fails loudly when none is loaded: stop simulation needs session boundaries)."""
+        trading = self._calendars.get(CalendarKind.TRADING)
+        if trading is None:
+            raise SimScriptError("stop simulation needs a loaded trading calendar")
+        return any(s.open_at <= at < s.close_at for s in trading.sessions)
 
     def refuse_next_cancel(self, client_order_id: str) -> None:
         """The next cancel request for this order is accepted as ``pending_cancel`` but
@@ -592,6 +655,7 @@ class SimBroker:
             tif=request.time_in_force.value.lower(),
             qty=request.qty,
             limit_price=request.limit_price,
+            stop_price=request.stop_price,
             status=behavior.initial_status if isinstance(behavior, Accept) else "new",
             created_at=now,
             updated_at=now,
@@ -717,6 +781,7 @@ class SimBroker:
             "filled_qty": _num(o.filled_qty),
             "filled_avg_price": None if avg is None else _num(avg),
             "limit_price": None if o.limit_price is None else _num(o.limit_price),
+            "stop_price": None if o.stop_price is None else _num(o.stop_price),
             "status": o.status,
             "created_at": _iso(o.created_at),
             "submitted_at": _iso(o.created_at),

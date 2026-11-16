@@ -343,12 +343,17 @@ uv run swing-trading-bot migrate --backup /backups/pre-migration.sqlite3
 It verifies history and integrity, writes and verifies the backup, then applies all pending
 migrations in one transaction (all or nothing). The backup path must not exist.
 
-**Pending: migration 0008 (Step 16.9, not yet authorized).** The code now packages
-migration 8 (`CONSOLIDATED_BAR` reference closes, `session_close_conflicts`). The real
-ledger is at version 7, so every command that opens it exits 9 until an operator runs the
-backed-up `migrate` above. That needs explicit authorization. Migrating does **not**
-activate consolidated baselines: OBSERVE stays `OFFICIAL`-only, with the gate off
-(ARCHITECTURE §12.37).
+*Migration 0008 (Step 16.9) has been applied to the real ledger, which is at version 8.*
+
+**Pending: migration 0009 (Step 16.12, not yet authorized).** The code now packages
+migration 9 (`orders.stop_price` with order-type rules, immutable plan columns,
+`plan_stop_levels`, `protection_gaps`; ARCHITECTURE §12.41). The real ledger is at
+version 8, so **every command that opens it — including OBSERVE `sync`, `reconcile` and
+`status` — exits 9 until an operator runs the backed-up `migrate` above.** That needs
+explicit authorization. Do not run commands against the real ledger with this code until
+then; to keep observing without migrating, run the previous commit. The migration only
+adds a column (all existing rows get `NULL`, verified against the new CHECK) and new,
+empty tables; it enables nothing: trading stays disabled and no Alpaca write path exists.
 
 ## 12. Lock contention
 

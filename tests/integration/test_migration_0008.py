@@ -64,8 +64,12 @@ def rows(c: sqlite3.Connection) -> list[tuple[object, ...]]:
     ).fetchall()
 
 
+UP_TO_8 = packaged_migrations()[:8]
+"""0001-0008: later migrations are covered by their own tests."""
+
+
 def migrate(c: sqlite3.Connection) -> None:
-    assert apply_pending(c, packaged_migrations(), now=NOW) == [8]
+    assert apply_pending(c, UP_TO_8, now=NOW) == [8]
 
 
 def insert_close(c: sqlite3.Connection, source: str, feed: str | None, adj: str | None) -> None:
@@ -85,8 +89,8 @@ def test_existing_rows_survive_unchanged(conn: sqlite3.Connection) -> None:
 
 def test_migration_is_recorded_and_repeatable(conn: sqlite3.Connection) -> None:
     migrate(conn)
-    assert apply_pending(conn, packaged_migrations(), now=NOW) == []  # idempotent
-    verify_applied(conn, packaged_migrations())  # checksums and user_version agree
+    assert apply_pending(conn, UP_TO_8, now=NOW) == []  # idempotent
+    verify_applied(conn, UP_TO_8)  # checksums and user_version agree
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
 
 
@@ -156,7 +160,7 @@ def test_invalid_legacy_row_aborts_the_whole_migration(tmp_path: Path) -> None:
               ("X", "2026-11-13", "1", "DAILY_BAR", TS, RX, None))  # fmt: skip
     c.execute("PRAGMA ignore_check_constraints = OFF")
     with pytest.raises(MigrationError, match="rolled back"):
-        apply_pending(c, packaged_migrations(), now=NOW)
+        apply_pending(c, UP_TO_8, now=NOW)
     assert c.execute("PRAGMA user_version").fetchone()[0] == 7
     assert c.execute("SELECT count(*) FROM session_closes").fetchone()[0] == 1
     c.close()
@@ -184,7 +188,7 @@ def test_version_name_and_checksum_are_tracked(conn: sqlite3.Connection) -> None
     ).fetchone()
     assert row == (8, "consolidated_reference_closes", m8.checksum)
     tampered = [m if m.version != 8 else replace(m, sql=m.sql + "\n-- edited\n")
-                for m in packaged_migrations()]  # fmt: skip
+                for m in UP_TO_8]  # fmt: skip
     with pytest.raises(MigrationChecksumError):
         verify_applied(conn, tampered)  # an edited 0008 is refused, never re-applied
 
@@ -204,7 +208,7 @@ def test_failure_mid_migration_rolls_everything_back(
 
     run = apply_pending_atomic if atomic else apply_pending
     with pytest.raises(MigrationError):
-        run(conn, packaged_migrations(), now=NOW, before_statement=explode)
+        run(conn, UP_TO_8, now=NOW, before_statement=explode)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
     assert conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 7
     assert [r[:7] for r in rows_v7(conn)] == [r[:7] for r in before]

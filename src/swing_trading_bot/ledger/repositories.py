@@ -166,6 +166,8 @@ class OrderRecord:
     broker_filled_qty: Decimal | None = None
     """Filled quantity the broker last reported; above ``filled_qty`` means fills whose
     activities are not booked yet (accounting incomplete)."""
+    stop_price: Decimal | None = None
+    """Trigger price of STOP / STOP_LIMIT orders (migration 0009); immutable."""
 
     @property
     def unbooked_fill_qty(self) -> Decimal:
@@ -190,7 +192,8 @@ class OrdersRepository:
         "client_order_id, broker_order_id, portfolio_id, intent_key, symbol, side, order_type, "
         "time_in_force, purpose, qty, limit_price, planned_stop, status, filled_qty, "
         "avg_fill_price, last_broker_status, reject_reason, trade_plan_id, order_role, "
-        "created_at, send_attempted_at, updated_at, last_synced_at, broker_filled_qty"
+        "created_at, send_attempted_at, updated_at, last_synced_at, broker_filled_qty, "
+        "stop_price"
     )
 
     def insert(self, tx: Tx, rec: OrderRecord) -> None:
@@ -221,6 +224,13 @@ class OrdersRepository:
         )
         return [self._from_row(r) for r in rows]
 
+    def plans_with_protective_stops(self, s: Session) -> list[str]:
+        rows = s.fetch_all(
+            "SELECT DISTINCT trade_plan_id FROM orders WHERE order_role = 'PROTECTIVE_STOP' "
+            "ORDER BY trade_plan_id"
+        )
+        return [str_from_db(r[0]) for r in rows]
+
     def get_by_intent_key(self, s: Session, intent_key: str) -> OrderRecord | None:
         row = s.fetch_one(f"SELECT {self._COLS} FROM orders WHERE intent_key = ?", (intent_key,))
         return None if row is None else self._from_row(row)
@@ -230,7 +240,7 @@ class OrdersRepository:
 
     def _insert(self, tx: Tx, rec: OrderRecord) -> None:
         tx.execute(
-            f"INSERT INTO orders ({self._COLS}) VALUES ({', '.join('?' * 24)})",
+            f"INSERT INTO orders ({self._COLS}) VALUES ({', '.join('?' * 25)})",
             (
                 rec.client_order_id,
                 rec.broker_order_id,
@@ -256,6 +266,7 @@ class OrdersRepository:
                 ts_to_db(rec.updated_at),
                 opt_ts_to_db(rec.last_synced_at),
                 opt_dec_to_db(rec.broker_filled_qty),
+                opt_dec_to_db(rec.stop_price),
             ),
         )
 
@@ -419,6 +430,7 @@ class OrdersRepository:
             updated_at=ts_from_db(row[21]),
             last_synced_at=opt_ts_from_db(row[22]),
             broker_filled_qty=opt_dec_from_db(row[23]),
+            stop_price=opt_dec_from_db(row[24]),
         )
 
 

@@ -19,7 +19,8 @@ step 15B.8 (single-page activity guard for `init-ledger`) committed; a narrow M1
 initialization exception policy is recorded (§12.32); M2-1 account restriction and
 protection enforcement implemented offline (§12.34); M2-2a historical daily bars
 implemented offline (§12.35); M2-3 TradePlan contract and sell-side OMS foundation
-implemented offline (§12.38) and hardened (§12.39-§12.40, no schema change; P1–P8 proposed only). Current M1 state (2026-11-13): the
+implemented offline (§12.38) and hardened (§12.39-§12.40); Step 16.12 durable protective stops in simulation with
+migration 0009 packaged but **not applied to the real ledger** (§12.41-§12.42). Current M1 state (2026-11-13): the
 real observe ledger has been initialized; two live reconciliations were CLEAN and the
 `INITIALIZED` halt was cleared by an audited `resume`; the ledger runs in OBSERVE mode
 with trading disabled, and a three-cycle market-hours observation session is pending.
@@ -3963,7 +3964,7 @@ semantics and whether it preserves or reissues ids; cancel races and the
 bodies for insufficient shares; DAY vs GTC expiry of stops overnight. Plus every existing
 M2 blocker (M1_PLAN §7, §9.1).
 
-#### Proposed migration 0009 (design only; not created)
+#### Proposed migration 0009 (design only; superseded by the implementation in §12.41)
 
 Applied only through the explicit, backed-up `migrate` workflow (§12.20); simulation
 ledgers auto-migrate. Additive and compatible with every existing row.
@@ -4047,6 +4048,234 @@ trailing evidence) through the backed-up migrate workflow; stop-order support in
 request/snapshot/mapping/SimBroker with identity checks; the per-plan multi-order rule in
 OMS, pre-trade and reconciler; exit orchestration; and the Alpaca paper validations in
 §12.39 under separate operator authorization (plus every existing M2 blocker).
+
+### 12.41 Step 16.12 (M2-3): durable protective stops and simulation (offline)
+
+Offline and simulation only: no Alpaca request, no broker write outside SimBroker, no
+trading enablement. **Migration 0009 is packaged; the real OBSERVE ledger (version 8) has
+not been migrated** and every command that opens it now exits 9 until an explicitly
+authorized, backed-up `migrate` (RUNBOOK §11).
+
+**Approved simulation policies (P1–P8).** P1 protection first, separate partial and
+runner allocations, no broker-native OCO assumed; P2 durable stop prices; P3 entry-only
+restrictions never block an otherwise permitted protective exit; P4 small positions get
+whole-position protection; P5 a partial entry fill needs an explicit, confirmed
+cancellation of the remainder first; P6 runner stop to the average entry rounded up to
+the cent after the *whole* partial bucket is sold (fees excluded); P7 stop-replacement
+gaps are recorded as unprotected intervals; P8 trailing state and its price evidence are
+persisted and only ratchet up.
+
+**Architecture findings.**
+* `orders` is referenced by foreign keys (fills, events, reservations, attempts) and has
+  a no-delete trigger, so the table rebuild sketched in §12.39 would abort on
+  `DROP TABLE`. 0009 uses `ALTER TABLE ADD COLUMN` with a CHECK instead; SQLite (≥ 3.37;
+  the project runs 3.45) verifies such a CHECK against every existing row, so a legacy
+  violation aborts the migration.
+* A column CHECK is evaluated on every INSERT/UPDATE of the row, so it can carry the
+  cross-column order-type and plan-column rules without a rebuild.
+* An existing test forbids `REAL` anywhere in the schema; the ratchet trigger therefore
+  compares decimal text exactly as integer millionths.
+* `external_order_payload` (acknowledgement binding) is unchanged: adding `stop_price`
+  would invalidate stored acknowledgements; acknowledged external orders are closed
+  orders, not plan stops.
+* The one-working-order-per-symbol rule is kept. Under P1 the protective stop covers
+  every plan share, so it is the symbol's only working order and no target coexists.
+
+**Migration 0009** (`0009_protective_stops.sql`).
+
+| Change | Rule |
+|---|---|
+| `orders.stop_price` (TEXT, exact Decimal) | `STOP`/`STOP_LIMIT` ⇔ stop price set; `LIMIT`/`STOP_LIMIT` ⇔ limit price set; plan id and role both NULL or both set; plan `ENTRY` ⇔ `BUY` |
+| `orders_immutable` recreated | adds `stop_price`, `trade_plan_id`, `order_role` |
+| `ix_orders_plan` | partial index on `trade_plan_id` |
+| `plan_stop_levels` (append-only) | `(plan, seq)` unique, seq contiguous from 1; stop and high-water only ratchet up (trigger, exact); `source ∈ {PLAN_INTENT, BREAKEVEN, TRAILING}`, TRAILING needs a high; `evidence_json` required |
+| `protection_gaps` | reasons `STOP_CANCEL_REQUESTED`, `STOP_ENDED_UNFILLED`; at most one open gap per plan (unique partial index); only the closing columns change, once; `STOP_ACKNOWLEDGED` names the closing order; `closed_at ≥ opened_at` |
+
+Compatibility: existing rows are OMS LIMIT orders with a limit price, MARKET orphans
+without one, and NULL or consistent plan columns; all satisfy the CHECK (tested with
+representative v8 rows). Failure at any statement rolls the whole migration back for
+both simulation auto-migration and the explicit workflow (tested at several statement
+indexes); a v8 observe ledger is refused, never migrated, on open. The new tables are
+covered by the ledger fingerprint automatically. No `trade_plans` table was added: the
+durable plan record stays the `PLAN_RECORDED` event (§12.39).
+
+**Models and identity.** `SubmitOrderRequest.stop_price` (required for `STOP`/
+`STOP_LIMIT`, forbidden otherwise); `BrokerOrderSnapshot.stop_price`;
+`order_from_raw` reads `stop_price` (absent or `null` → None, present → exact decimal or
+`InvalidBrokerDataError`); `OrderRecord.stop_price`. The adoption identity check
+(`lifecycle._identity_mismatch`) and the reconciler's `CONFLICTING_ORDER` comparison both
+include the stop price: a broker order whose stop differs from the durable one halts
+`RECON_ORDER` and is left untouched.
+
+**Stop-order lifecycle — `OrderManager.place_protective_stop(plan, generation)`.**
+1. Gate: refused only by *protective-exit blockers* (`GateStatus.protective_exit_blockers`
+   = blocking findings not in `ENTRY_ONLY`; P3).
+2. `BEGIN IMMEDIATE`: no persistent halt; plan record verifies; intent key
+   `{plan}:PROTECTIVE_STOP:{generation}` unused (else the existing order is reported);
+   entry terminal (P5: `ENTRY_STILL_WORKING` with instructions to cancel and confirm);
+   every plan fill booked; no other working order for the symbol; plan-owned shares =
+   ledger position > 0; stop level = max(replayed level, latest persisted level)
+   (P6/P8); a stored mark strictly above the stop (`STOP_NOT_BELOW_MARK` otherwise: a
+   stop at or above the market would trigger at once — use a risk exit); share book.
+3. One `SELL STOP GTC` for **all** plan shares (P1, P4), `RISK_EXIT`, role
+   `PROTECTIVE_STOP`, stop price durable *before* the send marker; a new or higher level
+   is appended to `plan_stop_levels` with evidence (order id, phase, mark) in the same
+   transaction.
+4. Send through the unchanged committed-marker / single-submit / outcome path
+   (at-most-once; ambiguous → `SUBMIT_AMBIGUOUS`, holds every share, never resent).
+5. `refresh_protection` closes an open gap if the broker acknowledged the stop.
+Fills of a stop are booked like any sell; shares stay held until booked; the plan's
+exit state closes when the position is flat.
+
+**P3 classification (`risk/gates.py: ENTRY_ONLY`).** Entry-only: daily lockout, weekly
+limit, no buying capacity, capital ceiling, negative available cash, portfolio gap
+stress, missing session/week baseline, unknown equity, unresolved settlement,
+reference-close conflict. Everything else blocks protective exits too, including
+`TRADING_DISABLED` and every `PERSISTENT_HALT` (whatever its reason — e.g. a
+`WEEKLY_DRAWDOWN` halt still blocks automated protection; changing that is an open
+decision), market closed, stale marks, reconciliation, unresolved orders, unbooked fills
+and position verification. Unknown reasons default to all-order. Risk `EXIT` sells use
+the same classification; `TARGET` sells still need a fully clear gate and stay refused
+by default (`UNPROTECTED_TARGET`).
+
+**Replacements and unprotected intervals (P7).** There is no replace call and no linked
+order. A replacement is: `request_cancel(old stop)` → the same transaction that records
+`PENDING_CANCEL` opens a `protection_gaps` row (`STOP_CANCEL_REQUESTED`) → the broker
+confirms the old stop terminal with every fill booked (`replace_readiness` = `READY`) →
+`place_protective_stop(generation + 1)` sized from the book → when the broker
+acknowledges it, the gap closes (`STOP_ACKNOWLEDGED`, naming the new order). A fill
+winning the race reduces the quantity to protect; a flat position closes the gap
+(`POSITION_FLAT`); a declined cancel closes it on the same stop; a stop the broker ends
+unfilled while shares remain opens `STOP_ENDED_UNFILLED` when `refresh_protection` runs.
+*(16.12A: gaps distinguish potential from confirmed and `OrderSync.sync` refreshes them;
+§12.42.)* **Not automated:** no code decides when to replace; maximum-gap alerts and
+halts are not implemented.
+
+**Trailing persistence (P8).** `record_high_observation(tx, plan, high, evidence)`
+requires market-data evidence, replays the exit state with every persisted high, and
+appends a level when the stop or high rises; lower highs record nothing. On restart,
+`protected_state` = replay of booked fills + persisted highs, and the effective stop is
+the higher of the replay and the latest persisted level, so a restart cannot lower a
+stop. Persisting a higher level does **not** move a live stop: that is a replacement
+(above) and is not orchestrated.
+
+**SimBroker.** STOP orders keep `stop_price` (in the raw payload too).
+`market_trade(symbol, price, liquidity=None, activity_delay=None)` prints a trade: every
+visible working SELL STOP with stop ≥ price triggers and executes **at the print price**
+(an opening gap fills below the stop), oldest first — *only during a regular session
+(§12.42)*; a triggered stop keeps executing on
+later prints; `liquidity` caps the shares executed (partial fills); `pending_cancel`
+orders still trigger (fill-vs-cancel races; the existing `cancel_delay`,
+`refuse_next_cancel` and activity delays apply). The no-shorting check counts working
+stops' leaves, so an oversell is rejected independently of the OMS. `STOP_LIMIT` and BUY
+stops are accepted but never triggered (not simulated).
+
+**Reservations and reconciliation.** No change to the derivation: a working stop holds
+`qty − booked` shares in every non-terminal status; `sell_share_holds` applies
+unchanged. Reconciliation compares the stop price; the per-symbol
+`MULTIPLE_WORKING_ORDERS` rule is untouched (one stop per symbol).
+
+**Safety tests.** `tests/integration/test_protective_stops.py` (47):
+whole-position placement and retry idempotency; normal trigger (and
+`NOTHING_TO_PROTECT` once flat); gap below the stop (fills at the open, −3R booked);
+partial stop fill and continued execution; cancellation with a recorded interval and a
+replacement closing it; declined cancel; late fill after cancellation (held until booked,
+gap closes flat); partial fill racing a cancel (replacement sized to the remainder); stop
+ended unfilled opens a gap; ambiguous submission adopted after restart without resend;
+restart preserving order, stop price, holds and levels; crash after intent (stop price
+durable before send); stop-price mismatch on adoption halts `RECON_ORDER`;
+reconciliation conflict on stop price; oversell refused by OMS and SimBroker; small
+position; partial entry needing cancel + confirmation; unknown plan, foreign intent,
+invalid generation; stop at or above the mark; trading disabled; persistent halt (gate
+and in-transaction); every entry-only reason permits protection; all-order reasons block
+it; reconciliation mismatch; risk exit under an entry-only blocker while targets stay
+blocked; trailing persistence across restart; SimBroker stop semantics.
+`tests/integration/test_migration_0009.py` (32): legacy rows, valid and invalid order
+shapes, immutability, ratchet (exact, not lexical) and append-only levels, gap
+open/close rules, invalid legacy row aborts, rollback at several statements for both
+workflows, observe refusal, checksum.
+
+**Remaining requirements for linked exits, partial profits and trailing.**
+* **Linked exits (P1).** A partial-profit TARGET cannot coexist with a whole-position
+  stop under the one-working-order rule and the share book. Next: split the stop into
+  a partial-bucket stop and a runner stop (two working orders of one plan), which needs
+  the per-plan multi-order rule in the OMS, pre-trade engine and reconciler (§12.39),
+  then a target for the partial bucket only via a *verified* linkage (broker OCO) or a
+  documented cancel-stop-then-target sequence with a recorded gap. Alpaca OCO/bracket
+  semantics remain unverified and are not assumed.
+* **Partial-profit management.** TARGET placement stays blocked (`UNPROTECTED_TARGET`)
+  until the bucket model above exists and is approved.
+* **Trailing orchestration.** A cycle step that reads verified highs (daily bars,
+  M2-2a), calls `record_high_observation`, decides when a higher level justifies a
+  replacement (thresholds, session timing, last-minutes freeze), runs the replacement
+  protocol and calls `refresh_protection`; plus maximum-gap alerts/halts (P7).
+* **Halts.** Whether specific persistent halts (e.g. `WEEKLY_DRAWDOWN`) should permit
+  automated protective exits.
+* **Alpaca validation** (paper, separately authorized): stop field rules and price
+  increments, GTC stop behavior overnight and across halts, gap execution, `qty_available`
+  with open stops, cancel races, replace semantics, fill activities for stops.
+
+### 12.42 Step 16.12A: protective-stop safety review (offline)
+
+Review of §12.41 before commit. Offline only; migration 0009 corrected **before** it was
+applied anywhere outside disposable test databases (the real ledger is at version 8).
+
+#### Findings and corrections
+
+| # | Finding | Correction |
+|---|---|---|
+| R1 | SimBroker triggered stops on any print, including after-hours and pre-market; the gap test "gapped" at 07:00 UTC. | `market_trade` executes nothing outside a regular session of the loaded calendar (fails loudly without one); the first eligible print of the next session is the executable price. |
+| R2 | A protection gap was one undifferentiated interval from the cancel *request*, although the old stop may still be working until the broker confirms. | `protection_gaps.confirmed_at`: a gap opens **potential** at the cancel request and becomes **confirmed** once the prior stop is broker-confirmed terminal with every fill booked while shares remain and no acknowledged stop covers them. `STOP_ENDED_UNFILLED` opens confirmed. |
+| R3 | A gap closed on any `ACCEPTED`/`PARTIALLY_FILLED` stop, without checking that it covers the held shares. | Closes only on a broker-acknowledged stop (broker id, `ACCEPTED`/`PARTIALLY_FILLED`) whose unfilled quantity covers the plan's shares. `PENDING_SUBMIT`, `SUBMIT_AMBIGUOUS` and `PENDING_CANCEL` never count as protection. |
+| R4 | Gap state was refreshed only after a placement; after a restart or a broker-side change nothing confirmed or closed it. | `OrderSync.sync` refreshes every plan with a protective stop after refreshing orders (no-op without plan stops, e.g. OBSERVE). |
+| R5 | `plan_stop_levels` / `protection_gaps` accepted rows for unknown plans, another plan's orders, non-stop orders, NULL prior orders, and empty or non-object evidence. | Triggers/CHECKs: the plan must have an `ENTRY` order; gap prior and closing orders must be `PROTECTIVE_STOP`s of the same plan; prior is required; a gap cannot be inserted closed; `POSITION_FLAT` names no order; evidence must be a non-empty JSON object and an evidence `client_order_id` must be an order of the same plan (malformed JSON is rejected by the CHECK, not an error). The repository also refuses empty evidence. |
+| R6 | No read model said whether a plan was actually protected. | `protection_status`: `FLAT`, `PROTECTED`, `POTENTIAL_GAP`, `UNCERTAIN`, `UNPROTECTED`. |
+
+#### Stop session policy (simulation; Alpaca behavior unverified)
+
+* **Submission and replacement** of a stop require the gate's protective-exit blockers to
+  be clear; `MARKET_CLOSED` is all-order, so no stop is submitted or replaced outside
+  the regular session (pending broker validation of extended-hours handling).
+* **An existing GTC stop is never cancelled or invalidated by the close**; it stays
+  `ACCEPTED`, holds its shares, and the plan stays `PROTECTED` overnight.
+* **Triggering** (SimBroker): only prints inside a regular session are eligible; an
+  after-hours or pre-market print below the stop executes nothing.
+* **Overnight gaps**: the first eligible print of the next session executes the stop at
+  that price (e.g. 44.00 for a 48.00 stop, −3R), never at the stop price.
+
+#### Replacement-gap lifecycle
+
+| Step | Old stop | Replacement | Gap | `protection_status` |
+|---|---|---|---|---|
+| Cancel requested | `PENDING_CANCEL` (holds shares) | — | opened **potential** (same tx) | `POTENTIAL_GAP` |
+| Cancel pending at broker | `PENDING_CANCEL` | — | potential | `POTENTIAL_GAP` |
+| Cancel declined | back to `ACCEPTED` | — | closed `STOP_ACKNOWLEDGED` by the old stop, never confirmed | `PROTECTED` |
+| Fill wins the race | `FILLED` | — | closed `POSITION_FLAT` | `FLAT` |
+| Cancel confirmed | `CANCELED`, fills booked | — | **confirmed** (`confirmed_at` ≥ opened) | `UNPROTECTED` |
+| Replacement intent committed / marker set | — | `PENDING_SUBMIT` (holds shares) | stays open, confirmed | `UNCERTAIN` |
+| Replacement ambiguous | — | `SUBMIT_AMBIGUOUS` | stays open | `UNCERTAIN` |
+| Replacement rejected | — | `REJECTED` | stays open | `UNPROTECTED` |
+| Replacement acknowledged or adopted | — | `ACCEPTED`, covers shares | closed `STOP_ACKNOWLEDGED` by it | `PROTECTED` |
+
+A completed send attempt is never reported as protection.
+
+#### Restart and replay (tested at every replacement transition)
+
+Crash points `after_cancel_marker`, `after_intent_commit`, `send_marker_uncommitted`,
+`after_send_marker`, `after_submit`, `after_outcome_commit`, then restart + recovery +
+sync: at most one submission per order; the replacement (or the old stop) holds every
+share in every status; the highest durable level (raised to 49.00 before the
+replacement) is kept and used — never lowered; an unresolved gap stays open and the plan
+is `UNCERTAIN`, not `PROTECTED`; an order the broker received is adopted and closes the
+gap; a cancel that never reached the broker leaves the old stop working and closes the
+gap unconfirmed. A late fill posting after a restart is booked against the old stop.
+
+#### Migration 0009 changes in this review
+
+`protection_gaps` gains `confirmed_at` and NOT NULL `prior_client_order_id`, with the
+CHECKs and set-once trigger above, plus ownership triggers for gaps and stop levels and
+the evidence-object CHECK. The schema is otherwise as in §12.41; it still applies only
+through simulation auto-migration or the explicit, backed-up `migrate`.
 
 ---
 

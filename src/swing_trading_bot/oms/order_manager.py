@@ -55,6 +55,7 @@ from swing_trading_bot.domain.enums import (
 from swing_trading_bot.domain.ids import new_client_order_id
 from swing_trading_bot.domain.models import BrokerOrderSnapshot
 from swing_trading_bot.domain.money import ZERO, MoneyError, valid_order_price, whole_shares
+from swing_trading_bot.domain.state_machine import is_terminal
 from swing_trading_bot.domain.trade_plan import (
     TradePlan,
     exit_intent_key,
@@ -64,11 +65,13 @@ from swing_trading_bot.domain.trade_plan import (
 from swing_trading_bot.ledger.db import Database, Tx, assert_no_transaction
 from swing_trading_bot.ledger.errors import PersistenceError
 from swing_trading_bot.ledger.portfolio import VirtualPortfolio
+from swing_trading_bot.ledger.protection_store import GapReason, ProtectionGapsRepository
 from swing_trading_bot.ledger.repositories import (
     OrderProgress,
     OrderRecord,
     OrdersRepository,
     PositionsRepository,
+    PriceMarksRepository,
     TradingStateRepository,
 )
 from swing_trading_bot.ledger.state_fingerprint import ledger_fingerprint
@@ -84,6 +87,12 @@ from swing_trading_bot.oms.lifecycle import (
     change_status,
     halt,
     record_event,
+)
+from swing_trading_bot.oms.protection import (
+    persist_level,
+    plan_owned_qty,
+    protected_state,
+    refresh_protection,
 )
 from swing_trading_bot.oms.share_reservations import SellSideBook
 from swing_trading_bot.oms.trade_plans import (
@@ -155,6 +164,11 @@ class RefusalCode(StrEnum):
     PLAN_IDENTITY_INVALID = "PLAN_IDENTITY_INVALID"
     STOP_ORDERS_UNSUPPORTED = "STOP_ORDERS_UNSUPPORTED"
     UNPROTECTED_TARGET = "UNPROTECTED_TARGET"
+    ENTRY_STILL_WORKING = "ENTRY_STILL_WORKING"
+    UNBOOKED_FILLS = "UNBOOKED_FILLS"
+    NOTHING_TO_PROTECT = "NOTHING_TO_PROTECT"
+    STOP_NOT_BELOW_MARK = "STOP_NOT_BELOW_MARK"
+    MARK_UNAVAILABLE = "MARK_UNAVAILABLE"
     GATE_BLOCKED = "GATE_BLOCKED"
     HALTED = "HALTED"
     INTENT_KEY_USED = "INTENT_KEY_USED"
@@ -364,10 +378,11 @@ class OrderManager:
     def place_plan_exit(self, request: PlanExitRequest, *, now: datetime) -> PlacementResult:
         """Create and submit a sell that belongs to a TradePlan.
 
-        Fail-closed, in this order: request shape; ``PROTECTIVE_STOP`` refused (stop orders
-        cannot be persisted yet: no ``stop_price`` column); the gate must be fully clear
-        (whether risk-reducing exits may bypass entry-only blockers is an unresolved
-        policy); then, inside ``BEGIN IMMEDIATE``: no persistent halt, unused intent key,
+        Fail-closed, in this order: request shape; ``PROTECTIVE_STOP`` refused here (use
+        :meth:`place_protective_stop`); ``TARGET`` refused unless an offline test opts in;
+        the gate (a risk ``EXIT`` is refused only by all-order blockers, policy P3; a
+        ``TARGET`` needs a fully clear gate); then, inside ``BEGIN IMMEDIATE``: no
+        persistent halt, unused intent key,
         no other working order for the symbol (the M1 one-working-order rule, which the
         reconciler also enforces), plan-owned shares equal the ledger position, and the
         :class:`SellSideBook` permits the quantity. The order and its audit event commit
@@ -383,8 +398,14 @@ class OrderManager:
                             "no protective stop can exist yet (P1/P2 proposed only); TARGET "
                             "sells run only in isolated offline OMS tests")  # fmt: skip
         gate = self._gates.evaluate(now=now)
-        if not gate.new_entries_allowed:
-            return _refused(RefusalCode.GATE_BLOCKED, ",".join(gate.reason_codes))
+        # P3: a risk EXIT is protective, so entry-only blockers do not refuse it; a
+        # TARGET (profit-taking) still needs a fully clear gate.
+        blockers = (
+            gate.blocking if request.role is OrderRole.TARGET else gate.protective_exit_blockers
+        )
+        if blockers:
+            return _refused(RefusalCode.GATE_BLOCKED,
+                            ",".join(sorted({f.reason.value for f in blockers})))  # fmt: skip
         coid = self._new_id()
         with self._db.transaction() as tx:
             refusal = self._create_plan_exit(tx, request, coid, now=now)
@@ -458,6 +479,139 @@ class OrderManager:
                      shares_available_before=book.available)  # fmt: skip
         return None
 
+    # ===================================================== protective stops (16.12)
+    def place_protective_stop(
+        self, plan: TradePlan, *, generation: int, now: datetime
+    ) -> PlacementResult:
+        """Protect the plan's whole, fully booked position with one SELL STOP (GTC).
+
+        Policies (approved for simulation, ARCHITECTURE §12.41): protection first (P1) —
+        the stop covers every plan share, so no TARGET can coexist with it; durable stop
+        price (P2); only all-order blockers refuse it (P3); small positions get the same
+        whole-position stop (P4); a working entry must first be cancelled and its
+        terminal status confirmed (P5); the stop level is the replayed level or the
+        latest persisted one, whichever is higher (P6, P8).
+
+        Fail-closed checks, in order: the gate's protective-exit blockers; then inside
+        ``BEGIN IMMEDIATE``: no persistent halt, the plan's durable record verifies,
+        unused intent key (an existing order is reported, nothing created), the entry is
+        terminal and every plan fill booked, no other working order for the symbol,
+        plan-owned shares equal the ledger position and are positive, a stored mark above
+        the stop (a stop at or above the market would trigger at once), and the share
+        book. The order, its audit event and any new stop level commit together, then
+        submission follows the same committed-marker path as every order.
+        """
+        assert_no_transaction("place_protective_stop")
+        if generation < 0:
+            return _refused(RefusalCode.INVALID_PLAN_REQUEST, "generation must be >= 0")
+        gate = self._gates.evaluate(now=now)
+        blockers = gate.protective_exit_blockers
+        if blockers:
+            return _refused(RefusalCode.GATE_BLOCKED,
+                            ",".join(sorted({f.reason.value for f in blockers})))  # fmt: skip
+        coid = self._new_id()
+        with self._db.transaction() as tx:
+            refusal = self._create_protective_stop(tx, plan, coid, generation=generation,
+                                                   now=now)  # fmt: skip
+        if refusal is not None:
+            return refusal
+        self._crash("after_intent_commit")
+        result = self._send(coid, now=now)
+        self.refresh_protection(plan.plan_id, now=now)
+        return result
+
+    def _create_protective_stop(  # noqa: PLR0911, PLR0912 - one branch per distinct refusal
+        self, tx: Tx, plan: TradePlan, coid: str, *, generation: int, now: datetime
+    ) -> PlacementResult | None:
+        if TradingStateRepository().get(tx).halted:
+            return _refused(RefusalCode.HALTED, "persistent halt")
+        try:
+            stored = load_plan(tx, plan.plan_id)
+        except PlanIdentityError as exc:
+            return _refused(RefusalCode.PLAN_IDENTITY_INVALID, str(exc))
+        if stored is None:
+            return _refused(RefusalCode.PLAN_UNKNOWN, plan.plan_id)
+        if stored.fingerprint != plan.fingerprint:
+            return _refused(RefusalCode.PLAN_INTENT_MISMATCH, "plan recorded with another intent")
+        key = exit_intent_key(plan.plan_id, OrderRole.PROTECTIVE_STOP, generation)
+        existing = self._orders.get_by_intent_key(tx, key)
+        if existing is not None:
+            return _existing(existing)
+        symbol = plan.intent.symbol
+        plan_orders = self._orders.list_for_plan(tx, plan.plan_id)
+        entry = next(o for o in plan_orders if o.order_role is OrderRole.ENTRY)
+        if not is_terminal(entry.status):
+            return _refused(RefusalCode.ENTRY_STILL_WORKING,
+                            "cancel the entry's unfilled remainder and wait for the broker's "
+                            "confirmation before protecting (P5)")  # fmt: skip
+        if any(o.unbooked_fill_qty > ZERO for o in plan_orders):
+            return _refused(RefusalCode.UNBOOKED_FILLS, "plan fills not yet booked")
+        working = [o for o in self._orders.list_working(tx) if o.symbol == symbol]
+        if working:
+            return _refused(RefusalCode.WORKING_ORDER_EXISTS,
+                            ",".join(o.client_order_id for o in working))  # fmt: skip
+        pid = self._pf.portfolio(tx).id or 0
+        pos = PositionsRepository().get(tx, pid, symbol)
+        position_qty = ZERO if pos is None else pos.qty
+        owned = plan_owned_qty(plan_orders)
+        if owned != position_qty:
+            return _refused(RefusalCode.PLAN_POSITION_MISMATCH,
+                            f"plan owns {owned}, ledger position {position_qty}")  # fmt: skip
+        if owned <= ZERO:
+            return _refused(RefusalCode.NOTHING_TO_PROTECT, "no plan shares are held")
+        state, stop = protected_state(tx, plan)
+        if stop is None:  # pragma: no cover - a plan always has an initial stop
+            return _refused(RefusalCode.NOTHING_TO_PROTECT, "no stop level")
+        mark = PriceMarksRepository().get(tx, symbol)
+        if mark is None:
+            return _refused(RefusalCode.MARK_UNAVAILABLE, symbol)
+        if mark.price <= stop:
+            return _refused(RefusalCode.STOP_NOT_BELOW_MARK,
+                            f"stop {stop} is not below the mark {mark.price}: use a risk "
+                            "exit")  # fmt: skip
+        book = SellSideBook.build(symbol, position_qty, working)
+        refusals = book.check_new_sell(owned, trade_plan_id=plan.plan_id,
+                                       role=OrderRole.PROTECTIVE_STOP)  # fmt: skip
+        if refusals:
+            return _refused(RefusalCode.SHARES_UNAVAILABLE, ",".join(r.value for r in refusals))
+        rec = OrderRecord(
+            client_order_id=coid,
+            portfolio_id=pid,
+            intent_key=key,
+            symbol=symbol,
+            side=Side.SELL,
+            order_type=OrderType.STOP,
+            time_in_force=TimeInForce.GTC,
+            purpose=IntentPurpose.RISK_EXIT,
+            qty=owned,
+            limit_price=None,
+            planned_stop=None,
+            status=OrderStatus.PENDING_SUBMIT,
+            filled_qty=ZERO,
+            avg_fill_price=None,
+            created_at=now,
+            updated_at=now,
+            trade_plan_id=plan.plan_id,
+            order_role=OrderRole.PROTECTIVE_STOP,
+            stop_price=stop,
+        )
+        self._orders.insert_plan_order(tx, rec)
+        evidence = {"client_order_id": coid, "phase": state.phase.value,
+                    "mark": str(mark.price), "mark_as_of": mark.as_of.isoformat()}  # fmt: skip
+        persist_level(tx, plan, state, stop, evidence=evidence, at=now)
+        record_event(tx, coid, at=now, source=EventSource.LOCAL, event="INTENT_CREATED",
+                     to_status=OrderStatus.PENDING_SUBMIT, trade_plan_id=plan.plan_id,
+                     role=OrderRole.PROTECTIVE_STOP.value, qty=owned, stop_price=stop,
+                     phase=state.phase.value, position_qty=position_qty,
+                     shares_reserved_before=book.reserved)  # fmt: skip
+        return None
+
+    def refresh_protection(self, plan_id: str, *, now: datetime) -> None:
+        """Open or close the plan's unprotected interval from its orders (P7)."""
+        assert_no_transaction("refresh_protection")
+        with self._db.transaction() as tx:
+            refresh_protection(tx, plan_id, at=now)
+
     def _send(self, coid: str, *, now: datetime) -> PlacementResult:
         with self._db.transaction() as tx:
             order = self._orders.require(tx, coid)
@@ -475,6 +629,7 @@ class OrderManager:
             order_type=order.order_type,
             time_in_force=order.time_in_force,
             limit_price=order.limit_price,
+            stop_price=order.stop_price,
         )
         assert_no_transaction("submit_order")
         snapshot: BrokerOrderSnapshot | None = None
@@ -554,6 +709,15 @@ class OrderManager:
                 change_status(tx, order, OrderStatus.PENDING_CANCEL, portfolio=self._pf, at=now,
                               source=EventSource.LOCAL, event="CANCEL_REQUESTED",
                               reason=reason)  # fmt: skip
+                if order.order_role is OrderRole.PROTECTIVE_STOP and order.trade_plan_id:
+                    # P7: from this request on, the position may be unprotected.
+                    ProtectionGapsRepository().open(
+                        tx,
+                        order.trade_plan_id,
+                        reason=GapReason.STOP_CANCEL_REQUESTED,
+                        prior=coid,
+                        at=now,
+                    )
         self._crash("after_cancel_marker")
         cancel_marker = read_committed_cancel_marker(self._db, coid)
         try:
@@ -575,7 +739,7 @@ class OrderManager:
 def _plan_exit_problem(req: PlanExitRequest) -> tuple[RefusalCode, str] | None:
     if req.role is OrderRole.PROTECTIVE_STOP:
         return (RefusalCode.STOP_ORDERS_UNSUPPORTED,
-                "stop orders need a persisted stop_price (schema decision pending)")  # fmt: skip
+                "protective stops are placed only by place_protective_stop")  # fmt: skip
     if req.role not in (OrderRole.TARGET, OrderRole.EXIT):
         return RefusalCode.INVALID_PLAN_REQUEST, f"role {req.role.value} is not a sell role"
     if (

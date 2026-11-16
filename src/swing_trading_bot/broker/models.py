@@ -157,6 +157,8 @@ class SubmitOrderRequest:
     order_type: OrderType
     time_in_force: TimeInForce
     limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    """Trigger price; required for STOP / STOP_LIMIT, forbidden otherwise (M2-3)."""
 
     def __post_init__(self) -> None:
         if not self.client_order_id or len(self.client_order_id) > 128:
@@ -168,6 +170,11 @@ class SubmitOrderRequest:
                 raise ValueError("limit orders need a positive limit_price")
         elif self.limit_price is not None:
             raise ValueError("only limit orders carry limit_price")
+        if self.order_type in {OrderType.STOP, OrderType.STOP_LIMIT}:
+            if self.stop_price is None or self.stop_price <= ZERO:
+                raise ValueError("stop orders need a positive stop_price")
+        elif self.stop_price is not None:
+            raise ValueError("only stop orders carry stop_price")
 
 
 @dataclass(frozen=True, slots=True)

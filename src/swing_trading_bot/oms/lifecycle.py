@@ -172,6 +172,7 @@ def _identity_mismatch(order: OrderRecord, snap: BrokerOrderSnapshot) -> str | N
         "qty": (order.qty, snap.qty),
         "order_type": (order.order_type, snap.order_type),
         "limit_price": (order.limit_price, snap.limit_price),
+        "stop_price": (order.stop_price, snap.stop_price),
     }
     if order.broker_order_id is not None:
         pairs["broker_order_id"] = (order.broker_order_id, snap.broker_order_id)

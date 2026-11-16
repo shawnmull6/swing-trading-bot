@@ -1175,6 +1175,7 @@ def _order_conflicts(
         "side": (mine.side, snap.side),
         "qty": (mine.qty, snap.qty),
         "limit_price": (mine.limit_price, snap.limit_price),
+        "stop_price": (mine.stop_price, snap.stop_price),
         "order_type": (mine.order_type, snap.order_type),
     }
     if mine.broker_order_id is not None:

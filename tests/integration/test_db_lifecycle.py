@@ -64,6 +64,8 @@ EXPECTED_TABLES = {
     "reconciliation_findings",
     "rebaseline_events",
     "rebaseline_acknowledgements",
+    "plan_stop_levels",
+    "protection_gaps",
 }
 
 
