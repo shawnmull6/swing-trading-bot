@@ -96,14 +96,57 @@ def persist_level(
                        evidence=evidence, at=at)  # fmt: skip
 
 
+@dataclass(frozen=True, slots=True)
+class ObservationLog:
+    """The market observations a plan's persisted stop levels were derived from
+    (evidence carrying ``observation_id`` and ``as_of``; Step 16.13A)."""
+
+    ids: frozenset[str]
+    latest_as_of: datetime | None
+
+
+def observation_log(s: Session, plan_id: str) -> ObservationLog:
+    ids: set[str] = set()
+    latest: datetime | None = None
+    for lv in PlanStopLevelsRepository().list_for_plan(s, plan_id):
+        oid, as_of = lv.evidence.get("observation_id"), lv.evidence.get("as_of")
+        if not isinstance(oid, str) or not isinstance(as_of, str):
+            continue
+        ids.add(oid)
+        try:
+            ts = datetime.fromisoformat(as_of)
+        except ValueError:  # pragma: no cover - only validated evidence carries an id
+            continue
+        if ts.utcoffset() is not None and (latest is None or ts > latest):
+            latest = ts
+    return ObservationLog(frozenset(ids), latest)
+
+
 def record_high_observation(
     tx: Tx, plan: TradePlan, *, high: Decimal, evidence: dict[str, Any], at: datetime
 ) -> StopLevel | None:
     """Persist an observed high (with its market-data evidence, e.g. the daily bar's
     session, feed and timestamp) and the stop it implies. Never lowers anything. The
-    evidence is required: a high without provenance is not recorded."""
+    evidence is required: a high without provenance is not recorded.
+
+    Evidence with a stable ``observation_id`` is applied at most once: an id already
+    persisted is a no-op (``None``), and an observation not newer than the latest
+    persisted one is refused — the caller validates ordering first; this is the second
+    guard at the persistence boundary."""
     if not evidence:
         raise ValueError("a high observation needs its market-data evidence")
+    oid = evidence.get("observation_id")
+    if isinstance(oid, str):
+        log = observation_log(tx, plan.plan_id)
+        if oid in log.ids:
+            return None
+        as_of = evidence.get("as_of")
+        if (
+            isinstance(as_of, str)
+            and log.latest_as_of is not None
+            and datetime.fromisoformat(as_of) <= log.latest_as_of
+        ):
+            raise ValueError(f"observation {oid} is not newer than the last persisted one")
     state, stop = protected_state(tx, plan)
     obs = ExitEvent(f"obs:{plan.plan_id}:{at.isoformat()}:{high}", ExitEventKind.PRICE_HIGH,
                     price=high)  # fmt: skip
@@ -208,8 +251,10 @@ def protection_status(s: Session, plan_id: str) -> ProtectionStatus:
 
 
 __all__ = [
+    "ObservationLog",
     "ProtectionState",
     "ProtectionStatus",
+    "observation_log",
     "persist_level",
     "persisted_highs",
     "plan_owned_qty",

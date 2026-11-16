@@ -274,6 +274,10 @@ class OrderManager:
         self._new_id = new_order_id
         self._orders = OrdersRepository()
 
+    @property
+    def config(self) -> OmsConfig:
+        return self._config
+
     # ============================================================== submission
     def place_entry(  # noqa: PLR0911 - each early return is a distinct refusal
         self, decision: RiskDecision, *, now: datetime, plan: TradePlan | None = None

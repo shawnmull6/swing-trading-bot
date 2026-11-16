@@ -349,8 +349,10 @@ class SimBroker:
         During a regular session, every visible, working SELL ``STOP`` order for
         ``symbol`` whose stop price is at or above ``price`` triggers and executes **at
         ``price``**, oldest first. A triggered stop behaves as a market order and keeps
-        executing on later eligible prints. ``liquidity`` caps the shares executed by this
-        print across all stops (partial fills). Orders in ``pending_cancel`` still
+        executing on later eligible prints. Working SELL ``LIMIT`` orders whose limit is at
+        or below the print also execute at the print (M2-3 exit orchestration).
+        ``liquidity`` caps the shares executed by this print across all orders (partial
+        fills). Orders in ``pending_cancel`` still
         trigger: a cancel request does not stop an execution that wins the race. Returns
         the client ids that executed. ``STOP_LIMIT`` orders are not simulated.
         """
@@ -365,14 +367,8 @@ class SimBroker:
         remaining = liquidity
         executed: list[str] = []
         for o in self._visible_orders():
-            if (o.symbol != symbol or o.side is not Side.SELL or o.order_type is not OrderType.STOP
-                    or o.status in TERMINAL or o.stop_price is None):  # fmt: skip
+            if o.symbol != symbol or not self._executes_on(o, price):
                 continue
-            if not (o.triggered or price <= o.stop_price):
-                continue
-            if not o.triggered:
-                o.triggered = True
-                self._log(f"STOP {o.client_order_id} triggered at {price} (stop {o.stop_price})")
             qty = o.leaves if remaining is None else min(o.leaves, remaining)
             if qty <= ZERO:
                 continue
@@ -381,6 +377,20 @@ class SimBroker:
             if remaining is not None:
                 remaining -= qty
         return executed
+
+    def _executes_on(self, o: _Order, price: Decimal) -> bool:
+        """Whether a working SELL order executes on an eligible print at ``price``: a
+        marketable LIMIT (limit at or below the print), or a STOP triggered now or before."""
+        if o.side is not Side.SELL or o.status in TERMINAL:
+            return False
+        if o.order_type is OrderType.LIMIT and o.limit_price is not None:
+            return price >= o.limit_price
+        if o.order_type is not OrderType.STOP or o.stop_price is None:
+            return False
+        if not o.triggered and price <= o.stop_price:
+            o.triggered = True
+            self._log(f"STOP {o.client_order_id} triggered at {price} (stop {o.stop_price})")
+        return o.triggered
 
     def in_regular_session(self, at: datetime) -> bool:
         """Whether ``at`` falls inside a regular session of the loaded trading calendar

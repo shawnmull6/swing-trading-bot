@@ -263,6 +263,20 @@ uv run swing-trading-bot resume --reason "maintenance done"
 newer than the halt; a refusal is recorded (`RESUME_REFUSED`). Loss-limit lockouts and the
 weekly drawdown limit keep blocking new entries independently of a resume.
 
+### Protection halts (M2-3 simulation; A§12.44)
+
+`STOP_BREACHED_UNPROTECTED` — a plan's position had no working stop and the mark was at
+or below its stop level. No order was sent. `PROTECTION_FAILED` — repeated protective
+stops were rejected. Both block every automated order and never clear on their own,
+even if the price recovers. Before resuming:
+
+1. read the evidence: the `PROTECTION_BREACHED` / `PROTECTION_FAILED` order event on the
+   plan's entry order and the open protection gap;
+2. decide how the position is handled (no automatic exit exists);
+3. `resume --reason "..."` (CLEAN reconciliation first). The next step re-protects at the
+   durable stop level, or records new evidence and halts again if the level is still
+   breached.
+
 ## 7. BROKER_OUTAGE recovery
 
 A failed sync cycle (network, timeout, 5xx, 429) blocks new entries at once

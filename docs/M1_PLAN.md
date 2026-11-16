@@ -42,7 +42,12 @@ simulation under the approved P1–P8 simulation policies; **migration 0009 pack
 ledger not migrated** (observe commands exit 9 until an authorized backed-up `migrate`);
 TARGET execution still blocked; linked exits and trailing orchestration not
 implemented. Step 16.12A (A§12.42): regular-session stop simulation, potential vs
-confirmed protection gaps, ownership/evidence constraints.**
+confirmed protection gaps, ownership/evidence constraints. Step 16.13 (A§12.43): exit
+orchestrator (simulation); partial profits deferred by default, touch-triggered partial
+exit simulation-only opt-in; linked exits still required. Step 16.13A (A§12.44):
+breached stop → persistent `STOP_BREACHED_UNPROTECTED` halt with recorded evidence, no
+automatic sell, operator resume only; strict evidence contract (identity, session,
+feed, duplicate/out-of-order); partial-profit opt-in unreachable from app config.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

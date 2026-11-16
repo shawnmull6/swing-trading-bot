@@ -116,6 +116,11 @@ class HaltReason(StrEnum):
     DAILY_LOSS_REPEAT = "DAILY_LOSS_REPEAT"
     WEEKLY_DRAWDOWN = "WEEKLY_DRAWDOWN"
     REBASELINE = "REBASELINE"
+    PROTECTION_FAILED = "PROTECTION_FAILED"
+    """M2-3 exit orchestration: a held position could not be re-protected (§12.43)."""
+    STOP_BREACHED_UNPROTECTED = "STOP_BREACHED_UNPROTECTED"
+    """M2-3 exit orchestration: a held position has no working stop and the mark is at or
+    below its stop level (§12.43). No automatic exit is sent; operator recovery only."""
 
 
 class BlockReason(StrEnum):

@@ -20,7 +20,9 @@ initialization exception policy is recorded (§12.32); M2-1 account restriction 
 protection enforcement implemented offline (§12.34); M2-2a historical daily bars
 implemented offline (§12.35); M2-3 TradePlan contract and sell-side OMS foundation
 implemented offline (§12.38) and hardened (§12.39-§12.40); Step 16.12 durable protective stops in simulation with
-migration 0009 packaged but **not applied to the real ledger** (§12.41-§12.42). Current M1 state (2026-11-13): the
+migration 0009 packaged but **not applied to the real ledger** (§12.41-§12.42); Step 16.13
+exit orchestration in simulation, partial profits deferred by default (§12.43), hardened
+with a fail-closed breached-stop halt and a strict evidence contract (§12.44). Current M1 state (2026-11-13): the
 real observe ledger has been initialized; two live reconciliations were CLEAN and the
 `INITIALIZED` halt was cleared by an audited `resume`; the ledger runs in OBSERVE mode
 with trading disabled, and a three-cycle market-hours observation session is pending.
@@ -4276,6 +4278,209 @@ gap unconfirmed. A late fill posting after a restart is booked against the old s
 CHECKs and set-once trigger above, plus ownership triggers for gaps and stop levels and
 the evidence-object CHECK. The schema is otherwise as in §12.41; it still applies only
 through simulation auto-migration or the explicit, backed-up `migrate`.
+
+### 12.43 Step 16.13 (M2-3): exit orchestration and partial-profit simulation (offline)
+
+Offline and simulation only; no schema change (still migration 0009, not applied to the
+real ledger); no Alpaca access; trading disabled.
+
+**Architecture findings.**
+* Every primitive the orchestrator needs already existed: plan identity and record
+  (§12.39), exit-state replay and durable levels (§12.38, §12.41), protective stops and
+  cancels with recorded gaps (§12.41-§12.42), the share book, `protection_status`, and
+  the P3 gate classification. The missing piece was a deterministic *decision layer*
+  that calls them in a safe order and resumes after any restart.
+* The one-working-order-per-symbol rule (OMS, pre-trade, reconciler) means a resting
+  partial-profit target can never coexist with the whole-position stop. Cancelling the
+  stop and leaving a resting target at resistance would leave the **whole** position
+  unprotected for an unbounded time: it cannot meet protection-first and is **not
+  automated**.
+* Strategy signals stay outside: the orchestrator receives a `TradePlan` (intent from a
+  strategy, sized by the risk engine) and caller-supplied price evidence; it never sizes,
+  never enters, and never reads a strategy.
+
+**`oms/exit_orchestrator.py` — `ExitOrchestrator.step(plan, now, evidence)`.** One
+consistent ledger snapshot, one gate evaluation, **at most one broker-facing action**;
+every decision is re-derived from durable state, so restarts resume without memory.
+
+| Precedence | Condition | Action |
+|---|---|---|
+| 1 | plan record does not verify | `INVALID_PLAN` (nothing done) |
+| 2 | any plan order pending/ambiguous/orphaned, or unbooked fills | `WAIT_RESOLUTION` |
+| 3 | entry working, no fill / cancel pending | `WAIT_ENTRY` / `WAIT_CANCEL` |
+| 4 | entry working with fills (P5), no all-order blocker | `CANCEL_ENTRY_REMAINDER` |
+| 5 | entry abandoned or position flat | `DONE` |
+| 6 | any all-order blocker (P3: halt, `TRADING_DISABLED`, market closed, reconciliation, identity, broker, marks...) | `HOLD_BLOCKED` — nothing placed **or cancelled**; a working GTC stop stays |
+| 7 | an order is `PENDING_CANCEL` | `WAIT_CANCEL` |
+| 8 | partial-exit order working | `WAIT_PARTIAL`, or `CANCEL_PARTIAL_TIMEOUT` after `partial_fill_timeout` |
+| 9 | acknowledged stop working | record a validated high (runner only) → `RECORD_HIGH`; target touched → `PARTIAL_DEFERRED` (default) or `CANCEL_STOP_FOR_PARTIAL` (opt-in); durable level ≥ stop + `min_stop_raise` → `CANCEL_STOP_FOR_RAISE`; else `PROTECTED` |
+| 10 | nothing working, shares held, last order a stop cancelled *for the partial*, opt-in, target still touched | `PLACE_PARTIAL_EXIT` (marketable limit at the target for the remaining bucket) |
+| 11 | nothing working, shares held | `PLACE_STOP` (next generation, durable level); `STOP_BREACHED_UNPROTECTED` if the mark is at or below the level; `HALT_PROTECTION_FAILED` after `max_restore_attempts` consecutive rejected stops |
+
+`StepResult.protection` is re-read after the action from `protection_status`; it is
+`PROTECTED` only for a broker-acknowledged stop covering every share — never for a
+pending, ambiguous or cancelling stop, nor for a completed send attempt. Cancels carry a
+reason (`EXIT_ORCHESTRATOR:*`) in the order events, so a restarted step knows why a stop
+was cancelled. Replacement never starts while an earlier order is unresolved (rule 2
+and the single working order).
+
+**Price evidence.** `PriceEvidence(symbol, last, session_high, as_of, source, feed,
+session)`; `evidence_problems` rejects missing, stale (`max_evidence_age`, 2 min),
+future, naive, wrong-symbol, wrong-session, inconsistent (`high < last`) and
+unallowed-source evidence (default allowed: `SIM`). Invalid evidence never raises,
+lowers or moves a stop and never triggers a partial; protection itself (placing a
+missing stop) does not wait for evidence.
+
+**Partial profit.**
+* **Default (integrated): `PARTIAL_DEFERRED`.** The stop stays; no TARGET is ever sent
+  (`OmsConfig.allow_unprotected_targets` stays false; constructing the orchestrator
+  with the opt-in against such an OMS raises).
+* **Proposed, simulation-only opt-in: touch-triggered partial exit**
+  (`ExitPolicy.touch_partial_exit` + `allow_unprotected_targets`). Only when *validated*
+  evidence shows `last ≥ target`: cancel the stop (potential gap) → broker confirms
+  (confirmed gap) → marketable SELL LIMIT at the target for the remaining bucket, DAY →
+  filled (or cancelled after `partial_fill_timeout`, 2 min) → re-protect every
+  remaining share (gap closes). The unprotected interval is recorded and bounded by
+  cancel latency + timeout, and occurs only with the price at the target, far above the
+  stop; it is **still a gap**, so it is not proposed for paper execution. A timed-out
+  partial is not retried in the same cycle (the next action is always re-protection).
+* **Safer alternative (requires linked orders, not implemented):** split the position
+  into a partial-bucket stop and a runner stop, then attach the target to the bucket via
+  a *verified* broker OCO, so every share stays protected throughout. Needs the per-plan
+  multi-order rule (§12.39) and Alpaca OCO contract validation.
+
+**Breakeven and trailing.** Breakeven only after the *whole* partial bucket is sold
+(a partially filled, timed-out partial keeps the original stop). Runner highs from
+validated evidence are persisted with their evidence (`record_high_observation`); the
+stop level only ratchets up; a live stop is replaced only when the durable level is at
+least `min_stop_raise` (0.05) above it, during an eligible session, with no unresolved
+order. Restart reconstruction = booked fills + persisted highs, max with the latest
+persisted level.
+
+**Failure handling.** Overnight: `HOLD_BLOCKED (MARKET_CLOSED)`, GTC stop kept, gap
+fills at the next eligible print. Partial stop fills: still `PROTECTED` while the
+remainder is covered. Declined cancel: back to `PROTECTED`, gap closed unconfirmed,
+raise retried. Ambiguous replacement: `UNCERTAIN` → `WAIT_RESOLUTION` until adopted.
+Rejected replacements: retried, then `PROTECTION_FAILED` persistent halt with the gap
+left open and confirmed. Halt / reconciliation mismatch: hold, nothing cancelled.
+Breached level without a stop: reported `STOP_BREACHED_UNPROTECTED`, no automatic
+order.
+
+**SimBroker.** Working SELL LIMIT orders now also execute on eligible prints whose price
+is at or above the limit (at the print price), sharing the `liquidity` cap.
+
+**End-to-end simulations** (`tests/integration/test_exit_orchestrator.py`, 24): full
+lifecycle (entry → stop → touch partial → breakeven runner → trailing raise → trailing
+exit; realized +57.00; two bounded, confirmed, closed gaps); default policy defers the
+partial; stop-out before target; opening gap (held overnight, filled at 44.00);
+partially filled stop still protects; small position; partial entry fill; restart at
+six replacement transitions; declined cancel; ambiguous replacement; failure to restore
+protection (halt); partial-exit timeout restoring full protection; halt and
+reconciliation holds; missing/stale/invalid evidence; protection without evidence;
+breached level; evidence validation; impostor plan.
+
+**Remaining policy decisions.**
+1. Whether any partial-profit mechanism with an unprotected interval is acceptable (the
+   touch-triggered exit), or partial profits wait for verified linked orders.
+2. The linked-order model (bucket stops + OCO) and the per-plan multi-order rule.
+3. Response to `STOP_BREACHED_UNPROTECTED` (automatic marketable risk exit vs operator).
+4. Retry limit and escalation for failed protection; maximum gap duration alerts.
+5. Evidence sources and freshness for paper (`SIP` trades, daily-bar highs), and
+   whether intraday highs or only completed bars may trail.
+6. Whether specific halts (e.g. `WEEKLY_DRAWDOWN`) may run automated protection.
+7. A scheduler/runtime cycle that calls `step` (not implemented; orchestration is a
+   callable, not a loop).
+
+### 12.44 Step 16.13A: exit-orchestrator final hardening (offline)
+
+Offline and simulation only; no schema change (migration 0009 unchanged, still not
+applied to the real ledger); no Alpaca access; trading disabled. Approved policies:
+protection-first is mandatory in the integrated workflow; automated TARGET orders stay
+disabled until linked-order semantics are validated; `STOP_BREACHED_UNPROTECTED` fails
+closed without an automatic market sell; no automatic order bypasses a persistent halt
+or all-order blocker; trailing levels only increase and evidence is validated before it
+is persisted or used. (Supersedes §12.43 decision 3.)
+
+**Breached stop without protection (fail closed).** When no stop works and the OMS
+refuses a new stop because the mark is at or below the stop level
+(`STOP_NOT_BELOW_MARK`), the step sends **nothing** and, in one transaction:
+1. appends a `PROTECTION_BREACHED` order event to the plan's entry order (append-only
+   `order_events`) with the evidence: plan, symbol, held quantity, phase, effective stop
+   level, the ledger mark (price, `as_of`, `received_at`, source, feed), the last
+   protective stop (id, status, stop price), the open protection gap (id, opened,
+   confirmed, reason), the step's validated evidence and evidence problems, and the OMS
+   refusal;
+2. raises the persistent halt `STOP_BREACHED_UNPROTECTED` (`halt_events` audit,
+   actor `exit-orchestrator`) unless a halt is already in force (an earlier reason is
+   never overwritten).
+
+The halt is an all-order blocker: no automated entry, exit, stop or cancel for any plan,
+so later steps return `HOLD_BLOCKED (PERSISTENT_HALT)` and record nothing more. It
+survives restart and **does not clear when the price recovers**; no code path clears it
+automatically. Recovery is the operator's guarded resume (D11: a CLEAN reconciliation
+newer than the halt; refusals audited). After a resume, the next step re-derives from
+durable state: if the mark is now above the level it places the protective stop at the
+durable level (never lower); if the level is still breached it records new evidence and
+halts again. `PROTECTION_FAILED` halts now also record a `PROTECTION_FAILED` order event
+listing the rejected stops.
+
+**Evidence contract.** `PriceEvidence(symbol, last, session_high, as_of, source, feed,
+session, observation_id)`. Checked from the evidence alone (`evidence_problems`):
+
+| Problem | Rejected when |
+|---|---|
+| `EVIDENCE_MISSING` | no evidence |
+| `EVIDENCE_SYMBOL_MISMATCH` | symbol not the plan's |
+| `EVIDENCE_IDENTITY_INVALID` | `observation_id` missing, not `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}` |
+| `EVIDENCE_PRICES_INVALID` | `last`/`session_high` not a finite positive `Decimal`, more than 4 places, or `high < last` |
+| `EVIDENCE_TIMESTAMP_NAIVE` | `as_of` not a timezone-aware datetime (cannot be ordered) |
+| `EVIDENCE_FROM_FUTURE` / `EVIDENCE_STALE` | `as_of > now` / older than `max_evidence_age` (2 min) |
+| `EVIDENCE_SESSION_MISMATCH` | `session` not a date, or not the market date of `as_of` |
+| `EVIDENCE_SOURCE_NOT_ALLOWED` / `EVIDENCE_FEED_NOT_ALLOWED` | not in `allowed_sources` (`SIM`) / `allowed_feeds` (`sim`) |
+
+Checked against the ledger (`_context_problems`), only for evidence that passed:
+
+| Problem | Rejected when |
+|---|---|
+| `EVIDENCE_SESSION_UNKNOWN` | the session is not a trading session of the ledger calendar |
+| `EVIDENCE_OUTSIDE_SESSION` | `as_of` outside `[open_at, close_at)` of that session (pre/post-market) |
+| `EVIDENCE_DUPLICATE` | the `observation_id` was already applied to this plan |
+| `EVIDENCE_OUT_OF_ORDER` | `as_of` not strictly after the latest applied observation |
+
+*Duplicates and older observations.* An applied observation is one whose evidence was
+persisted with a stop level (`plan_stop_levels.evidence_json` carries `observation_id`
+and `as_of`). Re-delivery of the same id — even with a newer timestamp or different
+prices — is idempotent: nothing is persisted, moved or triggered. An observation at or
+before the latest applied one is refused. Observations that did not advance the level
+are not persisted; re-presenting one is harmless because levels only ratchet up.
+`record_high_observation` repeats both checks at the persistence boundary (duplicate id
+→ no-op; older → `ValueError`). Any problem makes the evidence unusable for the whole
+step (no high recorded, no raise, no partial trigger); protection itself never waits
+for evidence. Restart reconstruction is unchanged (booked fills + persisted highs,
+max with the latest persisted level) and needs no live market data.
+
+**Simulation-only partial profits.** The integrated default stays `PARTIAL_DEFERRED`.
+The opt-in needs both `ExitPolicy.touch_partial_exit` and
+`OmsConfig.allow_unprotected_targets`; `AppConfig.oms()` never sets the latter for any
+runtime mode, the YAML configuration models forbid unknown keys (so no configuration
+file can introduce either switch), no application module constructs either switch as
+true (enforced by a source-scan test), and constructing the orchestrator with the
+opt-in against an application-built OMS raises. The demonstrated partial-profit
+lifecycle (§12.43) **includes confirmed unprotected intervals** and is **not approved
+for paper execution**.
+
+**Regression tests** (`tests/integration/test_exit_orchestrator.py`, 62 in total):
+breached stop with no working protection (durable halt, evidence, nothing sent, entries
+blocked); restart and price recovery without clearing; operator resume (refused without
+a clean run; re-protects at the durable level; re-halts if still breached); breach after
+a cancelled stop keeps the gap evidence; `PROTECTION_FAILED` evidence; duplicate, forged
+duplicate, older and same-time observations; persistence-boundary replay; pre-market and
+non-session evidence; 19 malformed-evidence cases; trailing monotonicity and restart
+reconstruction; default deferral; configuration and source isolation of the opt-in.
+
+**Remaining policy decisions** (from §12.43): 1, 2, 4, 5, 6, 7 remain open; 3 is
+decided (fail closed, operator recovery). Open addition: which manual exit procedure the
+operator uses for a breached, halted position once broker execution exists.
 
 ---
 
