@@ -17,6 +17,7 @@ from hypothesis import strategies as st
 from swing_trading_bot.domain.enums import (
     ActivityAttribution,
     HaltReason,
+    IntentPurpose,
     MarkSource,
     OrderRole,
     OrderStatus,
@@ -35,6 +36,7 @@ from swing_trading_bot.ledger.errors import (
 )
 from swing_trading_bot.ledger.invariants import (
     InvariantChecker,
+    SellShareHolds,
     Violation,
     default_checker,
 )
@@ -144,6 +146,80 @@ def test_reserved_rth01_fields_rejected_in_m1(db: Database, make_order: OrderFac
         make_order(order_role=OrderRole.ENTRY)
     with pytest.raises(PersistenceError, match="RTH-01"):
         make_order(trade_plan_id="plan-1")
+
+
+def test_plan_orders_are_validated_and_round_trip(db: Database, make_order: OrderFactory) -> None:
+    """M2-3: plan columns only through insert_plan_order, consistent with the side."""
+    plan = "tp-" + "d" * 32
+    base = make_order()
+    entry = replace(base, client_order_id="stb-plan-entry", intent_key=f"{plan}:ENTRY:0",
+                    trade_plan_id=plan, order_role=OrderRole.ENTRY)  # fmt: skip
+    bad = [
+        replace(entry, trade_plan_id=None),
+        replace(entry, order_role=None),
+        replace(entry, trade_plan_id="plan-1"),
+        replace(entry, side=Side.SELL),  # ENTRY must buy
+        replace(entry, order_role=OrderRole.TARGET),  # sell roles must sell
+    ]
+    for rec in bad:
+        with db.transaction() as tx, pytest.raises(PersistenceError):
+            orders.insert_plan_order(tx, rec)
+    with db.transaction() as tx:
+        orders.insert_plan_order(tx, entry)
+    with db.read() as s:
+        assert orders.get(s, entry.client_order_id) == entry
+        assert orders.list_for_plan(s, plan) == [entry]
+        assert orders.intent_key_exists(s, f"{plan}:ENTRY:0")
+        assert not orders.intent_key_exists(s, f"{plan}:ENTRY:1")
+
+
+def test_sell_share_holds_invariant(db: Database, make_order: OrderFactory) -> None:
+    """M2-3: Σ sell holds per symbol never exceed the position; terminal orders' booked
+    fills equal the broker's filled_qty."""
+
+    sell = make_order(side=Side.SELL, purpose=IntentPurpose.RISK_EXIT, qty=Decimal("5"),
+                      planned_stop=None)  # fmt: skip
+    with db.read() as s:
+        violations = SellShareHolds().check(s)
+    assert [v.subject for v in violations] == [f"{sell.portfolio_id}:AAPL"]  # no position
+    with db.transaction() as tx:
+        PositionsRepository().upsert(tx, PositionRecord(sell.portfolio_id, "AAPL", Decimal(5),
+                                                        Decimal(750), Decimal(0), T0))  # fmt: skip
+    with db.read() as s:
+        assert SellShareHolds().check(s) == []
+        assert "sell_share_holds" in default_checker().run(s).checked
+    with db.transaction() as tx:
+        orders.transition_status(tx, sell.client_order_id, expected=OrderStatus.PENDING_SUBMIT,
+                                 target=OrderStatus.REJECTED, at=T0)  # fmt: skip
+        orders.record_broker_progress(tx, sell.client_order_id, broker_filled_qty=Decimal(1),
+                                      at=T0)  # fmt: skip
+    with db.read() as s:
+        details = [v.detail for v in SellShareHolds().check(s)]
+    assert any("booked fills 0 != broker filled_qty 1" in d for d in details)
+
+
+def test_sell_share_holds_separates_booked_from_unbooked_fills(
+    db: Database, make_order: OrderFactory
+) -> None:
+    """A working sell holds qty - BOOKED fills: broker-reported but unbooked fills stay
+    held (the ledger position still contains them), so they neither trip the invariant
+    nor free shares early. Booking them reduces hold and position together."""
+    sell = make_order(side=Side.SELL, purpose=IntentPurpose.RISK_EXIT, qty=Decimal("5"),
+                      planned_stop=None)  # fmt: skip
+    with db.transaction() as tx:
+        PositionsRepository().upsert(tx, PositionRecord(sell.portfolio_id, "AAPL", Decimal(5),
+                                                        Decimal(750), Decimal(0), T0))  # fmt: skip
+        orders.transition_status(tx, sell.client_order_id, expected=OrderStatus.PENDING_SUBMIT,
+                                 target=OrderStatus.ACCEPTED, at=T0)  # fmt: skip
+        orders.record_broker_progress(tx, sell.client_order_id, broker_filled_qty=Decimal(3),
+                                      at=T0)  # fmt: skip
+    with db.read() as s:
+        assert SellShareHolds().check(s) == []  # holds 5 (0 booked) <= position 5
+    with db.transaction() as tx:  # the position shrinks without booked fills: oversold
+        PositionsRepository().upsert(tx, PositionRecord(sell.portfolio_id, "AAPL", Decimal(4),
+                                                        Decimal(600), Decimal(0), T0))  # fmt: skip
+    with db.read() as s:
+        assert [v.detail for v in SellShareHolds().check(s)] == ["sell holds 5 exceed position 4"]
 
 
 def test_order_lifecycle_with_validated_transitions(db: Database, make_order: OrderFactory) -> None:

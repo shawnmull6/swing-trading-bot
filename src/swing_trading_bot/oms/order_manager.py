@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import Final
 
@@ -44,13 +45,22 @@ from swing_trading_bot.config.risk_limits import AmbiguousOrderPolicy
 from swing_trading_bot.domain.enums import (
     HaltReason,
     IntentPurpose,
+    OrderRole,
     OrderStatus,
+    OrderType,
     RuntimeMode,
     Side,
+    TimeInForce,
 )
 from swing_trading_bot.domain.ids import new_client_order_id
 from swing_trading_bot.domain.models import BrokerOrderSnapshot
-from swing_trading_bot.domain.money import ZERO
+from swing_trading_bot.domain.money import ZERO, MoneyError, valid_order_price, whole_shares
+from swing_trading_bot.domain.trade_plan import (
+    TradePlan,
+    exit_intent_key,
+    is_fingerprint,
+    is_plan_id,
+)
 from swing_trading_bot.ledger.db import Database, Tx, assert_no_transaction
 from swing_trading_bot.ledger.errors import PersistenceError
 from swing_trading_bot.ledger.portfolio import VirtualPortfolio
@@ -58,6 +68,8 @@ from swing_trading_bot.ledger.repositories import (
     OrderProgress,
     OrderRecord,
     OrdersRepository,
+    PositionsRepository,
+    TradingStateRepository,
 )
 from swing_trading_bot.ledger.state_fingerprint import ledger_fingerprint
 from swing_trading_bot.oms.execution import (
@@ -72,6 +84,13 @@ from swing_trading_bot.oms.lifecycle import (
     change_status,
     halt,
     record_event,
+)
+from swing_trading_bot.oms.share_reservations import SellSideBook
+from swing_trading_bot.oms.trade_plans import (
+    PLAN_RECORDED_EVENT,
+    PlanIdentityError,
+    load_plan,
+    proposal_mismatch,
 )
 from swing_trading_bot.risk.gates import GateStatus, TradingGates
 from swing_trading_bot.risk.pretrade import PreTradeRiskEngine, RiskDecision
@@ -97,6 +116,10 @@ class OmsConfig:
     activity_overlap: timedelta = timedelta(hours=1)
     lookup_interval: timedelta = timedelta(minutes=1)
     reconciliation_max_age: timedelta = timedelta(minutes=10)
+    allow_unprotected_targets: bool = False
+    """M2-3 safety (ARCHITECTURE §12.40): a TARGET sell while no protective stop can
+    exist leaves the position unprotected (policy P1, proposed only). Refused unless an
+    isolated offline OMS test opts in explicitly; no runtime path sets it."""
 
     @property
     def absent_window(self) -> timedelta:
@@ -126,6 +149,19 @@ class RefusalCode(StrEnum):
     QUANTITY_CHANGED = "QUANTITY_CHANGED"
     RESERVATION_MISMATCH = "RESERVATION_MISMATCH"
     ACCOUNT_UNAVAILABLE = "ACCOUNT_UNAVAILABLE"
+    # plan orders (M2-3)
+    INVALID_PLAN_REQUEST = "INVALID_PLAN_REQUEST"
+    PLAN_INTENT_MISMATCH = "PLAN_INTENT_MISMATCH"
+    PLAN_IDENTITY_INVALID = "PLAN_IDENTITY_INVALID"
+    STOP_ORDERS_UNSUPPORTED = "STOP_ORDERS_UNSUPPORTED"
+    UNPROTECTED_TARGET = "UNPROTECTED_TARGET"
+    GATE_BLOCKED = "GATE_BLOCKED"
+    HALTED = "HALTED"
+    INTENT_KEY_USED = "INTENT_KEY_USED"
+    WORKING_ORDER_EXISTS = "WORKING_ORDER_EXISTS"
+    PLAN_UNKNOWN = "PLAN_UNKNOWN"
+    PLAN_POSITION_MISMATCH = "PLAN_POSITION_MISMATCH"
+    SHARES_UNAVAILABLE = "SHARES_UNAVAILABLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +171,44 @@ class PlacementResult:
     status: OrderStatus | None = None
     refusal: RefusalCode | None = None
     detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PlanExitRequest:
+    """A sell that belongs to a TradePlan (M2-3). ``generation`` makes the intent key
+    deterministic: re-deriving the same step after a restart collides with the UNIQUE
+    ``intent_key`` instead of creating a second order; a replacement uses the next one.
+    ``plan_fingerprint`` must match the intent recorded with the plan's entry, so a sell
+    can never be attributed to a plan under a different intent."""
+
+    trade_plan_id: str
+    role: OrderRole
+    symbol: str
+    qty: Decimal
+    limit_price: Decimal
+    generation: int
+    plan_fingerprint: str
+    time_in_force: TimeInForce = TimeInForce.DAY
+
+    @classmethod
+    def for_plan(
+        cls, plan: TradePlan, role: OrderRole, *, qty: Decimal, limit_price: Decimal,
+        generation: int, time_in_force: TimeInForce = TimeInForce.DAY,
+    ) -> PlanExitRequest:  # fmt: skip
+        return cls(plan.plan_id, role, plan.intent.symbol, qty, limit_price, generation,
+                   plan.fingerprint, time_in_force)  # fmt: skip
+
+    @property
+    def intent_key(self) -> str:
+        return exit_intent_key(self.trade_plan_id, self.role, self.generation)
+
+    @property
+    def purpose(self) -> IntentPurpose:
+        return (
+            IntentPurpose.DISCRETIONARY_EXIT
+            if self.role is OrderRole.TARGET
+            else IntentPurpose.RISK_EXIT
+        )
 
 
 class CancelOutcome(StrEnum):
@@ -187,9 +261,29 @@ class OrderManager:
         self._orders = OrdersRepository()
 
     # ============================================================== submission
-    def place_entry(self, decision: RiskDecision, *, now: datetime) -> PlacementResult:
-        """Create, reserve and submit the entry a :class:`RiskDecision` approved."""
+    def place_entry(  # noqa: PLR0911 - each early return is a distinct refusal
+        self, decision: RiskDecision, *, now: datetime, plan: TradePlan | None = None
+    ) -> PlacementResult:
+        """Create, reserve and submit the entry a :class:`RiskDecision` approved.
+
+        With ``plan`` the order is that trade instance's ENTRY. The decision's proposal
+        must be exactly the plan's entry (same intent key, symbol, prices, order shape),
+        and the intent's canonical content and fingerprint are stored in the entry's
+        append-only ``INTENT_CREATED`` event, which makes the plan durable.
+
+        Retry semantics: if the plan's entry intent key is already used, nothing is
+        created and the result is ``REFUSED``/``INTENT_KEY_USED`` carrying the existing
+        order's ``client_order_id`` — a retry never creates a second trade. A new,
+        independent trade must use a new :class:`TradePlan` (fresh ``plan_id``)."""
         assert_no_transaction("place_entry")
+        if plan is not None:
+            mismatch = proposal_mismatch(plan, decision.proposal)
+            if mismatch is not None:
+                return _refused(RefusalCode.PLAN_INTENT_MISMATCH, mismatch)
+            with self._db.read() as s:
+                existing = self._orders.get_by_intent_key(s, plan.entry_intent_key)
+            if existing is not None:
+                return _existing(existing)
         if not decision.approved:
             return _refused(RefusalCode.NOT_APPROVED, ",".join(decision.rejection_codes))
         if not now <= decision.valid_until or now < decision.evidence.evaluated_at:
@@ -204,7 +298,7 @@ class OrderManager:
         coid = self._new_id()
         with self._db.transaction() as tx:
             refusal = self._create_intent(tx, decision, coid, account=account, gate=gate,
-                                          now=now)  # fmt: skip
+                                          now=now, plan=plan)  # fmt: skip
         if refusal is not None:
             return refusal
         self._crash("after_intent_commit")
@@ -212,8 +306,12 @@ class OrderManager:
 
     def _create_intent(
         self, tx: Tx, decision: RiskDecision, coid: str, *, account: AccountSnapshot,
-        gate: GateStatus, now: datetime,
+        gate: GateStatus, now: datetime, plan: TradePlan | None = None,
     ) -> PlacementResult | None:  # fmt: skip
+        if plan is not None:
+            existing = self._orders.get_by_intent_key(tx, plan.entry_intent_key)
+            if existing is not None:  # a concurrent retry committed first
+                return _existing(existing)
         current = ledger_fingerprint(tx)
         if current != decision.evidence.ledger_fingerprint:
             return _refused(RefusalCode.LEDGER_CHANGED, "ledger state changed since the decision")
@@ -240,8 +338,13 @@ class OrderManager:
             avg_fill_price=None,
             created_at=now,
             updated_at=now,
+            trade_plan_id=None if plan is None else plan.plan_id,
+            order_role=None if plan is None else OrderRole.ENTRY,
         )
-        self._orders.insert(tx, rec)
+        if plan is None:
+            self._orders.insert(tx, rec)
+        else:
+            self._orders.insert_plan_order(tx, rec)
         fee = self._engine.fees.buy_fee(decision.approved_qty)
         reserved = self._pf.reserve_buy(tx, coid, fee_estimate=fee, now=now)
         if reserved != again.reservation:  # pragma: no cover - same formula both sides
@@ -251,6 +354,108 @@ class OrderManager:
                      revalidated_decision_id=again.decision_id, fingerprint=current,
                      qty=rec.qty, limit_price=rec.limit_price, planned_stop=rec.planned_stop,
                      reservation=reserved)  # fmt: skip
+        if plan is not None:  # the durable copy of the trade instance's intent
+            record_event(tx, coid, at=now, source=EventSource.LOCAL, event=PLAN_RECORDED_EVENT,
+                         trade_plan_id=plan.plan_id, plan_fingerprint=plan.fingerprint,
+                         plan_intent=plan.intent.canonical())  # fmt: skip
+        return None
+
+    # ========================================================= plan exits (M2-3)
+    def place_plan_exit(self, request: PlanExitRequest, *, now: datetime) -> PlacementResult:
+        """Create and submit a sell that belongs to a TradePlan.
+
+        Fail-closed, in this order: request shape; ``PROTECTIVE_STOP`` refused (stop orders
+        cannot be persisted yet: no ``stop_price`` column); the gate must be fully clear
+        (whether risk-reducing exits may bypass entry-only blockers is an unresolved
+        policy); then, inside ``BEGIN IMMEDIATE``: no persistent halt, unused intent key,
+        no other working order for the symbol (the M1 one-working-order rule, which the
+        reconciler also enforces), plan-owned shares equal the ledger position, and the
+        :class:`SellSideBook` permits the quantity. The order and its audit event commit
+        together; submission then follows the same marker/outcome path as entries. Sells
+        hold shares, not cash: no cash reservation is created.
+        """
+        assert_no_transaction("place_plan_exit")
+        problem = _plan_exit_problem(request)
+        if problem is not None:
+            return _refused(*problem)
+        if request.role is OrderRole.TARGET and not self._config.allow_unprotected_targets:
+            return _refused(RefusalCode.UNPROTECTED_TARGET,
+                            "no protective stop can exist yet (P1/P2 proposed only); TARGET "
+                            "sells run only in isolated offline OMS tests")  # fmt: skip
+        gate = self._gates.evaluate(now=now)
+        if not gate.new_entries_allowed:
+            return _refused(RefusalCode.GATE_BLOCKED, ",".join(gate.reason_codes))
+        coid = self._new_id()
+        with self._db.transaction() as tx:
+            refusal = self._create_plan_exit(tx, request, coid, now=now)
+        if refusal is not None:
+            return refusal
+        self._crash("after_intent_commit")
+        return self._send(coid, now=now)
+
+    def _create_plan_exit(  # noqa: PLR0911 - each early return is a distinct refusal
+        self, tx: Tx, req: PlanExitRequest, coid: str, *, now: datetime
+    ) -> PlacementResult | None:
+        if TradingStateRepository().get(tx).halted:
+            return _refused(RefusalCode.HALTED, "persistent halt")
+        existing = self._orders.get_by_intent_key(tx, req.intent_key)
+        if existing is not None:
+            return _existing(existing)
+        pid = self._pf.portfolio(tx).id or 0
+        working = [o for o in self._orders.list_working(tx) if o.symbol == req.symbol]
+        if working:
+            return _refused(RefusalCode.WORKING_ORDER_EXISTS,
+                            ",".join(o.client_order_id for o in working))  # fmt: skip
+        plan_orders = self._orders.list_for_plan(tx, req.trade_plan_id)
+        if not any(o.order_role is OrderRole.ENTRY and o.symbol == req.symbol
+                   for o in plan_orders):  # fmt: skip
+            return _refused(RefusalCode.PLAN_UNKNOWN, req.trade_plan_id)
+        try:
+            stored = load_plan(tx, req.trade_plan_id)
+        except PlanIdentityError as exc:
+            return _refused(RefusalCode.PLAN_IDENTITY_INVALID, str(exc))
+        if stored is None or stored.fingerprint != req.plan_fingerprint:
+            return _refused(RefusalCode.PLAN_INTENT_MISMATCH,
+                            "fingerprint differs from the plan's recorded intent")  # fmt: skip
+        if stored.intent.symbol != req.symbol:
+            return _refused(RefusalCode.PLAN_INTENT_MISMATCH, "symbol differs from the plan")
+        pos = PositionsRepository().get(tx, pid, req.symbol)
+        position_qty = ZERO if pos is None else pos.qty
+        owned = sum((o.filled_qty if o.side is Side.BUY else -o.filled_qty
+                     for o in plan_orders), ZERO)  # fmt: skip
+        if owned != position_qty:
+            return _refused(RefusalCode.PLAN_POSITION_MISMATCH,
+                            f"plan owns {owned}, ledger position {position_qty}")  # fmt: skip
+        book = SellSideBook.build(req.symbol, position_qty, working)
+        refusals = book.check_new_sell(req.qty, trade_plan_id=req.trade_plan_id, role=req.role)
+        if refusals:
+            return _refused(RefusalCode.SHARES_UNAVAILABLE, ",".join(r.value for r in refusals))
+        rec = OrderRecord(
+            client_order_id=coid,
+            portfolio_id=pid,
+            intent_key=req.intent_key,
+            symbol=req.symbol,
+            side=Side.SELL,
+            order_type=OrderType.LIMIT,
+            time_in_force=req.time_in_force,
+            purpose=req.purpose,
+            qty=req.qty,
+            limit_price=req.limit_price,
+            planned_stop=None,
+            status=OrderStatus.PENDING_SUBMIT,
+            filled_qty=ZERO,
+            avg_fill_price=None,
+            created_at=now,
+            updated_at=now,
+            trade_plan_id=req.trade_plan_id,
+            order_role=req.role,
+        )
+        self._orders.insert_plan_order(tx, rec)
+        record_event(tx, coid, at=now, source=EventSource.LOCAL, event="INTENT_CREATED",
+                     to_status=OrderStatus.PENDING_SUBMIT, trade_plan_id=req.trade_plan_id,
+                     role=req.role.value, qty=req.qty, limit_price=req.limit_price,
+                     position_qty=position_qty, shares_reserved_before=book.reserved,
+                     shares_available_before=book.available)  # fmt: skip
         return None
 
     def _send(self, coid: str, *, now: datetime) -> PlacementResult:
@@ -367,6 +572,33 @@ class OrderManager:
             record_event(tx, coid, at=now, source=EventSource.LOCAL, event=event, error=error)
 
 
+def _plan_exit_problem(req: PlanExitRequest) -> tuple[RefusalCode, str] | None:
+    if req.role is OrderRole.PROTECTIVE_STOP:
+        return (RefusalCode.STOP_ORDERS_UNSUPPORTED,
+                "stop orders need a persisted stop_price (schema decision pending)")  # fmt: skip
+    if req.role not in (OrderRole.TARGET, OrderRole.EXIT):
+        return RefusalCode.INVALID_PLAN_REQUEST, f"role {req.role.value} is not a sell role"
+    if (
+        not is_plan_id(req.trade_plan_id)
+        or not is_fingerprint(req.plan_fingerprint)
+        or req.generation < 0
+    ):
+        return RefusalCode.INVALID_PLAN_REQUEST, "invalid plan id, fingerprint or generation"
+    try:
+        whole_shares(req.qty)
+        valid_order_price(req.limit_price)
+    except MoneyError as exc:
+        return RefusalCode.INVALID_PLAN_REQUEST, str(exc)
+    return None
+
+
+def _existing(order: OrderRecord) -> PlacementResult:
+    """The step already has an order: report it, create nothing (idempotent retry)."""
+    return PlacementResult(PlacementOutcome.REFUSED, order.client_order_id, order.status,
+                           RefusalCode.INTENT_KEY_USED, f"intent {order.intent_key} already "
+                           f"has order {order.client_order_id} ({order.status.value})")  # fmt: skip
+
+
 def _refused(code: RefusalCode, detail: str) -> PlacementResult:
     return PlacementResult(PlacementOutcome.REFUSED, None, refusal=code, detail=detail)
 
@@ -380,6 +612,7 @@ __all__ = [
     "OrderManager",
     "PlacementOutcome",
     "PlacementResult",
+    "PlanExitRequest",
     "RefusalCode",
     "check_execution_allowed",
 ]

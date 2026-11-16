@@ -18,7 +18,8 @@ evidence publication and write-failure handling, §12.30) committed; live run #4
 step 15B.8 (single-page activity guard for `init-ledger`) committed; a narrow M1
 initialization exception policy is recorded (§12.32); M2-1 account restriction and
 protection enforcement implemented offline (§12.34); M2-2a historical daily bars
-implemented offline (§12.35). Current M1 state (2026-11-13): the
+implemented offline (§12.35); M2-3 TradePlan contract and sell-side OMS foundation
+implemented offline (§12.38) and hardened (§12.39-§12.40, no schema change; P1–P8 proposed only). Current M1 state (2026-11-13): the
 real observe ledger has been initialized; two live reconciliations were CLEAN and the
 `INITIALIZED` halt was cleared by an audited `resume`; the ledger runs in OBSERVE mode
 with trading disabled, and a three-cycle market-hours observation session is pending.
@@ -492,7 +493,9 @@ in M1, so no migration of order history is needed later. The rule will evolve to
   close; replace sequences are explicit and recoverable states.
 
 Whether linked stops use Alpaca OCO/bracket orders or independent orders is an RTH-01
-decision and needs its own contract tests.
+decision and needs its own contract tests. *M2-3 (§12.38):* the TradePlan contract,
+derived share reservations and a simulation-only plan sell path exist offline; the M1
+one-working-order rule is still enforced and stop orders are not yet supported.
 
 ---
 
@@ -3668,6 +3671,382 @@ mark moved at least `discontinuity_diagnostic_pct` (30%) from the reference clos
 * Alpaca's split-activity format and when a split reaches `/positions` vs the price
   (pre-market);
 * the real cost and latency of the extra positions GET per cycle.
+
+### 12.38 Step 16.11 (M2-3): TradePlan contract and sell-side OMS foundation (offline)
+
+Offline and simulation only. No Alpaca request, no schema migration, no change to the
+real OBSERVE ledger, no trading enablement. Exit execution still exists only against
+SimBroker, behind the unchanged `SimulationExecution` capability and committed markers.
+
+**Architecture findings that shaped the design.**
+* `orders.trade_plan_id` / `orders.order_role` exist since migration 0001 (always NULL in
+  M1). They are *not* in the `orders_immutable` trigger; no code updates them, and adding
+  them to the trigger is part of the deferred migration below.
+* There is **no `stop_price`** anywhere: not in `SubmitOrderRequest`,
+  `BrokerOrderSnapshot`, `broker/mapping.py`, SimBroker, or the `orders` table. A stop
+  order could therefore not be persisted, identity-checked on adoption, or rebuilt after
+  a restart.
+* `Database.open` refuses an observe ledger with pending migrations. Packaging a new
+  migration would make the real ledger refuse to open until an explicit, backed-up
+  `migrate` — an operational change this step is not authorized to cause. **This step
+  adds no migration**; the real ledger stays at schema version 8.
+* `VirtualPortfolio` already books SELL fills (average cost, realized P&L, settlement);
+  `close_reservation` is a no-op for orders without a cash reservation; the lifecycle,
+  sync, recovery and fill gating are side-agnostic.
+* SimBroker already rejects sells above `held − Σ leaves of non-terminal sells` (pending
+  cancels included) and lets fills race cancels.
+* The reconciler reports `MULTIPLE_WORKING_ORDERS` for more than one open broker order
+  per symbol, so the M1 one-working-order-per-symbol rule is kept.
+
+**1. Strategy intent — `domain/trade_plan.py` (pure).**
+* `TradePlanIntent` (frozen, validated): strategy id/version, `signal_ref`, symbol,
+  instrument type, `entry_limit`, `protective_stop` < entry < `partial_target` (valid
+  order prices), `ExitAllocationPolicy` (partial fraction in (0, 1), minimum partial and
+  runner sizes), `TrailingStopIntent` (`ABSOLUTE` whole cents or `PERCENT` in (0, 1)),
+  `breakeven_after_partial`, entry time in force. Floats are refused.
+* *(Superseded by §12.39: identity is a generated trade-instance id, and the content
+  hash is only a fingerprint.)* Order intent keys are `"{plan_id}:{ROLE}:{generation}"`
+  (`exit_intent_key`), so the UNIQUE `orders.intent_key` makes each step at-most-once;
+  a replacement uses the next generation.
+* Strategy replacement: anything that produces a valid intent plugs in; nothing in the
+  OMS knows how support/resistance were found.
+
+**2. Risk-approved sizing — unchanged.** `oms/trade_plans.entry_proposal(plan)` builds
+the existing `TradeProposal` (limit buy at `entry_limit`, stop = `protective_stop`), so
+sizing, the 0.5% risk budget, gap stress and every pre-trade check stay in
+`risk/pretrade.py`. `OrderManager.place_entry(decision, plan=…)` tags the order `ENTRY`
+and requires the decision's proposal to be exactly the plan's entry (§12.39).
+
+**3. Whole-share allocation.** `allocate_exit_quantities(filled_qty, policy)`: partial =
+floor(qty × fraction), runner = the rest; never rounds up. If either bucket is below its
+minimum the split is **infeasible** (partial 0, runner = all). Allocation uses the
+*filled* entry quantity, not the approved one.
+
+**4. Exit-management state — `ExitState` (pure reducer).** Events: `ENTRY_FILL`,
+`ENTRY_CLOSED`, `TARGET_FILL`, `STOP_FILL` (any non-target sell), `PRICE_HIGH`, each with
+an id; a repeated id with identical content is a no-op, with different content it raises
+(conflicting replay). Phases: `PENDING_ENTRY → ENTRY_PARTIAL → PROTECTED → RUNNER →
+CLOSED`, plus `ENTRY_ABANDONED` (no fill) and `SMALL_POSITION_UNRESOLVED` (allocation
+infeasible: only the protective stop applies).
+* After the **whole** partial bucket is sold the stop moves to
+  max(stop, breakeven) where breakeven = average entry fill rounded **up** to a cent
+  (fees excluded), then trails: `stop_for(high_water)` rounded **down** to a cent.
+  The stop only ratchets up (property-tested). There is no trailing before the partial.
+* Oversells, target fills beyond the bucket, entry fills after close, and sells before
+  the entry closed raise `ExitStateError` (callers fail closed).
+* `exit_orders()` reports the desired protective stop and partial target and flags
+  `share_conflict` when they need more shares than are held (always true in `PROTECTED`:
+  stop for all shares + target for the partial). It never resolves the conflict.
+* `assess_open(open)` reports a gap through the stop: loss at the open, planned loss and
+  the R-multiple (e.g. −3R). A stop is a trigger, not a price guarantee.
+* `oms/trade_plans.rebuild_exit_state(session, plan, highs)` verifies the plan against
+  its durable record (§12.39), then replays booked fills of
+  the plan's orders (in execution order, `ENTRY_CLOSED` once the entry is terminal and
+  fully booked) plus caller-supplied highs. After a restart the state is re-derived from
+  the durable ledger; nothing is trusted from memory. Unbooked broker fills are not
+  events.
+
+**5. Sell-side share reservations — `oms/share_reservations.py` (derived, no table).**
+* A working SELL holds `qty − booked filled_qty` shares in **every** non-terminal status:
+  `PENDING_SUBMIT`/`SUBMIT_AMBIGUOUS` (may exist at the broker) and `PENDING_CANCEL` (a
+  cancel request frees nothing). Terminal orders hold nothing. Unbooked broker fills
+  stay held (the ledger position still contains them), so hold and position stay
+  consistent.
+* `SellSideBook.check_new_sell(qty, plan, role)` refuses: invalid qty or role,
+  `INSUFFICIENT_SHARES` (reserved + qty > position), `PLAN_CONFLICT` (a working order of
+  another plan or of no plan), `ROLE_ALREADY_LIVE` (one live `PROTECTIVE_STOP` and one
+  live `EXIT`; several `TARGET`s allowed), `ENTRY_STILL_WORKING`, `UNBOOKED_FILLS`,
+  `BOOK_INCONSISTENT` (holds above the position, several plans, duplicate single roles).
+  Property test: an accepted sell never makes reserved exceed the position.
+
+**6. OMS sell path — `OrderManager.place_plan_exit(PlanExitRequest)`.**
+* Order: request shape (`INVALID_PLAN_REQUEST`); `PROTECTIVE_STOP` →
+  `STOP_ORDERS_UNSUPPORTED`; the gate must be fully clear (`GATE_BLOCKED`, see policy
+  P3); then inside `BEGIN IMMEDIATE`: no persistent halt (`HALTED`), unused intent key
+  (`INTENT_KEY_USED`), no other working order for the symbol (`WORKING_ORDER_EXISTS`),
+  the plan has an entry (`PLAN_UNKNOWN`), plan-owned shares (Σ plan buy fills − Σ plan
+  sell fills) equal the ledger position (`PLAN_POSITION_MISMATCH`), and the book permits
+  the quantity (`SHARES_UNAVAILABLE`). The SELL LIMIT order (`TARGET` →
+  `DISCRETIONARY_EXIT`, `EXIT` → `RISK_EXIT`) and its `INTENT_CREATED` event (with the
+  book before the order) commit together. No cash reservation is created.
+* Submission reuses tx A2 / committed send marker / single submit / tx B unchanged:
+  at-most-once, `SUBMIT_AMBIGUOUS` holds the shares, never resent, and the §10.3
+  protocol and restart recovery apply as for entries.
+* `OrdersRepository.insert` still refuses plan columns; `insert_plan_order` requires both
+  plan id and role, with ENTRY ⇔ BUY. `list_for_plan` and `intent_key_exists` added.
+
+**7. Cancel/replace — `replace_readiness(old)`.** There is no atomic replace. A
+replacement is *cancel → broker-confirmed terminal with every fill booked → new order
+(next generation) sized from the book at that moment*. Readiness:
+`CANCEL_NOT_REQUESTED`, `AWAITING_CANCEL_CONFIRMATION` (`PENDING_CANCEL`),
+`AWAITING_FILL_BOOKING` (unbooked broker fills), `OLD_ORDER_UNRESOLVED` (ambiguous or
+orphan), `OLD_ORDER_FILLED` (the fill won the race), `READY`. A declined cancel returns
+the order to working (`PENDING_CANCEL → ACCEPTED`).
+
+**8. SimBroker.** `refuse_next_cancel(client_order_id)`: the next cancel is accepted as
+`pending_cancel` and declined after `cancel_delay` (back to `new`/`partially_filled`).
+
+**Unresolved policy decisions (stopped, not invented).** Recommendations: §12.39.
+
+| # | Decision | Alternatives | Current behavior (fail-closed) |
+|---|---|---|---|
+| P1 | **Stop vs target for the same shares.** A full-size stop plus a partial target exceeds the position (Alpaca `qty_available`). | (a) broker OCO for the partial bucket + plain stop for the runner bucket (needs contract tests, §9); (b) split stops per bucket, target managed by cancelling that bucket's stop first (brief unprotected window); (c) stop for all shares, target as a monitored trigger that cancels/replaces the stop (window + gap risk); (d) stop-limit variants | `share_conflict` reported; the book refuses the second sell; only one working order per symbol |
+| P2 | **Stop orders.** Need `stop_price` in request, snapshot, mapping, SimBroker trigger/gap semantics and `orders` (migration 0009, which also makes `trade_plan_id`/`order_role` immutable and could add a `trade_plans` table for intents and trailing high-water). | migrate now (requires an explicit backed-up `migrate` of the real ledger before the next observe run) vs defer to the M2 execution step | `STOP_ORDERS_UNSUPPORTED`; no migration |
+| P3 | **Exits under entry-only blockers** (persistent halt, `TRADING_DISABLED`, daily lockout, weekly limit, reconciliation mismatch). §12.13 calls exits "permitted in principle" unless `EXIT_BLOCKING`. | (a) block every sell while any blocker is active; (b) allow protective stops/risk exits only; (c) allow any risk-reducing plan sell when no `EXIT_BLOCKING` reason; cancel-on-halt semantics | (a): any blocking finding refuses |
+| P4 | **Small positions** (partial split infeasible). | full exit at target; no partial (runner only, trail all); skip entries whose approved qty cannot split; raise minimum size | `SMALL_POSITION_UNRESOLVED`: protective stop only, no target |
+| P5 | **Protecting a partially filled, still-working entry.** | stop for filled shares now and resize as fills arrive; cancel the entry at the first fill; wait until the entry is terminal (DAY expiry) | exits refused while the entry works (`WORKING_ORDER_EXISTS` / `ENTRY_STILL_WORKING`) |
+| P6 | **When the partial counts as taken; breakeven definition.** | breakeven after the first target fill vs the whole bucket; breakeven with or without fees | whole bucket; average fill rounded up, fees excluded (marked for review) |
+| P7 | **Unprotected window during replace** of a protective stop (P1 b/c, trailing updates). | accept with a maximum window; require OCO/replace endpoint; tighten only via new order then cancel old (needs spare shares, impossible at full size) | no stop orders exist yet |
+| P8 | **Trailing input.** Highs from daily bars vs intraday marks; persistence of the high-water mark across restarts. | daily bar highs (M2-2a infrastructure) vs marks; persist vs re-derive | caller-supplied `PRICE_HIGH` events; not persisted |
+
+**Tests.**
+* `tests/unit/test_trade_plan.py`: intent validation and identity, trailing rounding,
+  small-position allocation, allocation properties, full lifecycle, breakeven, stop and
+  target conflict, small-position phase, impossible events, idempotent and conflicting
+  replay, gap through the stop, ratchet property.
+* `tests/unit/test_share_reservations.py`: holds by status (pending cancel and ambiguous
+  hold), unbooked fills, plan/role conflicts, working entry, oversold book, replace
+  readiness table, oversell property.
+* `tests/integration/test_plan_exits.py` (SimBroker + simulate ledger): tagged entry and
+  foreign intent key; target hold and partial fills; second sell refused; stop orders
+  refused; invalid requests; oversell; exit while entry works; unknown plan; late fill
+  after cancellation (shares held until booked, replacement sized from the book); cancel
+  declined; fill wins the cancel race; ambiguous sell holds shares and is adopted after
+  restart without resend; crash after intent commit (unsent order holds shares, gate
+  refuses); exit state rebuilt identically after restart; overnight gap (loss beyond 1R
+  booked); trading disabled; persistent halt; reconciliation mismatch; shares not owned
+  by the plan.
+* `tests/integration/test_repositories.py`: `insert_plan_order` validation and round trip.
+
+**Not done / still required before any M2 exit execution:** P1–P8 decisions; stop-order
+support (P2); relaxing the one-working-order rule in the OMS, pre-trade engine and
+reconciler; exit orchestration (deciding *when* to place, cancel or replace); live
+contract tests for sell orders, OCO/bracket semantics and `qty_available` (§9, M2-V2,
+M2-V5); every existing M2 entry criterion (M1_PLAN §9).
+
+### 12.39 Step 16.11A: M2-3 foundation hardening and exit architecture (offline)
+
+Review of §12.38 before commit. Offline only: no Alpaca access, no migration (the real
+ledger stays at schema version 8), no trading enablement.
+
+#### Findings and fixes
+
+| # | Finding | Fix |
+|---|---|---|
+| F1 | `plan_id` was a hash of the intent's content: two independent trades with the same parameters (a repeated signal) got the **same** id, so the second was refused as if it were a retry. | Trade-instance identity is now a generated UUIDv7 (`TradePlan.new`); the content hash is a separate `fingerprint`. |
+| F2 | A retry of an entry whose intent key was already used surfaced as a risk rejection (`NOT_APPROVED`) with no link to the existing order. | `place_entry(plan=…)` checks the plan's entry key first (outside and again inside tx A) and returns `REFUSED`/`INTENT_KEY_USED` with the existing order's `client_order_id` and status. Exits do the same. |
+| F3 | Nothing durable recorded *which intent* a plan was created with; an exit or a replay could be attributed to a plan under a different intent. | The entry's tx A also appends a `PLAN_RECORDED` order event with the canonical intent and fingerprint (append-only, no migration). `load_plan` rebuilds and verifies it; exits must present the matching fingerprint (`PLAN_INTENT_MISMATCH`); a missing/duplicated/non-verifying record → `PLAN_IDENTITY_INVALID`; `rebuild_exit_state` refuses a plan that differs from the record. |
+| F4 | `place_entry(…, trade_plan_id=…)` only compared intent keys: a decision with the plan's key but other prices or symbol was accepted. | `proposal_mismatch` requires the proposal to equal the plan's entry (key, symbol, side, type, TIF, entry, stop, instrument, extended hours). |
+| F5 | `held_shares` released a terminal sell's hold unconditionally; a terminal order with broker-reported but unbooked fills would free shares the broker already sold. The lifecycle never produces this state, but the hold relied on it. | Terminal sells hold `broker_filled_qty − filled_qty`; such orders stay in the book as uncertain and refuse new sells (`UNBOOKED_FILLS`). Terminal buys are never counted as working entries. |
+| F6 | No ledger invariant tied sell orders to positions, and a FILL booked on an already-terminal order (late fill) went undetected (§6.5 lists it, but no invariant implemented it). | New data invariant `sell_share_holds`: Σ holds per (portfolio, symbol) ≤ position, and terminal orders' booked fills = the broker's last `filled_qty` (when reported). A violation is a `LEDGER_INVARIANT` halt. It reads only; ledgers without sell orders (the real OBSERVE ledger) are unaffected. |
+
+#### TradePlan identity semantics
+
+| Concept | Value | Purpose |
+|---|---|---|
+| Trade-instance id | `plan_id = "tp-" + UUIDv7 hex` (`new_plan_id`, version/variant checked) | *Which trade.* Generated once per trade; never derived from content. |
+| Intent fingerprint | `"tpf-" + sha256(canonical intent)` | *What is intended.* Equal fingerprints = equal intents, not the same trade. |
+| Order intent key | `"{plan_id}:{ROLE}:{generation}"`, UNIQUE in `orders` | *Which step.* At-most-once per step; a replacement uses the next generation. |
+| Durable record | entry order (`trade_plan_id`, role `ENTRY`) + one `PLAN_RECORDED` event | Restart: `load_plan` rebuilds the `TradePlan` and verifies the fingerprint. |
+
+* **Retry or restart of a trade:** reuse the same `TradePlan` (or `load_plan`). Its keys
+  collide with what exists; the OMS reports the existing order and creates nothing.
+  If tx A never committed, the retry proceeds normally — still at most one entry.
+* **New independent trade:** `TradePlan.new(intent)`, even with an identical intent:
+  new id, new keys, never mistaken for a retry.
+* **Caller responsibility:** a strategy runner must persist or re-derive the `plan_id`
+  of a trade it is still working on *before* calling `place_entry`, or decide that a
+  signal is new. Until migration 0009 adds a `trade_plans` table, a plan exists in the
+  ledger only once its entry intent commits.
+
+#### Sell reservation audit
+
+| Sell order state | Shares held | New sell for the symbol |
+|---|---|---|
+| `PENDING_SUBMIT` (marker NULL or set) | qty − booked | refused (gate `UNRESOLVED_ORDERS`; book) |
+| `SUBMIT_AMBIGUOUS` | qty − booked | refused; released only by adoption or operator `CONFIRMED_ABSENT` |
+| `ACCEPTED` / `PARTIALLY_FILLED` | qty − booked | refused (one working order per symbol) |
+| `PENDING_CANCEL` | qty − booked (cancel request frees nothing) | refused; a declined cancel returns to working |
+| broker fills not yet booked (any status) | still held (ledger position still contains them) | refused (`UNBOOKED_FILLS` in gate, risk engine and book) |
+| terminal, all fills booked | 0 | permitted by the book |
+| terminal with unbooked fills (not produced by the lifecycle) | unbooked qty | refused; invariant violation if booked ≠ broker |
+| `CONFIRMED_ABSENT` (operator, §10.3) | 0; if it reappears it is adopted (halt `RECON_ORDER`) and holds again | blocked by the halt |
+| `ORPHAN` | 0 (fills booked); halt `RECON_EXECUTION` | blocked |
+
+* **Late fills:** a fill racing a cancel is held (`PENDING_CANCEL` until booked). A fill
+  booked after the order is terminal is recorded (broker truth) and halts via
+  `sell_share_holds`.
+* **Restart:** holds are derived from durable `orders` rows; a rebuilt OMS sees an
+  identical book (tested).
+* **Reconciliation:** a ledger position below the holds (e.g. after an external sale or
+  rebaseline) violates `sell_share_holds`; broker/ledger position differences are
+  already blocking gates (`POSITION_QTY_MISMATCH`/`UNVERIFIED`, §12.37) and
+  `RECON_POSITION` halts. The book uses the *ledger* position; the broker's
+  `qty_available` is never read for sizing (not verified live).
+* **Conclusion:** with the fixes above, no tested state releases shares before the broker
+  confirms a terminal status with every fill booked, and no accepted sell can make holds
+  exceed the position (property-tested); concurrent intents are serialized by
+  `BEGIN IMMEDIATE`.
+
+#### Recommended policy for P1–P8 (proposed only — not approved, not implemented; §12.40)
+
+* **P1 — Linked exits, protection first.** Every held share is covered by a protective
+  stop at all times that the broker allows. Preferred design: split the position into the
+  partial bucket and the runner bucket; protect the runner with a plain stop; protect the
+  partial bucket with a broker-linked OCO (target limit + stop) **only after** Alpaca's
+  OCO/bracket semantics are verified in paper contract tests (leg identity, client ids,
+  `qty_available` accounting, partial fills on one leg, cancel of the sibling, replace).
+  Until then, no target order is placed while a stop is required; the stop wins.
+  *Alpaca behaviour is not validated.*
+* **P2 — Durable stop prices are a prerequisite.** No stop order is submitted before
+  migration 0009 and the snapshot equivalence below exist.
+* **P3 — Separate entry-only blockers from all-order restrictions.** All-order (exits
+  also refused): `EXIT_BLOCKING` reasons (identity, environment, broker unreachable, auth,
+  invalid data, ledger integrity), unresolved/ambiguous orders for the symbol, unbooked
+  fills, a position-quantity mismatch for the symbol, account `trading_blocked`/
+  `account_blocked`. Entry-only (risk-reducing exits of a *verified* position allowed):
+  daily lockout, weekly limit, capital and concentration limits, gap stress. Two items
+  need an explicit decision: whether `TRADING_ENABLED=false` means "no
+  orders at all" (recommended: yes — it is the operator's kill switch) and whether a
+  persistent halt permits protective exits (recommended: no automatic orders under a
+  halt; the operator may run an audited exit command).
+* **P4 — Small positions: protect the whole position.** If the split is infeasible, the
+  whole position gets the protective stop and then trails like a runner after a target
+  is reached (no partial). Optionally, size entries so a split is feasible.
+* **P5 — Partial entry fills need explicit protection.** Recommended: when an entry
+  partially fills, cancel the remainder of the entry (confirmed terminal), then protect
+  the filled shares; or, if the entry must keep working, protect filled shares with a
+  stop sized to booked fills and resize through the replace protocol. Never leave booked
+  shares unprotected longer than a stated maximum.
+* **P6 — Breakeven only after the complete partial bucket is sold** (current behavior);
+  breakeven = average entry fill rounded up to a cent, fees excluded (document the fee
+  gap in R-multiple reports).
+* **P7 — Cancel/replace gaps are unprotected time.** Every replace of a protective stop
+  is recorded as an unprotected interval (start = cancel request, end = new stop
+  accepted), with a maximum, an alert and a halt if exceeded; replacements are refused
+  during the final minutes of a session and while the gate is not clear. Prefer a broker
+  replace endpoint only after its semantics are verified.
+* **P8 — Trailing state survives restart with its evidence.** The high-water mark, the
+  stop it implies, and the market-data evidence behind it (source, feed, session, bar
+  timestamp) are persisted (migration 0009) and only ratchet; on restart the stored
+  value is used and may only be raised by new verified evidence. Daily-bar highs (M2-2a)
+  are the recommended source; intraday marks are not.
+
+#### Existing OMS limitations for linked exits
+
+* **One working order per symbol** (OMS exit path, pre-trade `DUPLICATE_WORKING_ORDER`,
+  reconciler `MULTIPLE_WORKING_ORDERS`). It cannot express stop + target, runner stop +
+  OCO, or entry + protective stop. Minimal future change, without weakening M1:
+  * allow several working orders for a symbol **only** when all belong to one active
+    plan, with at most one live order per single role and Σ sell holds ≤ position
+    (already enforced by `SellSideBook` and `sell_share_holds`);
+  * the reconciler replaces the per-symbol count with a per-plan check: every open broker
+    order for the symbol maps to a local working order of the same plan (by client id,
+    or verified leg linkage), the count equals the local count, and any unmatched or
+    extra order stays a `MISMATCH`; non-plan symbols keep the M1 rule unchanged;
+  * the pre-trade engine keeps refusing a new *entry* while any order for the symbol is
+    working.
+* **No order type beyond LIMIT** in the OMS, mapping or SimBroker; no `stop_price`.
+* **Identity check on adoption** compares symbol/side/qty/type/limit only; stop price and
+  leg linkage must join it.
+* **Exit orchestration does not exist** (when to place, cancel or replace); only
+  primitives and readiness checks do.
+
+**Must be validated against Alpaca paper (read-write contract tests, separately
+authorized) before any paper execution:** stop and stop-limit field rules and price
+increments; trigger behavior including gaps through the stop at the open and halts;
+`qty_available`/`held_for_orders` accounting for open sells; OCO and bracket semantics
+(leg ids and client ids, `legs` in order payloads, status of each leg, partial fills,
+sibling cancellation, replace, behavior when one leg is rejected); `PATCH` replace
+semantics and whether it preserves or reissues ids; cancel races and the
+`pending_cancel` → `filled` path; FILL activity fields for leg orders; the 403/422
+bodies for insufficient shares; DAY vs GTC expiry of stops overnight. Plus every existing
+M2 blocker (M1_PLAN §7, §9.1).
+
+#### Proposed migration 0009 (design only; not created)
+
+Applied only through the explicit, backed-up `migrate` workflow (§12.20); simulation
+ledgers auto-migrate. Additive and compatible with every existing row.
+
+1. **`orders.stop_price`** `TEXT NULL`, same Decimal-text CHECK as `limit_price`, plus a
+   table CHECK: `order_type IN ('STOP','STOP_LIMIT') ⇔ stop_price IS NOT NULL` and
+   `order_type IN ('LIMIT','STOP_LIMIT') ⇔ limit_price IS NOT NULL`. Existing rows are all
+   LIMIT with a limit price and NULL stop price, so the CHECK holds for history.
+   SQLite needs a table rebuild for new CHECKs (as in 0003/0004/0008): copy rows,
+   recreate indexes and triggers, verify row counts and `foreign_key_check` in the same
+   transaction.
+2. **Immutability:** add `stop_price`, `trade_plan_id`, `order_role` to
+   `orders_immutable`; add a CHECK `(trade_plan_id IS NULL) = (order_role IS NULL)` and
+   `order_role = 'ENTRY' ⇔ side = 'BUY'` when set. Existing rows (all NULL) satisfy them.
+3. **Broker snapshot equivalence:** `SubmitOrderRequest`, `BrokerOrderSnapshot` and
+   `broker/mapping.py` gain `stop_price` (exact Decimal string, NULL ⇔ JSON `null`);
+   `_identity_mismatch` compares it; SimBroker implements stop triggers (including gap
+   fills at the open). Adoption with a differing stop price halts `RECON_ORDER`.
+4. **`trade_plans` table** (optional in 0009, recommended): `plan_id` PK, `fingerprint`,
+   `intent_json` (canonical), `created_at`, `status`; append-only except status;
+   referenced by `orders.trade_plan_id` (FK added in the rebuild; existing NULLs pass).
+   Records the plan *before* the entry intent, closing the window noted above.
+5. **`plan_exit_state` / trailing evidence** (append-only): `plan_id`, `seq`,
+   `high_water`, `stop_price`, `evidence_source`, `evidence_ref` (bar session, feed,
+   timestamp), `recorded_at`; a trigger rejects a lower stop than the previous row.
+6. **Replay/restart:** exit state = replay of booked fills (as now) + the latest
+   persisted trailing row; persisted values are never lowered; a fingerprint mismatch
+   between `trade_plans` and `PLAN_RECORDED` halts.
+7. **Fingerprint table coverage:** new tables are added to `ledger_fingerprint`; the
+   existing test that every table is hashed or excluded enforces it.
+8. **Tests:** migration from v8 with representative rows, CHECK violations, trigger
+   refusals, round trips, the real-ledger refusal-until-migrate path, and
+   backup/restore.
+
+#### Tests added in 16.11A
+
+* `tests/unit/test_trade_plan.py`: fingerprint determinism; distinct ids for identical
+  intents; retry reuses identity; UUIDv7 id validation; canonical round trip and
+  tampering.
+* `tests/integration/test_plan_exits.py`: entry retry reports the existing order (also
+  after a crash before send); an independent trade with an identical intent is accepted
+  while the first trade's retry still reports its own order; an exit under a different
+  intent or fingerprint is refused; a duplicated plan record is refused; plan reloaded
+  after restart; holds identical after restart; late fill on a terminal sell halts.
+* `tests/unit/test_share_reservations.py`: terminal sells with unbooked fills keep them
+  held; terminal buys are not working entries; confirmed-absent reappearance holds.
+* `tests/integration/test_repositories.py`: `sell_share_holds` invariant.
+
+### 12.40 Step 16.11B: M2-3 foundation finalization (offline)
+
+Approved for commit: UUIDv7 trade-instance identity separate from the intent
+fingerprint; durable `PLAN_RECORDED` events; idempotent OMS entry and exit retries;
+entry-proposal validation; conservative sell-share reservations; the `sell_share_holds`
+invariant (§12.38-§12.39).
+
+* **P1–P8 remain proposed policies** (§12.39). None is approved execution behavior, and
+  the stop/target, linked-order, exit-under-blocker, small-position, partial-entry,
+  replace-gap and trailing-persistence rules are not implemented beyond the fail-closed
+  defaults listed in §12.38.
+* **No unprotected TARGET in the integrated workflow.** `OmsConfig.allow_unprotected_targets`
+  defaults to `False`; `place_plan_exit` refuses a `TARGET` with `UNPROTECTED_TARGET`
+  before any ledger write or broker call. Only isolated offline OMS tests opt in
+  (`tests/integration/test_plan_exits.py`); `app/config.py` never sets it (tested).
+  `EXIT` (risk-reducing) sells remain available in simulation; stop orders remain
+  refused (`STOP_ORDERS_UNSUPPORTED`).
+* **`sell_share_holds` and unbooked fills.** A working sell holds `qty − booked fills`;
+  broker-reported but unbooked fills stay held because the ledger position still
+  contains them, so they neither violate the invariant nor release shares early. A
+  terminal sell holds only `broker_filled_qty − booked fills`, and any difference between
+  booked and broker-reported fills on a terminal order is a violation (tested).
+* **OBSERVE and M1 behavior.** Unchanged: observe never constructs an `OrderManager`;
+  non-plan orders use the unchanged `insert` (still refusing plan columns); entries
+  without a plan behave exactly as before; no migration (schema version 8). The only
+  change visible to an observe ledger is the additional read-only `sell_share_holds`
+  check in the default invariant set, which has nothing to report on a ledger without
+  sell orders.
+
+**Prerequisites for Step 16.12 (protective exits):** approval of P1–P8 (at least P1, P2,
+P3, P5, P7); migration 0009 (stop price, immutability, optionally `trade_plans` and
+trailing evidence) through the backed-up migrate workflow; stop-order support in the
+request/snapshot/mapping/SimBroker with identity checks; the per-plan multi-order rule in
+OMS, pre-trade and reconciler; exit orchestration; and the Alpaca paper validations in
+§12.39 under separate operator authorization (plus every existing M2 blocker).
 
 ---
 

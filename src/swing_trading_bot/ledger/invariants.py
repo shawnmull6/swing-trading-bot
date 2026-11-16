@@ -172,6 +172,53 @@ class NonNegativePositions:
         return out
 
 
+class SellShareHolds:
+    """Sell-side share holds never exceed the position (M2-3, ARCHITECTURE §12.39), and a
+    terminal order's booked fills equal the broker's last reported ``filled_qty``.
+
+    A working SELL holds ``qty - filled_qty``; a terminal one holds only broker-reported
+    fills not yet booked. Σ holds per (portfolio, symbol) above the position means shares
+    are committed twice (oversell). Booked fills differing from the broker's figure on a
+    terminal order means a fill arrived after the order was closed (late fill) or a
+    terminal status was applied early; both need an operator. Orders the broker never
+    reported a filled quantity for (``broker_filled_qty`` NULL) are not compared.
+    """
+
+    name = "sell_share_holds"
+
+    def check(self, s: Session) -> list[Violation]:
+        held: dict[tuple[int, str], Decimal] = defaultdict(lambda: ZERO)
+        out: list[Violation] = []
+        for coid, pid, symbol, side, status, qty, filled, broker in s.fetch_all(
+            "SELECT client_order_id, portfolio_id, symbol, side, status, qty, filled_qty, "
+            "broker_filled_qty FROM orders"
+        ):
+            terminal = OrderStatus(str_from_db(status)) in TERMINAL_STATUSES
+            booked = dec_from_db(filled)
+            reported = None if broker is None else dec_from_db(broker)
+            if terminal and reported is not None and reported != booked:
+                out.append(Violation(self.name, str_from_db(coid),
+                                     f"terminal ({str_from_db(status)}) with booked fills {booked}"
+                                     f" != broker filled_qty {reported}"))  # fmt: skip
+            if Side(str_from_db(side)) is not Side.SELL:
+                continue
+            key = (int_from_db(pid), str_from_db(symbol))
+            if terminal:
+                held[key] += max(ZERO, (reported or ZERO) - booked)
+            else:
+                held[key] += max(ZERO, dec_from_db(qty) - booked)
+        positions = {
+            (int_from_db(pid), str_from_db(sym)): dec_from_db(qty)
+            for pid, sym, qty in s.fetch_all("SELECT portfolio_id, symbol, qty FROM positions")
+        }
+        for key in sorted(held):
+            pos = positions.get(key, ZERO)
+            if held[key] > pos:
+                out.append(Violation(self.name, f"{key[0]}:{key[1]}",
+                                     f"sell holds {held[key]} exceed position {pos}"))  # fmt: skip
+        return out
+
+
 class SingletonRows:
     name = "singleton_rows"
 
@@ -190,6 +237,7 @@ DATA_INVARIANTS: Sequence[Invariant] = (
     ReservationConsistency(),
     PositionReplay(),
     NonNegativePositions(),
+    SellShareHolds(),
 )
 
 

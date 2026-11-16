@@ -258,6 +258,7 @@ class SimBroker:
         self._bars: dict[tuple[str, str, str], list[Raw]] = {}
         self.event_log: list[str] = []
         self._event_time: datetime | None = None
+        self._refuse_cancel: set[str] = set()
 
     # ============================================================ scripting
     def script_submit(
@@ -325,6 +326,12 @@ class SimBroker:
     def schedule_broker_cancel(self, client_order_id: str, *, after: timedelta) -> None:
         order = self._order_for_script(client_order_id)
         self._schedule(after, lambda: self._finish(order.broker_id, "canceled"))
+
+    def refuse_next_cancel(self, client_order_id: str) -> None:
+        """The next cancel request for this order is accepted as ``pending_cancel`` but
+        then declined by the broker after ``cancel_delay``: the order returns to working
+        (``new`` or ``partially_filled``). Models cancel/replace uncertainty (M2-3)."""
+        self._refuse_cancel.add(self._order_for_script(client_order_id).broker_id)
 
     def schedule_reject(self, client_order_id: str, *, after: timedelta) -> None:
         order = self._order_for_script(client_order_id)
@@ -610,7 +617,20 @@ class SimBroker:
         order.status = "pending_cancel"
         order.updated_at = self.clock.now()
         self._log(f"CANCEL {order.client_order_id} requested")
+        if broker_order_id in self._refuse_cancel:
+            self._refuse_cancel.discard(broker_order_id)
+            self._schedule(self.config.cancel_delay, lambda: self._decline_cancel(broker_order_id))
+            return
         self._schedule(self.config.cancel_delay, lambda: self._finish(broker_order_id, "canceled"))
+
+    def _decline_cancel(self, broker_id: str) -> None:
+        order = self._orders[broker_id]
+        if order.status != "pending_cancel":
+            self._log(f"CANCEL-DECLINED {order.client_order_id} ignored ({order.status})")
+            return
+        order.status = "partially_filled" if order.filled_qty > ZERO else "new"
+        order.updated_at = self._at()
+        self._log(f"CANCEL-DECLINED {order.client_order_id} -> {order.status}")
 
     # ========================================================== internals
     def _check_business_rules(self, request: SubmitOrderRequest) -> None:

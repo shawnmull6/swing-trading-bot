@@ -33,7 +33,12 @@ adjustments are not implemented (operational limitation). No Alpaca order submis
 Step 16.2 (M2-1): account restriction and protection enforcement implemented offline
 (A§12.34); not live-verified. Step 16.4 (M2-2a): historical daily-bar infrastructure
 implemented offline (A§12.35); official-close policy unchanged; M2 execution still not
-authorized.**
+authorized. Step 16.11 (M2-3): TradePlan contract and sell-side OMS foundation
+implemented offline (A§12.38); Step 16.11A hardening (trade-instance identity, durable
+plan record, `sell_share_holds` invariant) and recommended P1–P8 policy and migration
+0009 design (A§12.39); Step 16.11B finalization (A§12.40): unprotected TARGET sells
+refused outside isolated offline tests; no migration, stop orders not implemented, P1–P8
+proposed only.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

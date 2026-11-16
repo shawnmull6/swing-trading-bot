@@ -195,7 +195,40 @@ class OrdersRepository:
 
     def insert(self, tx: Tx, rec: OrderRecord) -> None:
         if rec.trade_plan_id is not None or rec.order_role is not None:
-            raise PersistenceError("trade_plan_id/order_role are reserved for RTH-01 (NULL in M1)")
+            raise PersistenceError(
+                "trade_plan_id/order_role are reserved for RTH-01 plan orders: use "
+                "insert_plan_order"
+            )
+        self._insert(tx, rec)
+
+    def insert_plan_order(self, tx: Tx, rec: OrderRecord) -> None:
+        """Insert an order that belongs to a TradePlan (M2-3, simulation only). Both
+        ``trade_plan_id`` and ``order_role`` are required, and the role must match the
+        side: ENTRY buys, every other role sells."""
+        if rec.trade_plan_id is None or rec.order_role is None:
+            raise PersistenceError("plan orders need both trade_plan_id and order_role")
+        if not rec.trade_plan_id.startswith("tp-") or len(rec.trade_plan_id) != 35:
+            raise PersistenceError(f"invalid trade_plan_id {rec.trade_plan_id!r}")
+        if (rec.order_role is OrderRole.ENTRY) != (rec.side is Side.BUY):
+            raise PersistenceError(f"order role {rec.order_role.value} does not match {rec.side}")
+        self._insert(tx, rec)
+
+    def list_for_plan(self, s: Session, trade_plan_id: str) -> list[OrderRecord]:
+        rows = s.fetch_all(
+            f"SELECT {self._COLS} FROM orders WHERE trade_plan_id = ? "
+            "ORDER BY created_at, client_order_id",
+            (trade_plan_id,),
+        )
+        return [self._from_row(r) for r in rows]
+
+    def get_by_intent_key(self, s: Session, intent_key: str) -> OrderRecord | None:
+        row = s.fetch_one(f"SELECT {self._COLS} FROM orders WHERE intent_key = ?", (intent_key,))
+        return None if row is None else self._from_row(row)
+
+    def intent_key_exists(self, s: Session, intent_key: str) -> bool:
+        return self.get_by_intent_key(s, intent_key) is not None
+
+    def _insert(self, tx: Tx, rec: OrderRecord) -> None:
         tx.execute(
             f"INSERT INTO orders ({self._COLS}) VALUES ({', '.join('?' * 24)})",
             (
@@ -216,8 +249,8 @@ class OrdersRepository:
                 opt_dec_to_db(rec.avg_fill_price),
                 rec.last_broker_status,
                 rec.reject_reason,
-                None,
-                None,
+                rec.trade_plan_id,
+                None if rec.order_role is None else rec.order_role.value,
                 ts_to_db(rec.created_at),
                 opt_ts_to_db(rec.send_attempted_at),
                 ts_to_db(rec.updated_at),

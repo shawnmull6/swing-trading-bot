@@ -59,6 +59,7 @@ class OmsEnv:
     crash: CrashHook | None = None
     read: BrokerReadPort | None = None
     execution: BrokerExecutionPort | None = None
+    config: OmsConfig = OMS_CONFIG
     om: OrderManager = field(init=False)
     sync: OrderSync = field(init=False)
     recovery: AmbiguousOrderRecovery = field(init=False)
@@ -71,10 +72,10 @@ class OmsEnv:
         e = self.r.env
         read = self.read or e.sim
         execution = SimulationExecution(self.execution or e.sim)
-        self.om = OrderManager(e.db, e.pf, self.r.engine, e.gates, read, execution, OMS_CONFIG,
+        self.om = OrderManager(e.db, e.pf, self.r.engine, e.gates, read, execution, self.config,
                                crash=crash)  # fmt: skip
-        self.sync = OrderSync(e.db, e.pf, read, OMS_CONFIG, crash=crash)
-        self.recovery = AmbiguousOrderRecovery(e.db, e.pf, read, OMS_CONFIG)
+        self.sync = OrderSync(e.db, e.pf, read, self.config, crash=crash)
+        self.recovery = AmbiguousOrderRecovery(e.db, e.pf, read, self.config)
 
     # ------------------------------------------------------------ shortcuts
     @property
@@ -152,8 +153,9 @@ def oms_env(
     *,
     sim_config: SimConfig | None = None,
     crash: CrashHook | None = None,
+    config: OmsConfig = OMS_CONFIG,
 ) -> OmsEnv:
-    return OmsEnv(risk_env(tmp_path, sim_config=sim_config), crash=crash)
+    return OmsEnv(risk_env(tmp_path, sim_config=sim_config), crash=crash, config=config)
 
 
 WORKING = (OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.PENDING_CANCEL)
