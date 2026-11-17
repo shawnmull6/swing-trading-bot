@@ -35,6 +35,36 @@ through a batch for budget reasons; it ends ``INCOMPLETE`` and a later, separate
 authorized session resumes. Retries: 429, 503 or a timeout only, at most
 ``READ_ATTEMPTS`` per page. 401/403 or an entitlement refusal stop at once.
 
+**Retry waits** (Step 16.17A.1). Before a retry the wait is the fallback backoff
+(0.5 s, 1 s, ... capped at 4 s) or, when the error carries a valid ``retry_after``
+(parsed by the transport from a ``Retry-After`` header), the longer of the two. The
+retry is abandoned *before* sleeping when the page's retries, the batch's attempts or
+the session's attempts are used up, or when the wait plus :data:`MIN_ATTEMPT_TIME`
+does not fit in the session time left. Nothing is ever waited for beyond the deadline.
+
+**Stop reasons.** :class:`SessionReport` keeps the original ``stop_code`` and adds a
+machine-readable ``stop_reason`` (:class:`StopReason`) plus a fixed-text
+``stop_detail``. A fetch may stop the session for a stated reason by raising
+:class:`FetchRefusedError`; such a refusal is never reported as malformed provider data
+unless its reason says so.
+
+**Deadline after a response** (Step 16.17A.3). Connect/read timeouts bound each socket
+wait, not a whole request, so a response can complete after the deadline. The deadline
+(monotonic, never extended or reset; reaching it exactly counts as expired) is
+therefore checked again after every fetch returns or fails — a page, a later page, a
+429/503/timeout about to be retried, or a response whose validation or
+canonicalization ran past it — and once more immediately before a batch is committed.
+An expired response is never accepted, retried or staged (``SESSION_DEADLINE_EXHAUSTED``
+with ``RESPONSE_AFTER_DEADLINE`` or ``BATCH_COMMIT_AFTER_DEADLINE``); its attempt was
+already counted when it was sent.
+
+**Provenance.** A fetch may return a :class:`FetchedPage` instead of bare bytes: the
+stored (e.g. canonicalized) body plus the SHA-256 and length of the response body as
+the HTTP client received it. Each page entry then records both digests separately
+(``sha256``/``bytes`` for the stored blob, ``received_sha256``/``received_bytes`` for
+the received body); the record's ``provenance`` names what each digest covers. The
+received body itself is never stored.
+
 **Publication.** :func:`publish_dataset` assembles the dataset only when every batch the
 gates make eligible is staged and verified (and no ineligible one is), then calls
 ``write_dataset`` (stage, fsync, one rename, never overwrite) and re-loads it. It never
@@ -48,9 +78,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
 
@@ -112,6 +144,15 @@ LOCK_FILE: Final = "session.lock"
 BACKOFF_BASE: Final = timedelta(milliseconds=500)
 BACKOFF_MAX: Final = timedelta(seconds=4)
 ATTEMPTS_PER_PAGE: Final = READ_ATTEMPTS
+MIN_ATTEMPT_TIME: Final = timedelta(seconds=1)
+"""An attempt (first or retry) starts only with at least this much session time left."""
+RESPONSE_AFTER_DEADLINE: Final = "RESPONSE_AFTER_DEADLINE"
+"""``stop_detail`` when a fetch returned or failed at or after the deadline."""
+BATCH_COMMIT_AFTER_DEADLINE: Final = "BATCH_COMMIT_AFTER_DEADLINE"
+"""``stop_detail`` when a fetched batch reached its commit at or after the deadline."""
+STORED_DIGEST_SCOPE: Final = "stored-body"
+RECEIVED_DIGEST_SCOPE: Final = "http-response-body-as-received-by-client"
+_SHA256_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
 _TICKER_CHANGES: Final = {"META": ("FB", date(2022, 6, 9))}
 
 
@@ -261,14 +302,17 @@ class StagingStore:
         finally:
             tmp.unlink(missing_ok=True)
 
-    def _commit(self, batch: AcquisitionBatch, pages: Sequence[bytes], attempts: int,
+    def _commit(self, batch: AcquisitionBatch, pages: Sequence[FetchedPage], attempts: int,
                 requested_at: datetime, received_at: datetime) -> None:  # fmt: skip
         req = _request(self.plan, batch)
         entries = []
-        for body in pages:
+        for page in pages:
+            body = page.body
             digest = sha256(body)
             self._write_new(self.root / "blobs" / f"{digest}.json", body)
-            entries.append({"sha256": digest, "bytes": len(body)})
+            entries.append({"sha256": digest, "bytes": len(body),
+                            "received_sha256": page.received_sha256,
+                            "received_bytes": page.received_bytes})  # fmt: skip
         record: dict[str, object] = {
             "batch_id": batch.batch_id, "request_id": batch.request_id,
             "kind": batch.kind.value, "plan_fingerprint": self.plan.fingerprint,
@@ -277,6 +321,8 @@ class StagingStore:
             "request_end": str(batch.request_end), "coverage_start": str(batch.coverage_start),
             "coverage_end": str(batch.coverage_end), "pages": entries, "attempts": attempts,
             "requested_at": requested_at.isoformat(), "received_at": received_at.isoformat(),
+            "provenance": {"sha256": STORED_DIGEST_SCOPE,
+                           "received_sha256": RECEIVED_DIGEST_SCOPE},
         }  # fmt: skip
         record["record_sha256"] = sha256(canonical(record).encode())
         self._write_new(self.root / "batches" / f"{batch.batch_id}.json", encode_json(record))
@@ -323,6 +369,7 @@ class StagingStore:
             blob = blob_path.read_bytes()
             if sha256(blob) != digest or len(blob) != entry.get("bytes"):
                 raise self._tampered(batch.batch_id, f"page {digest[:12]} changed")
+            self._check_received(batch, entry)
             try:
                 tokens.append(_page_token(batch.kind, blob))
             except InvalidBrokerDataError:
@@ -338,6 +385,18 @@ class StagingStore:
             raise self._tampered(batch.batch_id, "timestamps invalid") from None
         return BatchRecord(batch.batch_id, tuple(digests), attempts, requested, received, doc)
 
+    def _check_received(self, batch: AcquisitionBatch, entry: Mapping[str, object]) -> None:
+        if not _valid_received(entry):
+            raise self._tampered(batch.batch_id, "received-body digest invalid")
+
+    @staticmethod
+    def received(record: BatchRecord) -> list[tuple[str | None, int | None]]:
+        """(received SHA-256, received length) of each page; (None, None) where the
+        fetch did not expose the received bytes. Never the canonical digest."""
+        pages = record.raw.get("pages")
+        entries = pages if isinstance(pages, list) else []
+        return [(e.get("received_sha256"), e.get("received_bytes")) for e in entries]
+
     def committed(self) -> dict[str, BatchRecord]:
         """Every committed batch, verified. An unknown record fails closed."""
         out: dict[str, BatchRecord] = {}
@@ -352,17 +411,104 @@ class StagingStore:
         return [(self.root / "blobs" / f"{d}.json").read_bytes() for d in record.pages]
 
 
+def _valid_received(entry: Mapping[str, object]) -> bool:
+    """Received-body evidence is absent (older record, or not exposed) or a well-formed
+    digest and length; never half of one."""
+    digest, size = entry.get("received_sha256"), entry.get("received_bytes")
+    if digest is None and size is None:
+        return True
+    return (isinstance(digest, str) and bool(_SHA256_HEX.match(digest))
+            and isinstance(size, int) and not isinstance(size, bool) and size >= 0)  # fmt: skip
+
+
 # ===================================================================== sessions
 
-#: ``fetch(batch, request, page_token)`` -> the raw response body. Raises the broker
-#: read errors (``RateLimitedError``, ``ServiceUnavailableError``, ...).
-Fetch = Callable[[AcquisitionBatch, LogicalRequest, "str | None"], bytes]
+
+@dataclass(frozen=True, slots=True)
+class FetchedPage:
+    """One page as a fetch returns it: the ``body`` to stage, and — when the transport
+    exposes them — the SHA-256 and length of the response body exactly as the HTTP
+    client received it (before any canonicalization). ``received_sha256`` is never a
+    digest of ``body`` unless the two are byte-identical; it is ``None`` when unknown."""
+
+    body: bytes
+    received_sha256: str | None = None
+    received_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if not _valid_received({"received_sha256": self.received_sha256,
+                                "received_bytes": self.received_bytes}):  # fmt: skip
+            raise InvalidBrokerDataError("received-body digest is malformed")
+
+
+#: ``fetch(batch, request, page_token)`` -> the response body to stage, either as bare
+#: bytes (no received-body evidence) or a :class:`FetchedPage`. Raises the broker read
+#: errors (``RateLimitedError``, ``ServiceUnavailableError``, ...) or
+#: :class:`FetchRefusedError`. A retryable error may carry ``retry_after``
+#: (a non-negative ``timedelta``) parsed from the provider's ``Retry-After``.
+Fetch = Callable[[AcquisitionBatch, LogicalRequest, "str | None"], "bytes | FetchedPage"]
+
+
+class StopReason(StrEnum):
+    """Why a session stopped early (machine-readable; ``SessionReport.stop_reason``)."""
+
+    SESSION_DEADLINE_EXHAUSTED = "SESSION_DEADLINE_EXHAUSTED"
+    SESSION_ATTEMPT_BUDGET_EXHAUSTED = "SESSION_ATTEMPT_BUDGET_EXHAUSTED"
+    BATCH_ATTEMPT_BUDGET_EXHAUSTED = "BATCH_ATTEMPT_BUDGET_EXHAUSTED"
+    SESSION_TIME_RESERVE_INSUFFICIENT = "SESSION_TIME_RESERVE_INSUFFICIENT"
+    SESSION_ATTEMPT_RESERVE_INSUFFICIENT = "SESSION_ATTEMPT_RESERVE_INSUFFICIENT"
+    RATE_LIMIT_WAIT_EXCEEDS_DEADLINE = "RATE_LIMIT_WAIT_EXCEEDS_DEADLINE"
+    PAGE_RETRIES_EXHAUSTED = "PAGE_RETRIES_EXHAUSTED"
+    INVALID_PROVIDER_RESPONSE = "INVALID_PROVIDER_RESPONSE"
+    PAGINATION_INVALID = "PAGINATION_INVALID"
+    UNAUTHORIZED_ENDPOINT = "UNAUTHORIZED_ENDPOINT"
+    REDIRECT_REFUSED = "REDIRECT_REFUSED"
+    CREDENTIALS_REJECTED = "CREDENTIALS_REJECTED"
+    ENTITLEMENT_REFUSED = "ENTITLEMENT_REFUSED"
+    HTTP_ERROR = "HTTP_ERROR"
+    TRANSPORT_ERROR = "TRANSPORT_ERROR"
+    PROVENANCE_UNAVAILABLE = "PROVENANCE_UNAVAILABLE"
+
+
+#: The original ``stop_code`` each reason reports (kept for compatibility). Deadline,
+#: budget and authorization refusals never report ``INVALID_RESPONSE``.
+COMPAT_STOP_CODES: Final[Mapping[StopReason, str]] = {
+    StopReason.SESSION_DEADLINE_EXHAUSTED: "SESSION_DEADLINE_EXHAUSTED",
+    StopReason.SESSION_ATTEMPT_BUDGET_EXHAUSTED: "SESSION_BUDGET_EXHAUSTED",
+    StopReason.BATCH_ATTEMPT_BUDGET_EXHAUSTED: "BATCH_BUDGET_EXHAUSTED",
+    StopReason.SESSION_TIME_RESERVE_INSUFFICIENT: "SESSION_BUDGET_RESERVED",
+    StopReason.SESSION_ATTEMPT_RESERVE_INSUFFICIENT: "SESSION_BUDGET_RESERVED",
+    StopReason.RATE_LIMIT_WAIT_EXCEEDS_DEADLINE: "SESSION_DEADLINE_EXHAUSTED",
+    StopReason.PAGE_RETRIES_EXHAUSTED: "RETRIES_EXHAUSTED",
+    StopReason.INVALID_PROVIDER_RESPONSE: "INVALID_RESPONSE",
+    StopReason.PAGINATION_INVALID: "INVALID_RESPONSE",
+    StopReason.UNAUTHORIZED_ENDPOINT: "REQUEST_REFUSED",
+    StopReason.REDIRECT_REFUSED: "REQUEST_REFUSED",
+    StopReason.CREDENTIALS_REJECTED: "AUTH_OR_ENTITLEMENT_REFUSED",
+    StopReason.ENTITLEMENT_REFUSED: "AUTH_OR_ENTITLEMENT_REFUSED",
+    StopReason.HTTP_ERROR: "BROKER_ERROR",
+    StopReason.TRANSPORT_ERROR: "BROKER_ERROR",
+    StopReason.PROVENANCE_UNAVAILABLE: "REQUEST_REFUSED",
+}
+
+
+class FetchRefusedError(InvalidBrokerDataError):
+    """Raised by a fetch to stop the session for a stated ``reason``; ``code`` is fixed
+    text (no URL, body, token or credential) reported as ``stop_detail``."""
+
+    def __init__(self, code: str, reason: StopReason) -> None:
+        super().__init__(code)
+        self.code = code
+        self.reason = reason
 
 
 class _BatchStop(Exception):  # noqa: N818 - control flow
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
+    def __init__(self, reason: StopReason, detail: str | None = None,
+                 code: str | None = None) -> None:  # fmt: skip
+        self.reason = reason
+        self.code = code if code is not None else COMPAT_STOP_CODES[reason]
+        self.detail = detail
+        super().__init__(self.code)
 
 
 class _Budget:
@@ -375,12 +521,16 @@ class _Budget:
     def remaining(self) -> timedelta:
         return self.deadline - (self.monotonic() - self.started)
 
+    def expired(self) -> bool:
+        """The deadline has been reached (exactly at it counts as reached)."""
+        return self.remaining() <= timedelta(0)
+
     def take(self) -> None:
         """Count one attempt BEFORE it is sent; refuse it when nothing is left."""
-        if self.remaining() <= timedelta(0):
-            raise _BatchStop("SESSION_DEADLINE_EXHAUSTED")
+        if self.remaining() < MIN_ATTEMPT_TIME:
+            raise _BatchStop(StopReason.SESSION_DEADLINE_EXHAUSTED, "SESSION_TIME_LEFT")
         if self.used >= self.max_attempts:
-            raise _BatchStop("SESSION_BUDGET_EXHAUSTED")
+            raise _BatchStop(StopReason.SESSION_ATTEMPT_BUDGET_EXHAUSTED, "SESSION_ATTEMPTS")
         self.used += 1
 
 
@@ -396,6 +546,10 @@ class SessionReport:
     skipped: tuple[tuple[str, str], ...]
     pending: tuple[str, ...]
     failed_batch: str | None = None
+    stop_reason: StopReason | None = None
+    """The specific, machine-readable reason (``stop_code`` is kept for compatibility)."""
+    stop_detail: str | None = None
+    """Fixed-text detail (a refusal code, ``HTTP_404``, ...); never a body or token."""
 
 
 def _retryable(exc: BrokerError) -> bool:
@@ -405,61 +559,144 @@ def _retryable(exc: BrokerError) -> bool:
                                                          or exc.status_code == 503)  # fmt: skip
 
 
+def retry_after_of(exc: BaseException) -> timedelta | None:
+    """The provider's requested wait carried by a retryable error, if it is a
+    non-negative ``timedelta``; anything else counts as absent."""
+    value = getattr(exc, "retry_after", None)
+    return value if isinstance(value, timedelta) and value >= timedelta(0) else None
+
+
+def retry_wait(page_attempt: int, exc: BaseException) -> tuple[timedelta, bool]:
+    """(wait before the next attempt, whether ``Retry-After`` set it). The fallback
+    backoff is a floor: a valid ``Retry-After`` can lengthen the wait, never shorten it."""
+    fallback = min(BACKOFF_BASE * 2 ** (page_attempt - 1), BACKOFF_MAX)
+    asked = retry_after_of(exc)
+    if asked is not None and asked > fallback:
+        return asked, True
+    return fallback, False
+
+
+def _late_failure(exc: BrokerError) -> bool:
+    """Whether a failed fetch that ended after the deadline is reported as the deadline:
+    a retryable error (it is never retried) or a response-content failure (validation
+    or canonicalization that ran past it). Authorization, endpoint, redirect and the
+    transport's own refusals keep their reason."""
+    if _retryable(exc):
+        return True
+    if isinstance(exc, FetchRefusedError):
+        return exc.reason is StopReason.INVALID_PROVIDER_RESPONSE
+    return isinstance(exc, InvalidBrokerDataError)
+
+
+def _refusal(exc: BrokerError) -> _BatchStop:
+    """The stop for a non-retryable error (never retried, never a fallback endpoint)."""
+    if isinstance(exc, FetchRefusedError):
+        return _BatchStop(exc.reason, exc.code)
+    if isinstance(exc, MarketDataEntitlementError):
+        return _BatchStop(StopReason.ENTITLEMENT_REFUSED, f"HTTP_{exc.status_code}")
+    if isinstance(exc, AuthenticationError):
+        return _BatchStop(StopReason.CREDENTIALS_REJECTED, f"HTTP_{exc.status_code}")
+    if isinstance(exc, InvalidBrokerDataError):
+        return _BatchStop(StopReason.INVALID_PROVIDER_RESPONSE, "UNMAPPABLE_RESPONSE")
+    if exc.status_code:
+        status = f"HTTP_{exc.status_code}"
+        return _BatchStop(StopReason.HTTP_ERROR, status, code=status)
+    return _BatchStop(StopReason.TRANSPORT_ERROR, type(exc).__name__)
+
+
 def _fetch_page(batch: AcquisitionBatch, req: LogicalRequest, token: str | None, *,
                 fetch: Fetch, budget: _Budget, sleep: Callable[[timedelta], None],
-                spent: int) -> tuple[bytes, int]:  # fmt: skip
-    """One page with bounded retries. Returns (body, attempts used by the batch so far)."""
+                spent: int) -> tuple[FetchedPage, int]:  # fmt: skip
+    """One page with bounded retries. Returns (page, attempts used by the batch so far).
+    Every limit is checked before an attempt is sent and before any wait."""
     for page_attempt in range(1, ATTEMPTS_PER_PAGE + 1):
         if spent >= batch.max_attempts:
-            raise _BatchStop("BATCH_BUDGET_EXHAUSTED")
+            raise _BatchStop(StopReason.BATCH_ATTEMPT_BUDGET_EXHAUSTED, "BATCH_ATTEMPTS")
         budget.take()
         spent += 1
         try:
-            body = fetch(batch, req, token)
-        except (AuthenticationError, MarketDataEntitlementError):
-            raise _BatchStop("AUTH_OR_ENTITLEMENT_REFUSED") from None
-        except InvalidBrokerDataError:
-            raise _BatchStop("INVALID_RESPONSE") from None
+            got = fetch(batch, req, token)
         except BrokerError as exc:
+            if budget.expired() and _late_failure(exc):
+                raise _BatchStop(StopReason.SESSION_DEADLINE_EXHAUSTED,
+                                 RESPONSE_AFTER_DEADLINE) from None  # fmt: skip
             if not _retryable(exc):
-                raise _BatchStop(f"HTTP_{exc.status_code}" if exc.status_code
-                                 else "BROKER_ERROR") from None  # fmt: skip
+                raise _refusal(exc) from None
+            label = f"HTTP_{exc.status_code}" if exc.status_code else "TIMEOUT"
             if page_attempt == ATTEMPTS_PER_PAGE:
-                raise _BatchStop("RETRIES_EXHAUSTED") from None
-            delay = min(BACKOFF_BASE * 2 ** (page_attempt - 1), BACKOFF_MAX)
-            if budget.remaining() <= delay:
-                raise _BatchStop("SESSION_DEADLINE_EXHAUSTED") from None
-            sleep(delay)
+                raise _BatchStop(StopReason.PAGE_RETRIES_EXHAUSTED, label) from None
+            if spent >= batch.max_attempts:
+                raise _BatchStop(StopReason.BATCH_ATTEMPT_BUDGET_EXHAUSTED,
+                                 "BATCH_ATTEMPTS") from None  # fmt: skip
+            if budget.used >= budget.max_attempts:
+                raise _BatchStop(StopReason.SESSION_ATTEMPT_BUDGET_EXHAUSTED,
+                                 "SESSION_ATTEMPTS") from None  # fmt: skip
+            wait, from_header = retry_wait(page_attempt, exc)
+            if budget.remaining() - wait < MIN_ATTEMPT_TIME:
+                raise _BatchStop(StopReason.RATE_LIMIT_WAIT_EXCEEDS_DEADLINE if from_header
+                                 else StopReason.SESSION_DEADLINE_EXHAUSTED,
+                                 f"{label}_WAIT_{wait // timedelta(milliseconds=1)}MS"
+                                 ) from None  # fmt: skip
+            sleep(wait)
             continue
-        if not isinstance(body, bytes):
-            raise _BatchStop("INVALID_RESPONSE")
-        return body, spent
-    raise _BatchStop("RETRIES_EXHAUSTED")  # pragma: no cover - loop always returns/raises
+        if budget.expired():
+            raise _BatchStop(StopReason.SESSION_DEADLINE_EXHAUSTED, RESPONSE_AFTER_DEADLINE)
+        if isinstance(got, bytes):
+            return FetchedPage(got), spent
+        if isinstance(got, FetchedPage):
+            return got, spent
+        raise _BatchStop(StopReason.INVALID_PROVIDER_RESPONSE, "NOT_BYTES")
+    raise _BatchStop(StopReason.PAGE_RETRIES_EXHAUSTED)  # pragma: no cover - loop returns
 
 
 def _fetch_batch(batch: AcquisitionBatch, req: LogicalRequest, fetch: Fetch, budget: _Budget,
-                 sleep: Callable[[timedelta], None]) -> tuple[list[bytes], int]:  # fmt: skip
+                 sleep: Callable[[timedelta], None]) -> tuple[list[FetchedPage], int]:  # fmt: skip
     """Every page of one batch, or ``_BatchStop`` (nothing of the batch is kept)."""
-    pages: list[bytes] = []
+    pages: list[FetchedPage] = []
     seen: set[str] = set()
     token: str | None = None
     attempts = 0
     while True:
         if len(pages) >= batch.max_pages:
-            raise _BatchStop("PAGE_CAP_EXCEEDED")
-        body, attempts = _fetch_page(batch, req, token, fetch=fetch, budget=budget,
+            raise _BatchStop(StopReason.PAGINATION_INVALID, "PAGE_CAP_EXCEEDED",
+                             code="PAGE_CAP_EXCEEDED")  # fmt: skip
+        page, attempts = _fetch_page(batch, req, token, fetch=fetch, budget=budget,
                                      sleep=sleep, spent=attempts)  # fmt: skip
         try:
-            nxt = _page_token(batch.kind, body)
+            nxt = _page_token(batch.kind, page.body)
         except InvalidBrokerDataError:
-            raise _BatchStop("INVALID_RESPONSE") from None
-        pages.append(body)
+            raise _BatchStop(StopReason.INVALID_PROVIDER_RESPONSE, "PAGE_TOKEN_INVALID") from None
+        pages.append(page)
         if nxt is None:
             return pages, attempts
         if nxt in seen:
-            raise _BatchStop("REPEATED_PAGE_TOKEN")
+            raise _BatchStop(StopReason.PAGINATION_INVALID, "REPEATED_PAGE_TOKEN",
+                             code="REPEATED_PAGE_TOKEN")  # fmt: skip
         seen.add(nxt)
         token = nxt
+
+
+def _lock(store: StagingStore) -> Path:
+    """Take ``session.lock``; refused while anything of an earlier session is left."""
+    left = store.interruption()
+    if left:
+        raise InterruptedSessionError("INTERRUPTED_SESSION", ", ".join(left))
+    lock = store.root / LOCK_FILE
+    try:
+        os.close(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except FileExistsError:  # pragma: no cover - raced another session
+        raise InterruptedSessionError("SESSION_LOCKED") from None
+    return lock
+
+
+def _reserve(batch: AcquisitionBatch, budget: _Budget) -> tuple[StopReason | None, str | None]:
+    """Why ``batch`` may not start (its whole attempt budget and the time reserve must
+    fit), or (None, None)."""
+    if budget.max_attempts - budget.used < batch.max_attempts:
+        return StopReason.SESSION_ATTEMPT_RESERVE_INSUFFICIENT, "BATCH_BUDGET"
+    if budget.remaining() < timedelta(seconds=BATCH_TIME_RESERVE_S):
+        return StopReason.SESSION_TIME_RESERVE_INSUFFICIENT, "BATCH_TIME_RESERVE"
+    return None, None
 
 
 def run_session(
@@ -480,14 +717,7 @@ def run_session(
     deadline = plan.session_deadline_s if deadline_s is None else deadline_s
     if attempts_cap > plan.session_max_attempts or deadline > plan.session_deadline_s:
         raise StagingError("BUDGET_ABOVE_PLAN", "session budgets are never raised")
-    left = store.interruption()
-    if left:
-        raise InterruptedSessionError("INTERRUPTED_SESSION", ", ".join(left))
-    lock = store.root / LOCK_FILE
-    try:
-        os.close(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-    except FileExistsError:  # pragma: no cover - raced another session
-        raise InterruptedSessionError("SESSION_LOCKED") from None
+    lock = _lock(store)
     # From here an unexpected exception leaves the lock: recovery is then explicit.
     try:
         done = store.committed()
@@ -499,6 +729,8 @@ def run_session(
     skipped: list[tuple[str, str]] = []
     pending: list[str] = []
     stop: str | None = None
+    why: StopReason | None = None
+    detail: str | None = None
     failed: str | None = None
     for batch in plan.batches:
         if batch.batch_id in done:
@@ -510,16 +742,19 @@ def run_session(
         if stop is not None:
             pending.append(batch.batch_id)
             continue
-        if (attempts_cap - budget.used < batch.max_attempts
-                or budget.remaining() < timedelta(seconds=BATCH_TIME_RESERVE_S)):  # fmt: skip
-            stop = "SESSION_BUDGET_RESERVED"
+        why, detail = _reserve(batch, budget)
+        if why is not None:
+            stop = COMPAT_STOP_CODES[why]
             pending.append(batch.batch_id)
             continue
         requested_at = now()
         try:
             pages, attempts = _fetch_batch(batch, _request(plan, batch), fetch, budget, sleep)
+            if budget.expired():  # the last page's handling may have run past the deadline
+                raise _BatchStop(StopReason.SESSION_DEADLINE_EXHAUSTED,
+                                 BATCH_COMMIT_AFTER_DEADLINE)  # fmt: skip
         except _BatchStop as exc:
-            stop, failed = exc.code, batch.batch_id
+            stop, why, detail, failed = exc.code, exc.reason, exc.detail, batch.batch_id
             pending.append(batch.batch_id)
             continue
         store._commit(batch, pages, attempts, requested_at, now())
@@ -530,7 +765,7 @@ def run_session(
     elapsed = max(timedelta(0), timedelta(seconds=deadline) - budget.remaining())
     return SessionReport(status, stop, budget.used, elapsed,
                          tuple(committed), tuple(sorted(done)), tuple(skipped),
-                         tuple(pending), failed)  # fmt: skip
+                         tuple(pending), failed, why, detail)  # fmt: skip
 
 
 # ===================================================================== assembly
@@ -785,10 +1020,18 @@ def publish_dataset(
 
 __all__ = [
     "ATTEMPTS_PER_PAGE",
+    "BATCH_COMMIT_AFTER_DEADLINE",
+    "COMPAT_STOP_CODES",
     "LOCK_FILE",
+    "MIN_ATTEMPT_TIME",
+    "RECEIVED_DIGEST_SCOPE",
+    "RESPONSE_AFTER_DEADLINE",
+    "STORED_DIGEST_SCOPE",
     "STORE_FILE",
     "BatchRecord",
     "Fetch",
+    "FetchRefusedError",
+    "FetchedPage",
     "IncompatiblePlanError",
     "IncompleteAcquisitionError",
     "InterruptedSessionError",
@@ -797,8 +1040,11 @@ __all__ = [
     "StagingError",
     "StagingIntegrityError",
     "StagingStore",
+    "StopReason",
     "assemble_dataset",
     "ineligible_reason",
     "publish_dataset",
+    "retry_after_of",
+    "retry_wait",
     "run_session",
 ]

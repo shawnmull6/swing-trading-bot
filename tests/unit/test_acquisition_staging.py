@@ -19,9 +19,13 @@ import pytest
 from swing_trading_bot.broker.errors import (
     AuthenticationError,
     BrokerError,
+    DataEntitlementKind,
+    InvalidBrokerDataError,
+    MarketDataEntitlementError,
     RateLimitedError,
     ServiceUnavailableError,
 )
+from swing_trading_bot.research import staging
 from swing_trading_bot.research.acquisition import (
     REQUEST_BUDGET,
     SESSION_DEADLINE_S,
@@ -50,6 +54,8 @@ from swing_trading_bot.research.dataset import (
 )
 from swing_trading_bot.research.staging import (
     LOCK_FILE,
+    Fetch,
+    FetchRefusedError,
     IncompatiblePlanError,
     IncompleteAcquisitionError,
     InterruptedSessionError,
@@ -58,6 +64,7 @@ from swing_trading_bot.research.staging import (
     StagingError,
     StagingIntegrityError,
     StagingStore,
+    StopReason,
     assemble_dataset,
     publish_dataset,
     run_session,
@@ -184,7 +191,7 @@ class Provider:
 
 
 def session(
-    store: StagingStore, provider: Provider, clock: Clock | None = None, **kw: Any
+    store: StagingStore, provider: Fetch, clock: Clock | None = None, **kw: Any
 ) -> SessionReport:
     c = clock or Clock()
     return run_session(store, provider, gates=kw.pop("gates", GATES), monotonic=c.monotonic,
@@ -302,6 +309,36 @@ def test_failures_stop_the_session(store: StagingStore, errors: list[BrokerError
     assert report.committed == () and len(provider.calls) == len(errors)
 
 
+@pytest.mark.parametrize(
+    ("error", "code", "reason", "detail"),
+    [
+        (ServiceUnavailableError("t", kind="timeout"), "RETRIES_EXHAUSTED",
+         StopReason.PAGE_RETRIES_EXHAUSTED, "TIMEOUT"),
+        (AuthenticationError("401", status_code=401), "AUTH_OR_ENTITLEMENT_REFUSED",
+         StopReason.CREDENTIALS_REJECTED, "HTTP_401"),
+        (MarketDataEntitlementError("403", kind=DataEntitlementKind.RECENT_DATA_WINDOW),
+         "AUTH_OR_ENTITLEMENT_REFUSED", StopReason.ENTITLEMENT_REFUSED, "HTTP_403"),
+        (InvalidBrokerDataError("bad"), "INVALID_RESPONSE",
+         StopReason.INVALID_PROVIDER_RESPONSE, "UNMAPPABLE_RESPONSE"),
+        (BrokerError("404", status_code=404), "HTTP_404", StopReason.HTTP_ERROR, "HTTP_404"),
+        (ServiceUnavailableError("n", kind="network"), "BROKER_ERROR",
+         StopReason.TRANSPORT_ERROR, "ServiceUnavailableError"),
+    ],
+)  # fmt: skip
+def test_every_stop_keeps_its_compatible_code_and_adds_a_specific_reason(
+    store: StagingStore, error: BrokerError, code: str, reason: StopReason, detail: str
+) -> None:
+    provider = Provider(script={"C-CAL-TRADING": [error] * 3})
+    report = session(store, provider)
+    assert (report.stop_code, report.stop_reason, report.stop_detail) == (code, reason, detail)
+
+
+def test_bare_byte_fetches_record_no_received_digest(store: StagingStore) -> None:
+    session(store, Provider())
+    for record in store.committed().values():
+        assert set(StagingStore.received(record)) == {(None, None)}
+
+
 def test_a_batch_never_exceeds_its_own_attempt_budget(store: StagingStore) -> None:
     """Bars: cap 2 pages, budget 4 attempts. Page 1 needs 3 attempts, page 2 fails once:
     the 5th attempt is refused before it is sent."""
@@ -347,6 +384,165 @@ def test_the_deadline_is_enforced_before_a_batch_and_before_a_retry(store: Stagi
     other = StagingStore.create(store.root.parent / "other", plan(), created_at=NOW)
     report = session(other, retry, clock)
     assert report.stop_code == "SESSION_DEADLINE_EXHAUSTED" and clock.slept == []
+
+
+# ============================================================ Step 16.17A.3: late responses
+DEADLINE = timedelta(seconds=SESSION_DEADLINE_S)
+LATE = "RESPONSE_AFTER_DEADLINE"
+
+
+def _late_on(request_id: str, at: timedelta, clock: Clock, provider: Provider) -> Provider:
+    """``provider`` whose ``request_id`` response completes at ``at`` (session time)."""
+    inner = provider.on_call
+
+    def on_call() -> None:
+        if inner is not None:
+            inner()
+        if provider.calls[-1][0] == request_id:
+            clock.t = at
+
+    provider.on_call = on_call
+    return provider
+
+
+def _check_intact(store: StagingStore, committed: tuple[str, ...]) -> None:
+    """Earlier batches still verify; nothing of the expired batch was written."""
+    assert set(store.committed()) == set(committed)
+    assert store.interruption() == [] and not (store.root / LOCK_FILE).exists()
+
+
+@pytest.mark.parametrize(
+    ("at", "accepted"),
+    [(DEADLINE - timedelta(milliseconds=1), True),  # completes before: accepted
+     (DEADLINE, False),  # exactly at the deadline: expired
+     (DEADLINE + timedelta(seconds=1), False)],  # after: expired
+)  # fmt: skip
+def test_a_response_completing_at_or_after_the_deadline_is_never_accepted(
+    store: StagingStore, at: timedelta, accepted: bool
+) -> None:
+    clock = Clock(per_call=timedelta(0))
+    provider = _late_on("C-CAL-SETTLEMENT", at, clock, Provider())
+    report = session(store, provider, clock)
+    assert len(provider.calls) == report.attempts_used == 2  # the late attempt is counted
+    assert clock.slept == []
+    if accepted:
+        assert report.status == "INCOMPLETE" and len(report.committed) == 2
+        assert report.stop_reason is StopReason.SESSION_TIME_RESERVE_INSUFFICIENT
+    else:
+        assert report.status == "STOPPED"
+        assert [b.split(".")[0] for b in report.committed] == ["C-CAL-TRADING"]
+        assert report.stop_code == "SESSION_DEADLINE_EXHAUSTED"  # the compatible code
+        assert report.stop_reason is StopReason.SESSION_DEADLINE_EXHAUSTED
+        assert report.stop_detail == LATE
+        assert str(report.failed_batch).startswith("C-CAL-SETTLEMENT")
+    _check_intact(store, report.committed)
+
+
+def test_a_later_page_after_the_deadline_stages_nothing_of_its_batch(
+    store: StagingStore,
+) -> None:
+    clock = Clock(per_call=timedelta(0))
+    provider = Provider(page_size=200)
+
+    def second_page() -> None:
+        if provider.calls[-1][1] is not None:  # a page token: page 2
+            clock.t = DEADLINE
+
+    provider.on_call = second_page
+    report = session(store, provider, clock)
+    assert (report.stop_reason, report.stop_detail) == (StopReason.SESSION_DEADLINE_EXHAUSTED, LATE)
+    assert str(report.failed_batch).startswith("C-BARS")
+    assert sum(1 for _, t in provider.calls if t is not None) == 1
+    assert not any(b.startswith("C-BARS") for b in store.committed())
+    _check_intact(store, report.committed)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RateLimitedError("429"), ServiceUnavailableError("503", status_code=503),
+     ServiceUnavailableError("t", kind="timeout")],
+)  # fmt: skip
+def test_no_retry_is_started_after_the_deadline(store: StagingStore, error: BrokerError) -> None:
+    clock = Clock(per_call=timedelta(0))
+    provider = _late_on("C-CAL-TRADING", DEADLINE, clock,
+                        Provider(script={"C-CAL-TRADING": [error]}))  # fmt: skip
+    report = session(store, provider, clock)
+    assert len(provider.calls) == report.attempts_used == 1 and clock.slept == []
+    assert (report.stop_reason, report.stop_detail) == (StopReason.SESSION_DEADLINE_EXHAUSTED, LATE)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [InvalidBrokerDataError("shape"),
+     FetchRefusedError("UNEXPECTED_SHAPE", StopReason.INVALID_PROVIDER_RESPONSE)],
+)  # fmt: skip
+def test_validation_finishing_after_the_deadline_is_the_deadline_not_invalid_data(
+    store: StagingStore, error: BrokerError
+) -> None:
+    """The response arrived in time; its validation ran past the deadline and failed."""
+    clock = Clock(per_call=timedelta(0))
+    provider = _late_on("C-CAL-SETTLEMENT", DEADLINE + timedelta(milliseconds=1), clock,
+                        Provider(script={"C-CAL-SETTLEMENT": [error]}))  # fmt: skip
+    report = session(store, provider, clock)
+    assert report.stop_reason is StopReason.SESSION_DEADLINE_EXHAUSTED
+    assert report.stop_code == "SESSION_DEADLINE_EXHAUSTED" and report.stop_detail == LATE
+    _check_intact(store, report.committed)
+
+
+def test_validation_and_canonicalization_running_past_the_deadline_are_rejected(
+    store: StagingStore,
+) -> None:
+    """A fetch that received its response in time but returned (after validating and
+    canonicalizing it) at the deadline: the page is not accepted."""
+    clock = Clock(per_call=timedelta(0))
+    provider = Provider()
+
+    def fetch(batch: AcquisitionBatch, req: LogicalRequest, token: str | None) -> bytes:
+        body = provider(batch, req, token)  # received with time to spare
+        if req.request_id == "C-CAL-SETTLEMENT":
+            clock.t = DEADLINE  # validation + canonicalization took the rest
+        return body
+
+    report = session(store, fetch, clock)
+    assert (report.stop_reason, report.stop_detail) == (StopReason.SESSION_DEADLINE_EXHAUSTED, LATE)
+    assert report.attempts_used == 2
+    _check_intact(store, report.committed)
+
+
+def test_authorization_refusals_keep_their_reason_even_when_late(store: StagingStore) -> None:
+    clock = Clock(per_call=timedelta(0))
+    provider = _late_on("C-CAL-TRADING", DEADLINE, clock, Provider(
+        script={"C-CAL-TRADING": [AuthenticationError("401", status_code=401)]}))  # fmt: skip
+    report = session(store, provider, clock)
+    assert report.stop_reason is StopReason.CREDENTIALS_REJECTED
+
+
+def test_a_batch_reaching_its_commit_after_the_deadline_is_not_staged(
+    store: StagingStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last page arrived in time; reading it (page-token parsing) ran past the
+    deadline, so the completed batch is refused at the commit boundary."""
+    clock = Clock(per_call=timedelta(0))
+    real = staging._page_token
+    seen: list[int] = []
+
+    def slow_parse(kind: Any, body: bytes) -> str | None:
+        seen.append(1)
+        if len(seen) == 2:  # the second batch's (only) page
+            clock.t = DEADLINE
+        return real(kind, body)
+
+    monkeypatch.setattr(staging, "_page_token", slow_parse)
+    provider = Provider()
+    report = session(store, provider, clock)
+    assert report.status == "STOPPED" and report.stop_code == "SESSION_DEADLINE_EXHAUSTED"
+    assert report.stop_reason is StopReason.SESSION_DEADLINE_EXHAUSTED
+    assert report.stop_detail == "BATCH_COMMIT_AFTER_DEADLINE"
+    assert len(report.committed) == 1 and str(report.failed_batch).startswith("C-CAL-SETTLEMENT")
+    assert report.attempts_used == len(provider.calls) == 2
+    _check_intact(store, report.committed)
+    resumed = session(store, Provider())  # a later session resumes from where it stopped
+    assert resumed.status == "COMPLETE" and resumed.already_committed == report.committed
 
 
 def test_budgets_are_never_raised(store: StagingStore) -> None:

@@ -467,11 +467,74 @@ RUN_ALPACA_HISTORY_PROBE=1 STB_ENV_FILE=/abs/path/paper.env uv run python -m tes
 6. A passing probe authorizes nothing further. Acquisition needs its own authorization
    after the evidence is reviewed.
 
-## 16. Historical acquisition staging (Step 16.16E; not yet runnable live)
+## 16. Historical acquisition (Steps 16.16E, 16.17A; authorized operator only)
 
-There is no live acquisition runner yet; `research/staging.py` runs only with an
-injected fetch (tests). This section fixes the operating rules for the later,
-separately authorized run.
+The runner is `swing_trading_bot.history_acquisition` (Step 16.17A). It has been
+implemented and tested offline only; **no live session has been run or authorized.**
+Every command below except `session` is offline (no credential, no request). There is
+no path argument: staging and datasets live under `data/research/` and the probe
+evidence is named, not located.
+
+```bash
+uv run python -m swing_trading_bot.history_acquisition plan
+```
+
+```bash
+RUN_ALPACA_HISTORY_ACQUISITION=1 STB_ENV_FILE=/abs/path/paper.env uv run python -m swing_trading_bot.history_acquisition session --plan-fingerprint <fingerprint> --probe-evidence history-probe-20261117T025839Z --authorization <label> --max-sessions <n> --new-store
+```
+
+```bash
+uv run python -m swing_trading_bot.history_acquisition status --plan-fingerprint <fingerprint> --probe-evidence history-probe-20261117T025839Z
+```
+
+```bash
+uv run python -m swing_trading_bot.history_acquisition recover --plan-fingerprint <fingerprint> --label <date>-<reason>
+```
+
+```bash
+uv run python -m swing_trading_bot.history_acquisition publish --plan-fingerprint <fingerprint> --probe-evidence history-probe-20261117T025839Z --dataset-id <id>
+```
+
+* `session` runs exactly one session (120 attempts / 300 s) and stops; a later session
+  is `--resume` with a new `--authorization` label, never automatic. It refuses unless
+  the core probe gates passed, the store verifies, the journal is closed, the
+  authorized session count is not used up and something is still missing; only then
+  are credentials read (file source only, trading disabled). Exit 0 complete, 1
+  incomplete/stopped (resumable), 2 refused.
+* Journal: `staging/<fp16>/sessions/NN.start.json` and `NN.report.json` (write-once,
+  status, stop code, stop reason and detail, attempts, committed and pending batches,
+  transport outcomes and refusals; no query value, header, page token or body — tokens
+  appear only as 16-hex SHA-256 prefixes, bodies only as SHA-256 and length).
+* **Stop reasons** (Step 16.17A.1). `stop_code` keeps the 16.16E values; `stop_reason`
+  says exactly why: `SESSION_DEADLINE_EXHAUSTED`, `SESSION_ATTEMPT_BUDGET_EXHAUSTED`,
+  `BATCH_ATTEMPT_BUDGET_EXHAUSTED`, `SESSION_TIME_RESERVE_INSUFFICIENT`,
+  `SESSION_ATTEMPT_RESERVE_INSUFFICIENT`, `RATE_LIMIT_WAIT_EXCEEDS_DEADLINE`,
+  `PAGE_RETRIES_EXHAUSTED`, `INVALID_PROVIDER_RESPONSE`, `PAGINATION_INVALID`,
+  `UNAUTHORIZED_ENDPOINT`, `REDIRECT_REFUSED`, `CREDENTIALS_REJECTED`,
+  `ENTITLEMENT_REFUSED`, `HTTP_ERROR`, `TRANSPORT_ERROR`, `PROVENANCE_UNAVAILABLE`.
+  Budget, deadline and rate-limit stops are resumable with a new authorized `--resume`
+  session; credential, entitlement, endpoint and provider-data stops need review first.
+* **Retry-After.** On 429/503 a valid `Retry-After` (delta-seconds or IMF-fixdate) can
+  lengthen the 0.5 s / 1 s backoff, never shorten it, and never adds attempts (3 per
+  page, the batch and session budgets). A wait that would leave less than 1 s of the
+  300 s session is not taken: the session stops (`RATE_LIMIT_WAIT_EXCEEDS_DEADLINE`).
+  401, 403 and entitlement refusals are never retried.
+* **Deadline after a response** (Step 16.17A.3). Connect/read timeouts bound each socket
+  wait, not a whole request, so the deadline is checked again on the monotonic clock
+  after every response (the guard refuses it before reading status, `Retry-After` or
+  body), after the adapter's validation and canonicalization, and immediately before a
+  batch is committed. Reaching the deadline exactly counts as expired. The late batch
+  stages nothing, nothing is retried, the attempt stays counted, earlier batches stay
+  intact, and the session stops `SESSION_DEADLINE_EXHAUSTED` with detail
+  `RESPONSE_AFTER_DEADLINE` or `BATCH_COMMIT_AFTER_DEADLINE` (resumable).
+* **Provenance.** Each staged page records `sha256`/`bytes` of the stored canonical
+  body and, separately, `received_sha256`/`received_bytes` of the response body as the
+  HTTP client delivered it (after gzip/content decoding; wire bytes are not
+  accessible). The received bytes are not stored.
+* `publish` never creates attestations, never asserts research readiness, runs no
+  backtest and opens no holdout view.
+
+The operating rules:
 
 1. **Authorization first.** It must name the acquisition-plan fingerprint
    (RESEARCH_DATA §3.0a), the number of sessions, the destination and how corporate-action
@@ -484,8 +547,9 @@ separately authorized run.
    refetched. A store made for another plan fingerprint is refused, never reused.
 4. **After a crash** (`session.lock` or files in `tmp/` present) every session and
    publication is refused. Do not delete anything. Recovery is explicit:
-   `StagingStore.open(root, plan).recover(label="<date>-<reason>")` moves the lock and
-   in-flight files to `quarantine/<label>/` and re-verifies every staged batch.
+   `recover --label <date>-<reason>` moves the lock and in-flight files to
+   `quarantine/<label>/`, re-verifies every staged batch and closes the interrupted
+   session's journal entry.
 5. **Tampering** (`TAMPERED_BATCH`, `UNKNOWN_BATCH_RECORD`): stop. Nothing is repaired
    automatically. Keep the store for review; a fresh store is a new, reviewed decision.
 6. **Publication** happens only when every eligible batch verifies. It writes

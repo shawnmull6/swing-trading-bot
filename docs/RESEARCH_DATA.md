@@ -507,8 +507,12 @@ No backtest number — synthetic or historical, either policy — changes any it
    statement naming its fingerprint, ≤ 5 attempts / 60 s, the data host and the one
    endpoint. It can verify the filter role for forward splits only.
 3. **Acquisition**, after the probe's evidence has been reviewed (done for 16.16D) and a
-   live runner around `research/staging.py` has been implemented and reviewed. A
-   separate statement naming:
+   live runner around `research/staging.py` has been implemented (Step 16.17A,
+   `swing_trading_bot.history_acquisition`, RUNBOOK §16; offline-tested only;
+   Retry-After handling, explicit stop reasons and received-body digests added in
+   16.17A.1, the deadline re-checked after every response and before every batch
+   commit in 16.17A.3, without changing the plan fingerprint) and reviewed. A separate statement
+   naming:
    1. the acquisition-plan fingerprint (§3.0a);
    2. the credential file;
    3. read-only GETs, each session within 120 attempts / 300 s (49 expected, 117 at
