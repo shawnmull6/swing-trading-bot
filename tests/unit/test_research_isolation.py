@@ -39,7 +39,13 @@ FORBIDDEN_CALLS = frozenset({"exec", "eval", "__import__", "input", "print", "ge
 
 def _modules() -> list[Path]:
     files = sorted(RESEARCH.glob("*.py"))
-    assert {p.name for p in files} >= {"universe.py", "dataset.py", "acquisition.py"}
+    assert {p.name for p in files} >= {
+        "universe.py",
+        "dataset.py",
+        "acquisition.py",
+        "corporate_actions.py",
+        "staging.py",
+    }
     return files
 
 
@@ -74,6 +80,8 @@ def test_importing_research_loads_no_transport_ledger_or_oms() -> None:
         "import swing_trading_bot.research.dataset\n"
         "import swing_trading_bot.research.acquisition\n"
         "import swing_trading_bot.research.universe\n"
+        "import swing_trading_bot.research.corporate_actions\n"
+        "import swing_trading_bot.research.staging\n"
         "import swing_trading_bot.strategy.walk_forward\n"
         "import swing_trading_bot.strategy.evaluation\n"
         "bad = sorted(m for m in sys.modules if m.startswith(("

@@ -56,7 +56,12 @@ result claimed. Step 16.15A (A§12.48): evidence-based corporate-action attestat
 independent vs continuous portfolio modes, frozen research protocol; Step 16.15's
 out-of-scope read-only ledger access recorded as an operational deviation. Step 16.16B
 (A§12.49): offline capability-probe runner (P1–P6, ≤ 10 HTTP attempts) and the fixed
-`/v1/corporate-actions` transport method; the probe has not been executed.**
+`/v1/corporate-actions` transport method. Step 16.16D: the probe ran once (8 GETs, every
+check verified). Step 16.16E (A§12.50): corporate-action date semantics and padded
+windows, resumable batched acquisition with a write-once staging store and atomic
+publication; acquisition not executed. Step 16.16E.1 (A§12.51): CA date probe scoped to
+forward splits, reconciled request accounting (49 / 117 / 215 under 16.16D gates),
+separate ACQUISITION_COMPLETE and RESEARCH_READY states enforced at evaluation entry.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

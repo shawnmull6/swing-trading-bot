@@ -30,6 +30,7 @@ from swing_trading_bot.strategy.signals import ExitTemplate
 from swing_trading_bot.strategy.support_resistance import SupportResistanceParams
 from swing_trading_bot.strategy.walk_forward import (
     DEFAULT_PERIODS,
+    RESEARCH_READY,
     DataView,
     DateRange,
     FixedDefaultsSelector,
@@ -39,6 +40,7 @@ from swing_trading_bot.strategy.walk_forward import (
     HoldoutAccessError,
     HoldoutRelease,
     PortfolioMode,
+    ResearchAdmission,
     ResearchInputs,
     ResearchPeriods,
     SealedResearchData,
@@ -456,6 +458,7 @@ def _split_bars(symbol: str, phase: int) -> tuple[DailyBar, ...]:
 
 _PROP_INPUTS = ResearchInputs(
     dataset_digest="p" * 64,
+    admission=ResearchAdmission("p" * 64, RESEARCH_READY, "r" * 64),
     sessions=SESSIONS,
     bars={s: _split_bars(s, i * 5) for i, s in enumerate(("AAA", "BBB"))},
     corporate_actions={

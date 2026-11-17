@@ -18,6 +18,7 @@ from pathlib import Path
 from swing_trading_bot.broker.models import BarAdjustment, DailyBar
 from swing_trading_bot.domain.calendar import MARKET_TZ, TradingSession
 from swing_trading_bot.research.dataset import (
+    ACQUISITION_COMPLETE,
     CorporateActionRecord,
     Coverage,
     DistributionKind,
@@ -31,6 +32,7 @@ from swing_trading_bot.research.dataset import (
     encode_corporate_actions,
     encode_identity,
     encode_jsonl,
+    sha256,
     write_dataset,
 )
 from swing_trading_bot.strategy.market_data import CashDividend, SplitEvent
@@ -190,7 +192,17 @@ def manifest_meta(symbols: Sequence[str]) -> dict[str, object]:
              "requested_at": ACQUIRED.isoformat(), "received_at": ACQUIRED.isoformat(),
              "request_count": 0},
         ],
+        "acquisition_report": acquisition_report(),
     }  # fmt: skip
+
+
+def acquisition_report(
+    state: str = ACQUISITION_COMPLETE, batches: Sequence[str] = (BATCH, CAL_BATCH)
+) -> dict[str, object]:
+    """A fixture's record of a complete acquisition (synthetic page checksums)."""
+    return {"acquisition_state": state,
+            "required_batches": {b: {"pages_sha256": [sha256(b.encode())], "attempts": 1}
+                                 for b in batches}}  # fmt: skip
 
 
 def build_files(spec: FixtureSpec) -> tuple[dict[str, object], dict[str, bytes]]:

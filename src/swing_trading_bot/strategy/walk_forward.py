@@ -43,6 +43,14 @@ engine versions, parameters, execution policy and costs, folds, metrics, selecti
 procedure, release conditions) and the walk-forward report that protocol reproduces, so
 changing anything after the release invalidates it.
 
+**Research admission** (Step 16.16E.1). :class:`SealedResearchData` — and therefore
+every evaluation entry point (:func:`freeze_protocol`, :func:`run_walk_forward`,
+:func:`run_continuous`, :func:`run_holdout`) — refuses inputs without a
+:class:`ResearchAdmission` for the same dataset in state ``RESEARCH_READY``
+(:class:`ResearchAdmissionError`). The research layer issues one only from a dataset
+that passed both readiness gates (``research.dataset.assess_readiness``); its readiness
+fingerprint is part of the frozen protocol, so a holdout release is bound to it.
+
 **Portfolio state at fold boundaries** (:class:`PortfolioMode`). ``INDEPENDENT_FOLDS``
 (default): every test window starts flat with the template's initial equity and no
 pending orders, unsettled proceeds or receivables; its end state is reported
@@ -103,6 +111,10 @@ PROTOCOL_VERSION: Final = "2"
 
 class WalkForwardError(ValueError):
     """An invalid period, fold design or protocol."""
+
+
+class ResearchAdmissionError(WalkForwardError):
+    """The inputs were not admitted as RESEARCH_READY for evaluation."""
 
 
 class HoldoutAccessError(PermissionError):
@@ -304,6 +316,20 @@ def fold_table(folds: Sequence[Fold]) -> tuple[dict[str, object], ...]:
 # ===================================================================== sealed data
 
 
+RESEARCH_READY: Final = "RESEARCH_READY"
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchAdmission:
+    """The research layer's statement that a dataset passed both readiness gates
+    (acquisition complete and research-ready). Issued by
+    ``ResearchDataset.research_inputs``; never inferred."""
+
+    dataset_digest: str
+    state: str
+    readiness_fingerprint: str
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchInputs:
     """An integrity-checked dataset in memory. ``corporate_actions[symbol]`` is None when
@@ -320,6 +346,8 @@ class ResearchInputs:
     """Dataset file -> SHA-256 (from the verified manifest); part of the frozen protocol."""
     universe_id: str = ""
     universe_fingerprint: str = ""
+    admission: ResearchAdmission | None = None
+    """Required by :class:`SealedResearchData` (no evaluation without it)."""
 
     def __post_init__(self) -> None:
         if set(self.bars) != set(self.corporate_actions):
@@ -389,10 +417,20 @@ class SealedResearchData:
     """Research inputs with the holdout sealed. The only way to read them is
     :meth:`view`."""
 
-    __slots__ = ("_holdout_start", "_inputs")
+    __slots__ = ("_holdout_start", "_inputs", "_readiness")
 
     def __init__(self, inputs: ResearchInputs, *, holdout_start: date) -> None:
+        admission = inputs.admission
+        if not isinstance(admission, ResearchAdmission):
+            raise ResearchAdmissionError("the inputs carry no research admission")
+        if admission.state != RESEARCH_READY:
+            raise ResearchAdmissionError(f"the dataset is {admission.state}, not RESEARCH_READY")
+        if admission.dataset_digest != inputs.dataset_digest:
+            raise ResearchAdmissionError("the admission is for a different dataset")
+        if not admission.readiness_fingerprint:
+            raise ResearchAdmissionError("the admission names no readiness fingerprint")
         self._inputs = inputs
+        self._readiness = admission.readiness_fingerprint
         self._holdout_start = holdout_start
 
     @property
@@ -417,6 +455,7 @@ class SealedResearchData:
         """Dataset and universe identity (no prices)."""
         i = self._inputs
         return {"dataset_digest": i.dataset_digest,
+                "readiness_fingerprint": self._readiness,
                 "file_checksums": dict(sorted(i.file_checksums.items())),
                 "universe_id": i.universe_id, "universe_fingerprint": i.universe_fingerprint,
                 "symbols": sorted(i.bars), "feed": i.feed,
@@ -867,6 +906,7 @@ __all__ = [
     "ENGINE_VERSION",
     "PROTOCOL_VERSION",
     "RELEASE_CONDITIONS",
+    "RESEARCH_READY",
     "BoundaryState",
     "ContinuousReport",
     "DataView",
@@ -883,6 +923,8 @@ __all__ = [
     "ParameterSelector",
     "PolicyAggregate",
     "PortfolioMode",
+    "ResearchAdmission",
+    "ResearchAdmissionError",
     "ResearchInputs",
     "ResearchPeriods",
     "SealedResearchData",

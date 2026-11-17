@@ -17,6 +17,8 @@ from swing_trading_bot.research.dataset import (
     DatasetError,
     DatasetFormatError,
     DatasetIntegrityError,
+    DatasetNotResearchReadyError,
+    DatasetState,
     Evidence,
     EvidenceKind,
     OtherEvent,
@@ -195,14 +197,14 @@ def test_missing_record_rejects_the_symbol_and_the_backtest_audits_it(tmp_path: 
     status, issues = _quality(ds, "CCC")
     assert status is QualityStatus.REJECTED
     assert QualityIssue.CORPORATE_ACTIONS_MISSING in issues
-    inputs = ds.research_inputs()
-    assert inputs.corporate_actions["CCC"] is None
+    with pytest.raises(DatasetNotResearchReadyError) as err:
+        ds.research_inputs()  # a rejected symbol: complete but not research-ready
+    assert err.value.readiness.state is DatasetState.ACQUISITION_COMPLETE
+    assert ds.corporate_actions["CCC"] is None
     calendar = SessionCalendar(ds.sessions)
     preps = [
-        prepare_series(
-            s, inputs.bars[s], calendar=calendar, corporate_actions=inputs.corporate_actions[s]
-        )
-        for s in inputs.bars
+        prepare_series(s, ds.bars[s], calendar=calendar, corporate_actions=ds.corporate_actions[s])
+        for s in ds.bars
     ]
     cfg = BacktestConfig(SupportResistanceParams(), ExitTemplate(), ExitPolicyMode.PROTECTION_FIRST,
                          ExecutionAssumptions(fees=ZERO_FEES), LIMITS, date(2021, 3, 1),

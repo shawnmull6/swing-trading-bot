@@ -4996,6 +4996,126 @@ probe's id and fingerprint, and gates the FB requests on a new `TICKER-IDENTITY`
 * `test_alpaca_http.py`: the transport's public surface is now `get_json` plus the one
   corporate-actions method.
 
+### 12.50 Step 16.16E: acquisition hardening (offline)
+
+Offline only: no request, no credential read, no ledger access, trading disabled, no
+dataset acquired. Inputs: the Step 16.16D probe (`history-probe-20261117T025839Z`,
+8 GETs, every check `VERIFIED`).
+
+**1. Corporate-action date semantics (`research/corporate_actions.py`).** The probe
+returned SPY's 2020-06-19 ex-date dividend for `start=2020-07-01` (record 06-22,
+payable and process 07-31), so the endpoint does not filter on the ex-date or the record
+date; payable and process date remain candidates. The module keeps six dates apart:
+request window, provider filter date (`FilterSemantics`), ex-date, effective date (the
+ex-date for splits and dividends; for other types the ex-date or the provider's
+`effective_date`, nothing guessed), payable date, research coverage window.
+* Strict parser for the observed shape; unknown list names, missing ids/dates, bad
+  tokens or non-JSON fail closed (`CorporateActionParseError`). Only `forward_splits`
+  and `cash_dividends` shapes are verified; other types are mapped to unsupported events
+  and flagged `UNVERIFIED_EVENT_SHAPE`. Amounts stay `Decimal`.
+* Padded windows: coverage slices are contiguous calendar years by ex-date; requests are
+  padded 31 days before and 92 days after (`ca_windows`). Events are kept by effective
+  date; pad-zone events are cross-checked against the batch that owns their date
+  (`PAD_CROSS_CHECK_MISSING`), de-duplicated by provider id (a changed duplicate is
+  `DUPLICATE_EVENT_CONFLICT`; the same event under two ids is `AMBIGUOUS_DUPLICATE`).
+* Margin check: for every role that may be the filter, `filter date − effective date`
+  must lie within `[−31+14, 92−14]` days, or the padding is shown unsafe
+  (`PAD_MARGIN_EXCEEDED`). Observations can exclude roles (`narrow_semantics`) but never
+  verify one.
+* A `PROVIDER_REPORTED` claim is emitted only when the semantics are `LIVE_VERIFIED`,
+  no margin, cross-check, attribution or coverage-gap finding exists, and the symbol has
+  no invalid or conflicting event. The default acceptance still rejects it. Explicit
+  `INDEPENDENT_SOURCE`/`OPERATOR_REVIEW` attestations may be attached; same-provider and
+  provider-reported kinds are refused as attestations.
+* Gate `CA-DATE-SEMANTICS` (`ACQUISITION_GATES`, outside the fixed probe plan) with a
+  proposed live check `ca-date-semantics-probe-v1` (`e586916e…c4efa`): three single-day
+  requests (AAPL split on its payable day 2020-08-28 and its ex/process day 08-31; SPY
+  dividend on its payable/process day 07-31), ≤ 5 attempts, 60 s. Only the patterns
+  that identify exactly one admissible role verify it. No runner exists yet.
+
+**2. Resumable acquisition (`research/acquisition.py`, `research/staging.py`).**
+* `AcquisitionBatch`: one logical request, id `<request_id>.<12 hex>` over the request
+  and its boundaries, explicit symbols and request/coverage dates, page cap and attempt
+  budget `min(pages + 2, pages × 3)`; FB batches run only when `TICKER-IDENTITY`
+  *failed*.
+* Session (`run_session`): the plan's 120 attempts / 300 s, never raised
+  (`BUDGET_ABOVE_PLAN`); every attempt counted before it is sent; a batch starts only if
+  its whole budget and 30 s still fit (else `INCOMPLETE`, resumable); retries only for
+  429/503/timeout, ≤ 3 per page, backoff 0.5 → 4 s within the deadline; 401/403 and
+  entitlement refusals stop; page cap and repeated tokens stop. A stopped batch stages
+  nothing.
+* Store: write-once files via `tmp/` + fsync + `os.link` (no replace); content-addressed
+  page blobs; batch records with their own digest and every page's SHA-256, re-verified
+  on open, resume and assembly (`TAMPERED_BATCH`); a store is bound to one plan
+  fingerprint (`INCOMPATIBLE_PLAN`, `UNKNOWN_BATCH_RECORD`). A crash leaves
+  `session.lock`/`tmp/` files; sessions and publication then refuse until
+  `recover(label)` moves them to `quarantine/<label>/` and re-verifies every batch.
+* Publication (`publish_dataset`): only when every gate-eligible batch is staged and no
+  ineligible one is; calendar from TRADING rows cross-checked against SETTLEMENT rows;
+  bars through `bars_from_alpaca_pages`; identity (FB span only if the fallback ran);
+  corporate actions as above; then `write_dataset` and `load_dataset`. The manifest
+  carries an `acquisition_report` (plan fingerprint, gates, semantics, padding, claims,
+  findings). No backtest, walk-forward, holdout view or parameter selection is reachable.
+* `dataset.quality_report` lists every symbol with its status and reasons, rejected
+  ones included, plus the acquisition findings that concern it.
+
+**3. Plan.** 51 logical requests and batches; 51 expected HTTP; 121 at page caps; 223
+with every batch at its attempt budget (was 363 with 3 attempts on every capped page);
+≤ 2 sessions when nothing stops. Acquisition fingerprint `6ca96c06…ae5a3f`; probe
+fingerprint unchanged.
+
+**Tests.** `tests/unit/test_corporate_action_import.py` (23),
+`tests/unit/test_acquisition_staging.py` (28), plan tests extended, research isolation
+extended to the two new modules.
+
+### 12.51 Step 16.16E.1: review corrections (offline)
+
+**1. CA date probe.** `CA_SEMANTICS_REFERENCES` became `SemanticsReference` records
+holding every date the 16.16D evidence lists (none inferred). The expected response of
+each request under each hypothesis (ex, record, payable, process, any listed date) is
+derived from those dates (`hypothesis_table()`), and a role is identified only by a
+pattern unique among the hypotheses with at least one event returned. Payable vs
+process is distinguishable only on AAPL's split (payable 08-28, process 08-31); SPY's
+dividend has payable = process. A LIVE_VERIFIED result therefore carries `scope`
+(`("forward_splits",)`) and `fallback` (the prior candidates). Outside the scope both
+candidates' lags are checked, and `DATE_SEMANTICS_UNVERIFIED` is raised per list for
+any unscoped action type. Consequence: the probe alone unblocks no provider claim.
+`discriminating_events()` supports a later, separately authorized discovery step. The
+probe-plan and acquisition fingerprints are unchanged.
+
+**2. Request accounting.** `LogicalRequest.worst_case_http` (pages × 3, totalling 363)
+contradicted the enforced batch budgets and was removed. `LogicalRequest.attempt_budget`
+is now the single source for `AcquisitionBatch.max_attempts`. `request_accounting(plan,
+gates)` reports per kind and in total the expected, page-cap and retry-inclusive
+attempts and the session counts. `sessions_needed` simulates the runner's reservation
+rule, and the plan's `max_sessions_without_stop` uses it. Totals: all batches 51 / 121 /
+223; eligible under 16.16D 49 / 117 / 215; 1 session expected, 2 worst case. A test
+drives the runner with retries across several 12-attempt sessions and checks its spend
+and session count against the planner. `ineligible_reason` moved to `acquisition`.
+
+**3. Readiness.**
+* `dataset.assess_readiness` separates `ACQUISITION_COMPLETE` from `RESEARCH_READY`:
+  * acquisition: the manifest's report, required batches with page checksums, no extra
+    batch;
+  * research: no rejected symbol, and attested full-window coverage for every list.
+* `research_inputs()` raises `DatasetNotResearchReadyError` otherwise. When it succeeds
+  it attaches a `strategy.walk_forward.ResearchAdmission`.
+* `SealedResearchData` refuses inputs without a matching RESEARCH_READY admission
+  (`ResearchAdmissionError`), which closes every walk-forward, continuous and holdout
+  entry point.
+* The readiness fingerprint enters `SealedResearchData.identity`, and through it the
+  frozen protocol and holdout release.
+* The staging assembler records `acquisition_state`, `required_batches` (page SHA-256s,
+  attempts) and `request_accounting`. `quality_report` includes the readiness.
+* The strategy layer still imports nothing from research.
+
+**Tests.**
+* New: `tests/unit/test_research_readiness.py` (19).
+* Corporate-action tests: +7 for hypothesis discrimination and scope.
+* Plan tests: +4 for accounting.
+* Staging tests: +2 for runner reconciliation and readiness after publication.
+* The synthetic fixture now records a complete acquisition.
+
 ---
 
 ## 13. Configuration & secrets

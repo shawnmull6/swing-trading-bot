@@ -447,7 +447,10 @@ dataset and never starts acquisition.
 1. No bot process needs to stop and the ledger is not involved; do not open it.
 2. Use a credential file, not environment variables. It must be an absolute path, mode
    600, owned by you, not tracked by Git, `TRADING_MODE=paper`, and `TRADING_ENABLED`
-   absent or false. Unset every `ALPACA_*` variable in the shell first.
+   absent or false. Unset every `ALPACA_*` variable in the shell first, and also
+   `TRADING_MODE`, `TRADING_ENABLED`, `INITIAL_CAPITAL` and `MAX_CAPITAL_ALLOCATION`:
+   the loader refuses a credential file combined with any setting in the environment
+   (seen in Step 16.16D; those settings come from the file).
 3. Run (the fingerprint must equal the authorized one, or the runner refuses):
 
 ```bash
@@ -463,3 +466,36 @@ RUN_ALPACA_HISTORY_PROBE=1 STB_ENV_FILE=/abs/path/paper.env uv run python -m tes
    redirect or another host stops it.
 6. A passing probe authorizes nothing further. Acquisition needs its own authorization
    after the evidence is reviewed.
+
+## 16. Historical acquisition staging (Step 16.16E; not yet runnable live)
+
+There is no live acquisition runner yet; `research/staging.py` runs only with an
+injected fetch (tests). This section fixes the operating rules for the later,
+separately authorized run.
+
+1. **Authorization first.** It must name the acquisition-plan fingerprint
+   (RESEARCH_DATA §3.0a), the number of sessions, the destination and how corporate-action
+   coverage will be attested (§7). No session raises the plan's 120 attempts / 300 s.
+2. **Staging location.** `data/research/staging/<first 16 hex of the plan fingerprint>/`
+   (git-ignored). A store refuses a directory, or a parent, that holds a `ledger.*` file
+   (names only). Never place it in `data/` itself.
+3. **Resume.** A session that ends `INCOMPLETE` (budget reserved) is resumed by a later
+   authorized session with the same plan; staged batches are re-verified, never
+   refetched. A store made for another plan fingerprint is refused, never reused.
+4. **After a crash** (`session.lock` or files in `tmp/` present) every session and
+   publication is refused. Do not delete anything. Recovery is explicit:
+   `StagingStore.open(root, plan).recover(label="<date>-<reason>")` moves the lock and
+   in-flight files to `quarantine/<label>/` and re-verifies every staged batch.
+5. **Tampering** (`TAMPERED_BATCH`, `UNKNOWN_BATCH_RECORD`): stop. Nothing is repaired
+   automatically. Keep the store for review; a fresh store is a new, reviewed decision.
+6. **Publication** happens only when every eligible batch verifies. It writes
+   `data/research/<dataset_id>/` once (never overwritten) and reports every symbol,
+   rejected ones with reasons. It runs no backtest and opens no holdout view (§14).
+7. **Readiness** (Step 16.16E.1; RESEARCH_DATA §3.3b). A published dataset is
+   `ACQUISITION_COMPLETE`; it becomes `RESEARCH_READY` only when every universe symbol
+   is accepted and every corporate-action list of every symbol carries independent or
+   operator-review evidence over the whole window. Check with
+   `load_dataset(path).readiness()` or `quality_report(...)["readiness"]`. Walk-forward
+   and holdout evaluation refuse anything else; there is no override. A rejected symbol
+   is resolved by attestation or by a new, reviewed universe, never by editing the
+   dataset.

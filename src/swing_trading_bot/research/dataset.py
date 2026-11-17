@@ -77,7 +77,11 @@ from swing_trading_bot.strategy.market_data import (
     derive_split_events,
     prepare_series,
 )
-from swing_trading_bot.strategy.walk_forward import ResearchInputs
+from swing_trading_bot.strategy.walk_forward import (
+    RESEARCH_READY,
+    ResearchAdmission,
+    ResearchInputs,
+)
 
 SCHEMA_VERSION: Final = 2
 MANIFEST: Final = "manifest.json"
@@ -94,6 +98,18 @@ class DatasetError(ValueError):
 
 class DatasetIntegrityError(DatasetError):
     """Checksums, file set, manifest or schema version do not match."""
+
+
+class DatasetNotResearchReadyError(DatasetError):
+    """The dataset is not RESEARCH_READY; it must not reach walk-forward evaluation or a
+    holdout release. ``readiness`` keeps every blocker for inspection."""
+
+    def __init__(self, readiness: DatasetReadiness) -> None:
+        super().__init__(
+            f"{readiness.state.value}: "
+            + "; ".join(readiness.acquisition_blockers + readiness.research_blockers)
+        )
+        self.readiness = readiness
 
 
 class DatasetFormatError(DatasetError):
@@ -478,9 +494,9 @@ def corporate_action_claims(files: Mapping[str, bytes]) -> list[dict[str, object
     return rows
 
 
-def _refuse_ledger_location(root: Path) -> None:
-    """Never write or read a dataset in a directory that holds a ledger (the check lists
-    names only; it never opens a ledger file)."""
+def refuse_ledger_location(root: Path) -> None:
+    """Never write or read a dataset (or a staging store) in a directory that holds a
+    ledger (the check lists names only; it never opens a ledger file)."""
     for d in (root, root.parent):
         if d.is_dir() and any(c.name.startswith(_LEDGER_PREFIX) for c in d.iterdir()):
             raise DatasetError(f"{d} holds a ledger: datasets live in their own directory")
@@ -491,7 +507,7 @@ def write_dataset(root: Path, meta: Mapping[str, object], files: Mapping[str, by
     manifest field except ``files`` and ``manifest_sha256``. Returns the dataset digest."""
     if root.exists():
         raise DatasetError(f"{root} exists: datasets are immutable")
-    _refuse_ledger_location(root)
+    refuse_ledger_location(root)
     if MANIFEST in files or {"files", "manifest_sha256", "corporate_action_claims"} & set(meta):
         raise DatasetError("the manifest is generated, not supplied")
     for rel in files:
@@ -630,9 +646,18 @@ class ResearchDataset:
     def accepted_symbols(self) -> tuple[str, ...]:
         return tuple(q.symbol for q in self.quality if q.status is not QualityStatus.REJECTED)
 
+    def readiness(self) -> DatasetReadiness:
+        return assess_readiness(self)
+
     def research_inputs(self, sectors: Mapping[str, str] | None = None) -> ResearchInputs:
-        """Every universe symbol (rejected ones carry no corporate-action record, so the
-        backtest audits them as rejected rather than silently dropping them)."""
+        """The only bridge from a dataset to evaluation: refused
+        (:class:`DatasetNotResearchReadyError`) unless the dataset is RESEARCH_READY.
+        The inputs carry a :class:`ResearchAdmission` naming that readiness; the
+        walk-forward entry points refuse inputs without one. Inspection
+        (:func:`quality_report`, :meth:`readiness`) never needs this."""
+        readiness = self.readiness()
+        if not readiness.research_ready:
+            raise DatasetNotResearchReadyError(readiness)
         files = _obj(self.manifest.raw.get("files"), "files")
         universe = self.manifest.raw.get("universe")
         return ResearchInputs(
@@ -642,13 +667,15 @@ class ResearchDataset:
             file_checksums={rel: str(_obj(e, rel).get("sha256")) for rel, e in files.items()},
             universe_id=self.manifest.universe_id,
             universe_fingerprint=sha256(canonical(universe).encode()),
+            admission=ResearchAdmission(self.digest, readiness.state.value,
+                                        readiness.fingerprint),
         )  # fmt: skip
 
 
 def _read_verified(root: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
     if not root.is_dir():
         raise DatasetIntegrityError(f"{root} is not a dataset directory")
-    _refuse_ledger_location(root)
+    refuse_ledger_location(root)
     if not (root / MANIFEST).is_file():
         raise DatasetIntegrityError(f"{root} has no {MANIFEST}")
     manifest = _obj(loads((root / MANIFEST).read_bytes()), MANIFEST)
@@ -1132,7 +1159,143 @@ def load_dataset(root: Path, *, acceptance: CoverageAcceptance | None = None) ->
     return ResearchDataset(manifest, sessions, identities, bars, actions, records, tuple(quality))
 
 
+# ===================================================================== readiness
+
+#: ``acquisition_report.acquisition_state`` written by the staging assembler.
+ACQUISITION_COMPLETE: Final = "ACQUISITION_COMPLETE"
+_HEX64: Final = re.compile(r"^[0-9a-f]{64}$")
+_COVERAGE_LISTS: Final = (("splits", "split_coverage"), ("dividends", "dividend_coverage"),
+                          ("other_events", "other_coverage"))  # fmt: skip
+
+
+class DatasetState(StrEnum):
+    """Two separate gates, in order. A dataset can be complete and still not usable."""
+
+    ACQUISITION_INCOMPLETE = "ACQUISITION_INCOMPLETE"
+    ACQUISITION_COMPLETE = "ACQUISITION_COMPLETE"
+    """Every required provider batch is present, checksummed and validated."""
+    RESEARCH_READY = RESEARCH_READY
+    """ACQUISITION_COMPLETE, every universe symbol passed the quality checks, and every
+    corporate-action list of every symbol carries an accepted attestation
+    (INDEPENDENT_SOURCE or OPERATOR_REVIEW) over the whole dataset window."""
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetReadiness:
+    dataset_digest: str
+    acquisition_blockers: tuple[str, ...]
+    research_blockers: tuple[str, ...]
+    """Reasons the dataset is not research-ready (empty when it is). Includes
+    ``ACQUISITION_INCOMPLETE`` when the first gate failed."""
+
+    @property
+    def acquisition_complete(self) -> bool:
+        return not self.acquisition_blockers
+
+    @property
+    def research_ready(self) -> bool:
+        return self.acquisition_complete and not self.research_blockers
+
+    @property
+    def state(self) -> DatasetState:
+        if not self.acquisition_complete:
+            return DatasetState.ACQUISITION_INCOMPLETE
+        return DatasetState.RESEARCH_READY if self.research_ready \
+            else DatasetState.ACQUISITION_COMPLETE  # fmt: skip
+
+    def to_dict(self) -> dict[str, object]:
+        return {"dataset_digest": self.dataset_digest, "state": self.state.value,
+                "acquisition_complete": self.acquisition_complete,
+                "research_ready": self.research_ready,
+                "acquisition_blockers": list(self.acquisition_blockers),
+                "research_blockers": list(self.research_blockers)}  # fmt: skip
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256(canonical(self.to_dict()).encode())
+
+
+def _acquisition_blockers(m: DatasetManifest) -> list[str]:
+    report = m.raw.get("acquisition_report")
+    if not isinstance(report, dict):
+        return ["ACQUISITION_REPORT_MISSING"]
+    out = []
+    if report.get("acquisition_state") != ACQUISITION_COMPLETE:
+        out.append(f"ACQUISITION_STATE {report.get('acquisition_state')!r}")
+    required = report.get("required_batches")
+    if not isinstance(required, dict) or not required:
+        return [*out, "REQUIRED_BATCHES_MISSING"]
+    present = set(m.batches)
+    for bid, entry in sorted(required.items()):
+        if bid not in present:
+            out.append(f"REQUIRED_BATCH_ABSENT {bid}")
+        pages = entry.get("pages_sha256") if isinstance(entry, dict) else None
+        if (not isinstance(pages, list) or not pages
+                or not all(isinstance(h, str) and _HEX64.match(h) for h in pages)):  # fmt: skip
+            out.append(f"REQUIRED_BATCH_UNCHECKSUMMED {bid}")
+    out += [f"UNREQUIRED_BATCH {bid}" for bid in sorted(present - set(required))]
+    return out
+
+
+def _research_blockers(ds: ResearchDataset) -> list[str]:
+    m = ds.manifest
+    out = []
+    for q in ds.quality:
+        if q.status is QualityStatus.REJECTED:
+            issues = ",".join(sorted({f.issue.value for f in q.findings})) or "NO_RECORD"
+            out.append(f"SYMBOL_REJECTED {q.symbol}: {issues}")
+        if any(f.issue is QualityIssue.PROVIDER_ONLY_COVERAGE_ACCEPTED for f in q.findings):
+            out.append(f"PROVIDER_ONLY_COVERAGE {q.symbol}")
+    for sym in m.symbols:
+        rec = ds.records.get(sym)
+        for name, attr in _COVERAGE_LISTS:
+            cov = None if rec is None else getattr(rec, attr)
+            if (cov is None or not cov.kinds & _ATTESTING
+                    or cov.start > m.warmup_start or cov.end < m.research_end):  # fmt: skip
+                out.append(f"ATTESTATION_MISSING {sym} {name}")
+    return out
+
+
+def assess_readiness(ds: ResearchDataset) -> DatasetReadiness:
+    """Both gates for a loaded (integrity-verified) dataset. Pure; never raises for a
+    data fault: every reason is listed so a non-ready dataset stays inspectable."""
+    acquisition = _acquisition_blockers(ds.manifest)
+    research = _research_blockers(ds)
+    if acquisition:
+        research.insert(0, "ACQUISITION_INCOMPLETE")
+    return DatasetReadiness(ds.digest, tuple(acquisition), tuple(research))
+
+
+def quality_report(ds: ResearchDataset) -> dict[str, Any]:
+    """Every universe symbol with its status and reasons, rejected ones included, plus the
+    acquisition findings recorded in the manifest (Step 16.16E). Nothing is dropped."""
+    acquisition = ds.manifest.raw.get("acquisition_report")
+    acq = acquisition if isinstance(acquisition, dict) else {}
+    rows = [{
+        "symbol": q.symbol, "status": q.status.value, "bar_count": q.bar_count,
+        "first_session": None if q.first_session is None else str(q.first_session),
+        "last_session": None if q.last_session is None else str(q.last_session),
+        "expected_sessions": q.expected_sessions, "missing_sessions": len(q.missing_sessions),
+        "split_consistency": q.split_consistency,
+        "findings": [f"{f.issue.value} {f.detail}".strip() for f in q.findings],
+        "acquisition_findings": [f for f in acq.get("findings", [])
+                                 if isinstance(f, dict) and f.get("symbol") in (q.symbol, "*")],
+    } for q in ds.quality]  # fmt: skip
+    return {
+        "dataset_digest": ds.digest,
+        "readiness": assess_readiness(ds).to_dict(),
+        "survivorship_bias_free": ds.manifest.survivorship_bias_free,
+        "accepted": [r["symbol"] for r in rows if r["status"] != QualityStatus.REJECTED.value],
+        "rejected": {str(r["symbol"]): r["findings"] for r in rows
+                     if r["status"] == QualityStatus.REJECTED.value},
+        "symbols": rows,
+        "ca_date_semantics": acq.get("ca_date_semantics"),
+        "corporate_action_claims": acq.get("corporate_action_claims"),
+    }  # fmt: skip
+
+
 __all__ = [
+    "ACQUISITION_COMPLETE",
     "CALENDAR",
     "IDENTITY",
     "MANIFEST",
@@ -1145,6 +1308,9 @@ __all__ = [
     "DatasetFormatError",
     "DatasetIntegrityError",
     "DatasetManifest",
+    "DatasetNotResearchReadyError",
+    "DatasetReadiness",
+    "DatasetState",
     "DistributionKind",
     "Evidence",
     "EvidenceKind",
@@ -1157,6 +1323,7 @@ __all__ = [
     "SymbolIdentity",
     "SymbolQuality",
     "TickerSpan",
+    "assess_readiness",
     "bars_from_alpaca_pages",
     "canonical",
     "corporate_action_claims",
@@ -1168,6 +1335,8 @@ __all__ = [
     "encode_jsonl",
     "load_dataset",
     "loads",
+    "quality_report",
+    "refuse_ledger_location",
     "sha256",
     "write_dataset",
 ]

@@ -113,7 +113,7 @@ consistency check and unexplained drops are warnings (`ACCEPTED_WITH_WARNINGS`);
 span a gap produce no signal. Rejected symbols stay in the research inputs with no
 corporate-action record, so every backtest audits them as `SERIES_REJECTED`.
 
-## 3. Historical data plans (`research/acquisition.py`, revised 16.16B)
+## 3. Historical data plans (`research/acquisition.py`, revised 16.16B and 16.16E)
 
 There are two separate, fingerprinted plans. Nothing is sent by building either.
 **Logical requests** (one query each) are distinct from **HTTP requests** (pages ×
@@ -151,31 +151,88 @@ no dataset.
   derived from P1, never hard-coded.
 * **Holdout.** No probe reads a 2025–2026 price; only the calendars span that period.
 
+**Executed once in Step 16.16D** (evidence `contract-evidence/history-probe-20261117T025839Z/`):
+8 GETs, all HTTP 200, 1.9 s; every check `VERIFIED`. Limits of that evidence: SIP depth
+and pagination were shown for AAPL 2020-H2 only; the split check is same-provider; the
+corporate-action list is provider-reported; P6 showed the endpoint does not filter on
+the ex-date (§3.3a).
+
 ### 3.0a Acquisition — `build_acquisition_plan()`
 
-Fingerprint `c4d5d57649b501843fd96879c01286cd3947e4994c61306a36321fb6a825b7e9`. It
-names the probe plan's id and fingerprint and runs only after the probe's checks pass;
-it needs its own authorization (§7).
+Fingerprint `6ca96c0601a404b19bd5adac44bc1e46141a9febd9c66db7b9438a7380ae5a3f`
+(16.16E; was `c4d5d576…5b7e9`). It names the probe plan's id and fingerprint and the
+proposed `ca-date-semantics-probe-v1` (§3.3a), runs only after the probe's checks pass,
+and needs its own authorization (§7).
 
 | Phase | Logical requests | Expected HTTP | Page cap (planning) |
 |---|---|---|---|
 | CORE | 42: TRADING + SETTLEMENT calendars 2020-07-01 → 2026-10-31; 20 symbols × {raw, split} daily SIP bars over the same window (`limit=10000`, ≈1,596 bars each) | 42 | 82 |
-| CONDITIONAL | 9: corporate actions, one per year 2020–2026 (only if `CA-SHAPE` passes; `PROVIDER_REPORTED` evidence only); FB raw/split before 2022-06-09 (only if `TICKER-IDENTITY` shows META's early bars missing) | 9 | 39 |
+| CONDITIONAL | 9: corporate actions, one per ex-date year 2020–2026, requests padded −31/+92 days (only if `CA-SHAPE` passes; `PROVIDER_REPORTED` evidence only, §3.3a); FB raw/split before 2022-06-09 (only if `TICKER-IDENTITY` failed — it passed in 16.16D, so these are skipped) | 9 | 39 |
 | **Total** | **51** | **51** | **121** |
 
 * **Pagination.** Every request follows `next_page_token` to null; a repeated or
   non-string token, or a page beyond the request's planning cap, stops the session.
   Bar caps never exceed the adapter's 20.
 * **Retries.** Only 429, 503 and timeouts, at most 3 attempts per page with the same
-  token (worst case 121 × 3 = 363). The shared budget of **120** binds first:
-  exhausting it stops the session with nothing published.
+  token, and at most `pages + 2` attempts per batch (§3.0b). The session budget of
+  **120** attempts / **300 s** is unchanged; a batch whose whole budget would not fit is
+  left for a later session.
+* **Request accounting** (`request_accounting(plan, gates)`, Step 16.16E.1). Every
+  number is derived from the batch budgets the runner enforces; the planner's
+  `worst_case_http_requests` is their sum. (The pages × 3 per-request bound of 16.16B,
+  363 in total, was stale and has been removed.)
+
+| Batch kind | Batches | Expected pages | Max pages | Retry allowance | Max attempts / batch | Worst case |
+|---|---|---|---|---|---|---|
+| Calendar (TRADING, SETTLEMENT) | 2 | 1 | 1 | 2 | 3 | 6 |
+| Bars (20 symbols × raw/split) | 40 | 1 | 2 | 2 | 4 | 160 |
+| Bars, FB fallback (only if `TICKER-IDENTITY` failed) | 2 | 1 | 2 | 2 | 4 | 8 |
+| Corporate actions (one per ex-date year) | 7 | 1 | 5 | 2 | 7 | 49 |
+
+| Total | All 51 batches | Eligible under 16.16D gates (49; FB skipped) |
+|---|---|---|
+| Expected requests | 51 | **49** |
+| Page-cap requests (no retries) | 121 = 2·1 + 42·2 + 7·5 | **117** = 2·1 + 40·2 + 7·5 |
+| Retry-inclusive worst case | 223 = 2·3 + 42·4 + 7·7 | **215** = 2·3 + 40·4 + 7·7 |
+| Maximum attempts per session | 120 (300 s) | 120 (300 s) |
+| Sessions, expected use | 1 | **1** |
+| Sessions, every batch at its budget | 2 | **2** |
+
+  Session counts simulate the runner's rule (a batch starts only if its whole budget
+  still fits, `sessions_needed`); session time is not modelled, so a slow provider can
+  need more sessions, each still within 120 attempts / 300 s. 16.16E's report called 51
+  the expected count with FB skipped; 51 includes the two FB batches, 49 is correct.
 * **Entitlement failures.** A data-host 403 (including the recent-SIP message, A§12.36),
   any other 403 or a 401 is never retried and stops the session.
 * **Warm-up.** Bars before 2021-01-01 are history only and are never traded.
-* **Storage.** `data/research/<dataset_id>/` (git-ignored); written once by
-  `write_dataset`; responses mapped by `bars_from_alpaca_pages` (adapter validation).
+* **Storage.** Staging `data/research/staging/<plan fingerprint prefix>/`; the dataset
+  `data/research/<dataset_id>/` (git-ignored), written once by `write_dataset`;
+  responses mapped by `bars_from_alpaca_pages` (adapter validation).
 * **Credentials.** The read-only paper key selected with `STB_ENV_FILE`; GET only; no
   ledger opened.
+
+### 3.0b Resumable acquisition (`research/staging.py`, Step 16.16E)
+
+| Item | Rule |
+|---|---|
+| Batch | one logical request; id `<request_id>.<12 hex>` over the request and its boundaries; explicit symbols, request and coverage dates |
+| Per-batch budget | `min(pages + 2, pages × 3)`: calendar 3, bars 4, corporate actions 7 |
+| Session | 120 attempts / 300 s (never raised); every attempt counted before it is sent; a batch starts only if its whole budget and 30 s fit |
+| Eligibility | `requires_passed` gates must be `True`; FB batches need `TICKER-IDENTITY` `False`; a missing gate is neither (fail closed) |
+| Staging | `store.json`, `blobs/<sha256>.json`, `batches/<id>.json`, `tmp/`, `quarantine/`; files written to `tmp/`, fsynced, then linked (never replaced), read-only |
+| Integrity | record digest + page SHA-256s + page-token chain + plan fingerprint, re-verified on open, resume and assembly; `TAMPERED_BATCH`, `UNKNOWN_BATCH_RECORD`, `INCOMPATIBLE_PLAN` fail closed |
+| Interruption | `session.lock` or in-flight files block sessions and publication until `recover(label)` quarantines them and re-verifies every batch |
+| Publication | only when every eligible batch verifies and no ineligible one is staged; `write_dataset` (one rename, no overwrite), then `load_dataset`; no backtest, holdout view or tuning |
+
+**Storage structure** after publication: §2's layout, with `manifest.acquisitions`
+listing every batch (id, endpoint, parameters, request/receipt time, attempts) and
+`manifest.acquisition_report` holding `acquisition_state: ACQUISITION_COMPLETE`, every
+required batch with its page SHA-256s and attempts, the request accounting and attempts
+actually used, the plan fingerprint, gate outcomes, date-filter semantics (with the
+action types a verified role covers), padding, per-symbol corporate-action claims and
+every import finding.
+`quality_report(dataset)` lists all symbols with status and reasons; rejected ones are
+never dropped.
 
 ### 3.1 Capability-validation checklist (answered by the probe)
 
@@ -222,6 +279,94 @@ independent verification. For splits **and** dividends, an authoritative second 
 (exchange or issuer records, or a licensed vendor) or a documented operator review is
 required before coverage is accepted. Mergers/spin-offs for the pilot universe are expected to be
 none, but "expected" is not attested.
+
+### 3.3a Corporate-action dates (Step 16.16E, `research/corporate_actions.py`)
+
+Six dates are kept apart: the request window (padded), the provider's filter date, the
+ex-date, the effective date (ex-date for splits and dividends), the payable date (the
+dividend's pay date) and the research coverage window (selected by effective date).
+
+* **What is known.** 16.16D's P6 returned SPY's 2020-06-19 ex-date dividend for
+  `start=2020-07-01`; its record date was 06-22 and its payable and process dates 07-31.
+  So the filter is neither the ex-date nor the record date; payable or process date
+  remain. SPY's June-2021 dividend (paid end of July) was absent from the `end=2021-06-30`
+  request, consistent with either.
+* **Policy.** Requests are padded 31 days before and 92 days after each ex-date year;
+  events are kept by ex-date; pad-zone events must be confirmed by the batch owning
+  their date; duplicates are merged by provider id; conflicting or ambiguous duplicates
+  fail closed for their symbol and list. Observed lags must stay 14 days inside the
+  padding for every possible filter role.
+* **Gate `CA-DATE-SEMANTICS`.** Without live verification no `PROVIDER_REPORTED`
+  coverage claim is made (findings `DATE_SEMANTICS_UNVERIFIED`, per list), so
+  corporate-action coverage then rests on independent or operator-review evidence or the
+  symbol is rejected. Proposed check `ca-date-semantics-probe-v1`
+  (`e586916efa62c41591bde68842b554707e19aeff4b54fc8b10f1174a7c1c4efa`, unchanged by
+  16.16E.1). Reference events, with every date copied from the 16.16D evidence
+  (`raw/006`, `raw/007`; nothing inferred):
+
+| Event | Ex | Record | Payable | Process |
+|---|---|---|---|---|
+| AAPL 4:1 forward split | 2020-08-31 | 2020-08-24 | **2020-08-28** | **2020-08-31** |
+| SPY cash dividend 1.3662419 | 2020-06-19 | 2020-06-22 | 2020-07-31 | 2020-07-31 |
+
+  Expected responses (event returned = T), derived in code from those dates
+  (`hypothesis_table()`):
+
+| # | Single-day request (`/v1/corporate-actions`) | ex | record | payable | process | any date |
+|---|---|---|---|---|---|---|
+| Q1 | AAPL `forward_split` 2020-08-28 | F | F | **T** | **F** | T |
+| Q2 | AAPL `forward_split` 2020-08-31 | T | F | **F** | **T** | T |
+| Q3 | SPY `cash_dividend` 2020-07-31 | F | F | T | T | T |
+
+  * **Payable vs process: distinguishable, for forward splits only.** Q1/Q2 use the only
+    observed event whose payable and process dates differ. (T,F,T) ⇒ payable,
+    (F,T,T) ⇒ process. Every hypothesis gives a different pattern.
+  * **Q3 is a positive control.** It separates {payable, process} from {ex, record} and
+    shows a single-day window returns anything (an all-F answer, the record-date
+    pattern, is indistinguishable from a refused or exclusive window and is
+    `INCONCLUSIVE`). It cannot separate payable from process for dividends: all nine
+    dividends observed in 16.16D have payable = process.
+  * **Scope.** A verified role is recorded with `scope = ("forward_splits",)`; for every
+    other action type both payable and process stay candidates and both lags are
+    checked. The `splits` list also covers unprobed reverse splits and the
+    `other_events` list ten unprobed types, so **a successful probe alone unblocks no
+    `PROVIDER_REPORTED` claim**. With RESEARCH_READY requiring attestations (§3.3b), the
+    gate is off the critical path.
+  * **Discovery (not authorized, not implemented as a runner).** A dividend-scope
+    verification needs a cash dividend whose payable and process dates differ. None is in
+    the evidence. Bounded options, each needing its own authorization: (a) after an
+    authorized acquisition, scan the staged corporate-action pages offline with
+    `discriminating_events()` (no request), then (b) one further single-day probe on any
+    event found (≤ 2 requests, ≤ 4 attempts, 60 s, data host only).
+
+  ≤ 5 attempts, 60 s. No runner exists; it needs its own implementation review and
+  authorization.
+* **Padding is not completeness.** Even a verified, unblocked provider claim is
+  `PROVIDER_REPORTED` and is rejected by the default acceptance policy.
+
+### 3.3b Acquisition complete vs research ready (Step 16.16E.1)
+
+Two gates, assessed by `assess_readiness(dataset)` on every loaded dataset (states
+`ACQUISITION_INCOMPLETE` → `ACQUISITION_COMPLETE` → `RESEARCH_READY`):
+
+| Gate | Passes when | Blockers (examples) |
+|---|---|---|
+| `ACQUISITION_COMPLETE` | the manifest's `acquisition_report` says `ACQUISITION_COMPLETE`; every required batch is listed in `acquisitions` with page SHA-256s, and no other batch is; every file verified its checksum on load (else load fails) | `ACQUISITION_REPORT_MISSING`, `REQUIRED_BATCH_ABSENT`, `REQUIRED_BATCH_UNCHECKSUMMED`, `UNREQUIRED_BATCH` |
+| `RESEARCH_READY` | acquisition complete; **every** universe symbol passed the quality checks; every symbol's splits, dividends and other-events coverage spans warm-up start → research end with `INDEPENDENT_SOURCE` or `OPERATOR_REVIEW` evidence | `SYMBOL_REJECTED <sym>`, `ATTESTATION_MISSING <sym> <list>`, `PROVIDER_ONLY_COVERAGE <sym>` |
+
+* A complete dataset can stay not research-ready (e.g. one rejected symbol, or only
+  provider-reported coverage even under a lenient `CoverageAcceptance`).
+* `ResearchDataset.research_inputs()` is the only bridge to evaluation and raises
+  `DatasetNotResearchReadyError` (carrying every blocker) unless RESEARCH_READY. It
+  attaches a `ResearchAdmission` (digest, state, readiness fingerprint).
+* `SealedResearchData` refuses inputs without an admission for the same digest in state
+  `RESEARCH_READY` (`ResearchAdmissionError`), so `freeze_protocol`, `run_walk_forward`,
+  `run_continuous` and `run_holdout` cannot run on anything else. The readiness
+  fingerprint is part of the frozen protocol, so a holdout release is bound to it.
+* `quality_report()` and `readiness()` need no admission: rejected symbols and every
+  blocker stay inspectable.
+* Excluding a rejected symbol to reach RESEARCH_READY means a new universe (new
+  fingerprint and plan); there is no per-dataset exclusion switch.
 
 ### 3.4 Delisted symbols and historical membership
 
@@ -357,15 +502,23 @@ No backtest number — synthetic or historical, either policy — changes any it
    fingerprint (§3.0), the runner, the credential file selected with `STB_ENV_FILE`,
    the two hosts and three endpoints, the 10-attempt / 120 s limits, and the evidence
    location. No ledger access, broker write, trading enablement or dataset.
-2. **Acquisition**, only after the probe's evidence has been reviewed. A separate
-   statement naming:
+2. **CA-DATE-SEMANTICS check** (optional; not needed for RESEARCH_READY, §3.3b): an
+   implemented and reviewed runner for `ca-date-semantics-probe-v1` (§3.3a), then a
+   statement naming its fingerprint, ≤ 5 attempts / 60 s, the data host and the one
+   endpoint. It can verify the filter role for forward splits only.
+3. **Acquisition**, after the probe's evidence has been reviewed (done for 16.16D) and a
+   live runner around `research/staging.py` has been implemented and reviewed. A
+   separate statement naming:
    1. the acquisition-plan fingerprint (§3.0a);
    2. the credential file;
-   3. read-only GETs within the 120-request / 300 s budget (51 expected HTTP requests);
-   4. the probe evidence that gates it (§3.1);
-   5. the destination `data/research/<dataset_id>/`, with no ledger access;
+   3. read-only GETs, each session within 120 attempts / 300 s (49 expected, 117 at
+      page caps, 215 worst case under the 16.16D gates; §3.0a), and the maximum number
+      of sessions (2 when nothing stops);
+   4. the probe evidence and gate outcomes that gate it (§3.1, §3.3a);
+   5. the staging and destination directories under `data/research/`, with no ledger
+      access;
    6. how split and dividend coverage will be attested (independent source or operator
-      review; same-provider consistency does not count).
+      review; same-provider consistency and unverified provider claims do not count).
 
 ## 8. Operational deviation (Step 16.15)
 
