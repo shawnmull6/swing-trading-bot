@@ -511,7 +511,8 @@ No backtest number — synthetic or historical, either policy — changes any it
    `swing_trading_bot.history_acquisition`, RUNBOOK §16; offline-tested only;
    Retry-After handling, explicit stop reasons and received-body digests added in
    16.17A.1, the deadline re-checked after every response and before every batch
-   commit in 16.17A.3, without changing the plan fingerprint) and reviewed. A separate statement
+   commit in 16.17A.3, without changing the plan fingerprint; an external one-session
+   supervisor with a hard 300 s process limit added in 16.17B) and reviewed. A separate statement
    naming:
    1. the acquisition-plan fingerprint (§3.0a);
    2. the credential file;

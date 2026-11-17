@@ -1168,8 +1168,10 @@ def test_the_runner_imports_no_oms_execution_ledger_or_evaluation_module() -> No
             if name.startswith("swing_trading_bot"):
                 assert name.startswith(allowed), f"{path.name} imports {name}"
             else:
-                assert name.split(".")[0] not in {"sqlite3", "socket", "http", "urllib3",
-                                                  "httpx", "subprocess"}, name  # fmt: skip
+                banned = {"sqlite3", "socket", "http", "urllib3", "httpx", "subprocess"}
+                if path.name == "supervisor.py":  # Step 16.17B: its one job is a child process
+                    banned -= {"subprocess"}
+                assert name.split(".")[0] not in banned, name
         for needle in ("submit_order", "OrderManager", ".post(", ".put(", ".patch(",
                        ".delete(", "TRADING_ENABLED=", "ledger.sqlite3", "walk_forward",
                        "run_backtest", "HoldoutRelease", "research_inputs"):  # fmt: skip

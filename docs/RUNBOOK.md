@@ -534,6 +534,51 @@ uv run python -m swing_trading_bot.history_acquisition publish --plan-fingerprin
 * `publish` never creates attestations, never asserts research readiness, runs no
   backtest and opens no holdout view.
 
+**Supervised session** (Steps 16.17B, 16.17B.1; offline-tested only). The same `session` can be run
+under an external supervisor that adds a hard 300 s wall-clock limit around the whole
+process (the runner's own deadline cannot stop a request that hangs):
+
+```bash
+RUN_ALPACA_HISTORY_ACQUISITION=1 STB_ENV_FILE=/abs/path/paper.env uv run python -m swing_trading_bot.history_acquisition.supervisor --plan-fingerprint <fingerprint> --probe-evidence history-probe-20261117T025839Z --authorization <label> --max-sessions <n> --new-store
+```
+
+* It takes exactly the `session` arguments, validates them (approved fingerprint only)
+  and launches **one** `python -I -m swing_trading_bot.history_acquisition session ...`
+  child (no shell, fixed argv) in its own process group. It never retries, restarts,
+  resumes, recovers or publishes; `--resume` is only what the operator passes.
+* Environment: allowlist only (`PATH`, `HOME`, locale, `TMPDIR`, `TZ`, `STB_ENV_FILE`,
+  `RUN_ALPACA_HISTORY_ACQUISITION`). Any `ALPACA_*`/`APCA_*` or credential setting name
+  in the environment is refused before launch (names only). The enable flag must be set
+  by the operator; the credential file is passed as a path and never opened.
+* Limit: 300 s on the monotonic clock from launch, then `SIGTERM` to the child's process
+  group, up to 10 s to exit, then `SIGKILL`.
+* Process-group safety (Step 16.17B.1): the child is not reaped until every group signal
+  has been sent. Its exit is observed without reaping (`kqueue` on macOS, `pidfd` on
+  Linux), so its pid — the group id — stays reserved and can never name another
+  process's group. Live descendants left in the group are sent `SIGTERM`, then `SIGKILL`;
+  any that still survive are reported (`process_group_survivors: true`). Supported on
+  macOS and Linux 5.3+ only; elsewhere the supervisor refuses before launching. A
+  descendant that leaves the group (its own `setsid`) is outside its reach.
+* Output: one JSON document — `result` (`COMPLETE`, `INCOMPLETE`, `STOPPED`, `REFUSED`,
+  `SUPERVISOR_TIMEOUT`, `CHILD_FAILED`, `SUPERVISOR_INTERRUPTED`, `SUPERVISOR_ERROR`),
+  `code` (a fixed refusal/error code), `launched`, `staging_state`, `child_exit_status`,
+  `termination_requested`, `forced_termination`, `descendants_terminated`,
+  `process_group_survivors`, `elapsed_s`, `recovery_required`,
+  `status_inspection_required`, `next_step`, the runner report's fixed fields only, and
+  the stderr byte count (stderr is never relayed). No exception text, environment value
+  or credential appears. Exit 0 complete, 1 incomplete/stopped, 2 refused (bad
+  arguments, missing enable flag or credential file, credential variables in the
+  environment, plan drift, or a runner refusal), 3 supervisor timeout, 4 child failed,
+  5 supervisor error (plan verification failed, child could not be launched, platform
+  unsupported, internal error), 130 interrupted.
+* `staging_state`: `CLOSED` (the runner reported the session), `NOT_STARTED` (nothing
+  launched, or a runner refusal raised before its journal entry), `INTERRUPTED_EARLIER`
+  (the runner refused because an earlier session was interrupted) or `UNCERTAIN`
+  (timeout, crash, survivors, an unclassified refusal). `recovery_required` is false only
+  for `CLOSED` and `NOT_STARTED`. Otherwise run `status`; run `recover --label` only if
+  it reports an interrupted session (rule 4). The supervisor runs neither. A further
+  session needs its own authorization.
+
 The operating rules:
 
 1. **Authorization first.** It must name the acquisition-plan fingerprint
