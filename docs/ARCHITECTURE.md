@@ -22,7 +22,7 @@ implemented offline (§12.35); M2-3 TradePlan contract and sell-side OMS foundat
 implemented offline (§12.38) and hardened (§12.39-§12.40); Step 16.12 durable protective stops in simulation with
 migration 0009 packaged but **not applied to the real ledger** (§12.41-§12.42); Step 16.13
 exit orchestration in simulation, partial profits deferred by default (§12.43), hardened
-with a fail-closed breached-stop halt and a strict evidence contract (§12.44). Current M1 state (2026-11-13): the
+with a fail-closed breached-stop halt and a strict evidence contract (§12.44); Step 16.14 (M2-4) offline support/resistance strategy foundation and deterministic backtest, research only (§12.45), hardened for entry timing, open-position accounting and corporate-action completeness (§12.46). Current M1 state (2026-11-13): the
 real observe ledger has been initialized; two live reconciliations were CLEAN and the
 `INITIALIZED` halt was cleared by an audited `resume`; the ledger runs in OBSERVE mode
 with trading disabled, and a three-cycle market-hours observation session is pending.
@@ -118,6 +118,8 @@ src/swing_trading_bot/
   ledger/      … baselines.py, acknowledgements.py (steps 13-13.2)
   observability/ logging.py (JSON + secret redaction)
   app/         runtime.py, cli.py, commands.py, lock.py, … (step 14, §12.20)
+  strategy/    market_data.py, support_resistance.py, signals.py, backtest.py
+               (step 16.14, offline research only, §12.45)
 ```
 
 *As built:* `broker/alpaca_marks.py` and `broker/resilience.py` do not exist — marks and
@@ -4481,6 +4483,199 @@ reconstruction; default deferral; configuration and source isolation of the opt-
 **Remaining policy decisions** (from §12.43): 1, 2, 4, 5, 6, 7 remain open; 3 is
 decided (fail closed, operator recovery). Open addition: which manual exit procedure the
 operator uses for a breached, halted position once broker execution exists.
+
+### 12.45 Step 16.14 (M2-4): support/resistance strategy foundation and offline backtest
+
+Offline research only. No Alpaca request, no credential access, no ledger opened or
+migrated (the real ledger stays at schema 8; migration 0009 still unapplied), no trading
+enablement, no broker write path. Nothing outside `strategy/` imports it; nothing in
+`strategy/` can reach the OMS, ledger, broker transport or settings (tested by AST and a
+fresh-interpreter `sys.modules` check, `tests/unit/test_strategy_isolation.py`).
+
+**Package `src/swing_trading_bot/strategy/`** (pure, deterministic, no I/O, no clock):
+
+| Module | Responsibility |
+|---|---|
+| `market_data.py` | Data contract: `SessionCalendar`, `prepare_series` (validated raw series + provenance digest), point-in-time `SymbolSeries.window`, `derive_split_events` |
+| `support_resistance.py` | `SupportResistanceParams` (15 interpretable parameters, fingerprinted) and `evaluate_setup` → `SetupEvaluation` with ordered `RejectionReason`s |
+| `signals.py` | `SetupSignal` contract, `generate_signal`, `ExitTemplate`, `to_trade_plan_intent` (the only bridge to TradePlan) |
+| `backtest.py` | `run_backtest` / `compare_policies`: deterministic replay with trade-level audit and fingerprints |
+
+`risk/sizing.py` (new): the pure sizing math (`size`, `SizingInputs`, `Constraint`, …)
+moved **unchanged** out of `risk/pretrade.py`, which re-exports every name. The backtest
+sizes with exactly the engine's constraints without importing the ledger.
+
+**1. Data contract (Phase A).**
+* Input: `DailyBar`s from the existing `BarSource` (§12.35), one symbol, one feed (`sip`
+  by default), `adjustment=raw`. Series faults (wrong symbol/feed/adjustment, duplicate or
+  out-of-order sessions, a bar on a non-session, non-midnight `as_of`, invalid split
+  events) **reject the whole series**; nothing is sorted, de-duplicated or repaired.
+* A bar received before its session's close is provisional and excluded
+  (`INCOMPLETE_BAR`); a bar outside the calendar is excluded (`OUTSIDE_CALENDAR`).
+* Missing sessions are never filled: a decision window containing one is `INSUFFICIENT`
+  (`MISSING_SESSIONS`, `HISTORY_STARTS_IN_WINDOW`, `DECISION_SESSION_MISSING`).
+* Bar closes are feed **observations**, never official closes; nothing here records or
+  reads `session_closes`.
+* Provenance: feed, adjustment, first/last session, bar count, SHA-256 of bars + splits.
+* **Corporate actions.** Execution uses raw bars. Decisions use **point-in-time
+  split adjustment**: for a decision on `D`, a bar on `s` is divided by the splits
+  effective in `(s, D]` only, so the decision bar is always raw (tradable) and no later
+  split leaks backwards. Provider `adjustment=split` series are restated retroactively, so
+  they are used only to *derive* split events (`raw.close / adjusted.close` factor
+  changes, snapped to plausible ratios — one term ≤ 4, the other ≤ 50 — within 0.5%,
+  else `SPLIT_RATIO_UNRESOLVED`, fail closed). Cash dividends are never price-adjusted;
+  since §12.46 they are booked as cash, and every series needs an attested
+  corporate-action record (§12.46).
+
+**2. Strategy rules (Phase B), defaults are research starting points, not approved.**
+
+| Rule | Parameter(s) | Default |
+|---|---|---|
+| Volatility: simple-mean ATR / close in range | `atr_period`, `min_atr_pct`, `max_atr_pct` | 14, 1.5%, 8% |
+| Liquidity and price | `liquidity_period`, `min_avg_dollar_volume`, `min_price` | 20, $20M, $10 |
+| Swing points need `span` completed bars on both sides (confirmation lag, no look-ahead) | `level_lookback`, `pivot_span` | 60, 3 |
+| Zones: greedy clustering of swing prices | `zone_atr` | 0.5 ATR |
+| Support: highest zone at/below the close with enough swing lows | `min_support_touches` | 2 |
+| Proximity: `max(0, close − zone top) / ATR` | `max_entry_distance_atr` | 0.75 |
+| Confirmation on the decision bar | `confirmation` (`BULLISH_REJECTION` / `CLOSE_ABOVE_PRIOR_HIGH` / `NONE`) | bullish rejection |
+| Stop: support floor − buffer, rounded down | `stop_buffer_atr` | 0.25 ATR |
+| First target: lowest swing-high zone above entry − buffer, rounded down | `target_buffer_atr` | 0.10 ATR |
+| Reward/risk `(target − entry)/(entry − stop)` | `min_reward_risk` | 2.0 |
+
+Entry limit = decision close rounded down to a valid tick. Rejection reasons:
+`INSUFFICIENT_HISTORY`, `PRICE_BELOW_MINIMUM`, `INSUFFICIENT_LIQUIDITY`,
+`VOLATILITY_TOO_LOW/HIGH`, `NO_SUPPORT`, `NOT_NEAR_SUPPORT`, `NOT_CONFIRMED`,
+`INVALID_STOP`, `NO_RESISTANCE`, `TARGET_NOT_ABOVE_ENTRY`, `REWARD_RISK_TOO_LOW` (all
+evaluable reasons are reported, in that order).
+
+**3. Signal contract (Phase C).** `SetupSignal`: strategy id/version, parameter
+fingerprint, symbol, `decision_session`, `decision_at` (its close — no input is later),
+`entry_session` (the next session; the only one it is valid for), entry/stop/target
+(`0 < stop < entry < target`, enforced), support and resistance zones, ATR, reward/risk,
+provenance (feed, basis, splits applied, bars used, series digest). `signal_ref` =
+`SYMBOL:YYYYMMDD:<12 hex of the fingerprint>`. `to_trade_plan_intent(signal,
+ExitTemplate)` builds a `TradePlanIntent` (DAY entry; partial fraction 0.5; trailing
+`ABSOLUTE` 2 × ATR rounded up, or `PERCENT`); `TradePlan.new` and `entry_proposal` then
+apply unchanged, so sizing and every pre-trade check stay in `risk/`.
+
+**4. Backtest (Phase D).** Per session `S`: splits → entry orders from `S−1` → exits on
+held positions → entry-day stop check → mark at close → decisions after the close
+(sized with `risk.sizing.size`, `max_open_positions`, `min_price`, a $5,000 capital
+ceiling, settled-cash availability). Conservative fills: open ≤ limit fills at
+`min(limit, open × (1 + 5 bp))`, else only if the low trades *through* the limit; stops
+trigger on touch, fill at the stop (or the open on a gap) less 10 bp, never below the
+low; same-bar stop and target → **stop first**; no target on the entry day; breakeven
+and trailing take effect next session; missing held bar → `DATA_GAP_HELD`, next open
+treated as a gap; split on the entry session cancels the order; split while held scales
+shares (cash in lieu for fractions), prices, the trailing offset, stop and target
+(rounded up). Fees: the configured `FeeModel`. Output: `TradeRecord`s with every fill,
+an ordered `AuditEvent` log, the equity curve, rejection counts, a summary, and
+config/data/result SHA-256 fingerprints (identical inputs ⇒ identical fingerprint).
+
+| Policy | Executable through the current OMS? | Behaviour |
+|---|---|---|
+| `PROTECTION_FIRST` | **Yes** (§12.43–§12.44 default) | stop for every share; partial **deferred** (`PARTIAL_DEFERRED` on every touch); hence no breakeven and no trailing; exits only at the stop, otherwise open at the end |
+| `HYPOTHETICAL_LINKED_EXITS` | **No** — needs verified linked orders (bucket stops + OCO) | resting partial at the target, breakeven after the whole partial, ATR trail on the runner |
+
+Not modelled: partial fills, intraday paths beyond the stated rules, loss-limit lockouts,
+delistings (position marked at the last close, §12.46), concentration drift after entry.
+(§12.46 supersedes the entry-day gap rule and adds dividends, timing and accounting.)
+
+**Tests.** `tests/unit/test_strategy_market_data.py` (contract, windows, missing
+sessions, incomplete bars, point-in-time vs provider-adjusted bars, 2:1, 3:2 and 1:10
+splits, unresolved ratios), `tests/unit/test_strategy_support_resistance.py` (swing
+points, zones, ATR, accepted setup, every rejection reason, confirmation modes, intent
+translation, Hypothesis property: future bars never change a decision),
+`tests/unit/test_strategy_backtest.py` (both policies, exact P&L, gaps, ambiguous bars,
+entry-day stops, limit penetration, missing sessions, splits and cash in lieu, fees and
+slippage, capacity, determinism, no future leakage), `tests/unit/test_strategy_isolation.py`.
+Fixtures: `tests/support/strategy_fixture.py` (synthetic).
+
+**Missing before any strategy result is meaningful.** A historical SIP daily dataset
+(multi-year, a defined universe) fetched under an explicit authorization and stored
+offline; an authoritative corporate-action source (or verified raw-vs-split derivation
+against live SIP data, still unverified per §12.35 ¶7); a survivorship-free universe
+(delisted symbols); dividend data; a historical trading calendar older than the cached
+one.
+
+**Open strategy decisions.** (1) The executable policy has no profit exit at all —
+choose a protection-compatible exit (e.g. a time stop or a close-based exit via `EXIT`,
+both requiring OMS work) or wait for linked orders; (2) parameter defaults and an
+out-of-sample validation protocol (walk-forward, no optimization on the test window);
+(3) the universe and its liquidity floor; (4) ranking when signals exceed capacity
+(today: reward/risk, then symbol); (5) whether daily-bar highs may drive trailing (§12.43
+decision 5); (6) whether entries should be skipped when the next open is already below
+the stop (resolved in §12.46).
+
+### 12.46 Step 16.14A: strategy foundation hardening (offline)
+
+Offline only; same prohibitions as §12.45 (no Alpaca, no credentials, real ledger
+untouched at schema 8, migration 0009 unapplied, trading disabled, no broker write).
+
+**1. Entry timing and gap-through-stop policy** (`ExecutionAssumptions.entry_timing`).
+
+| Timing | When the order exists | Open ≤ planned stop | Entry later breaches the stop |
+|---|---|---|---|
+| `SUBMIT_AFTER_OPEN` (**default**: the runtime gate blocks entries while the market is closed and extended hours are not allowed) | submitted after the opening print is known | **not submitted**: `ENTRY_REJECTED_GAP_THROUGH_STOP` (open exactly at the stop included) | marketable at submission (open ≤ limit) → `AMBIGUOUS_ENTRY_ORDERING`: the bar cannot show whether the breach preceded submission (a pre-submit check would reject) or followed the fill; conservative assumption **filled, then stopped**. Resting (open > limit) → sequential, not ambiguous (price crosses the limit before the stop) |
+| `RESTING_BEFORE_OPEN` | placed before the open; irrevocable in the opening auction | the open is **not** used to reject it: filled at the open, `ENTRY_FILLED_THROUGH_STOP`; the OMS would refuse the stop (`STOP_NOT_BELOW_MARK`) and halt `STOP_BREACHED_UNPROTECTED` — modelled as an exit at the open less slippage and labelled | sequential: filled at the open, then stopped |
+
+*OMS gap (not changed here):* the pre-trade engine has no "fresh mark at or below the
+planned stop" entry rejection. The `SUBMIT_AFTER_OPEN` guard is modelled in the backtest
+only and must be added to `risk/pretrade.py` before entries are automated.
+
+**2. Open-position accounting.** Trades are `COMPLETED` (every share sold) or `OPEN`.
+Open trades carry `open_qty`, final `mark_price`/`mark_session`/`mark_stale`,
+`market_value`, `unrealized_pnl` and `marked_r_multiple`; `r_multiple`, wins, losses,
+win rate, average R and expectancy use **completed trades only** (an unrealized gain is
+never a win). The summary reports cash, open-position market value, dividends
+receivable, final equity (= their sum), realized, unrealized and dividend income
+separately; when valued, `final − initial = realized + unrealized + dividends` (tested
+with fees, both policies, splits with cash in lieu, and dividends). Final-price policy:
+the close of the last replayed session; a missing final price follows
+`MissingPricePolicy` — `LAST_AVAILABLE_CLOSE` (default; `FINAL_MARK_STALE`, counted) or
+`UNVALUED` (fail closed: market value, unrealized P&L, final equity and return are
+`None`, `valuation_complete=false`). Each equity-curve point carries cash, market value,
+receivables, equity and stale symbols; a stale held mark blocks new entries that
+session (`ENTRY_BLOCKED_STALE_MARK`), as the runtime gate does.
+
+**3. Corporate-action completeness** (`market_data.CorporateActions`, `CoverageWindow`,
+`CashDividend`, `DividendPolicy`). `prepare_series(..., corporate_actions=...)` is
+required; all of the following reject the series:
+
+| Finding | Condition |
+|---|---|
+| `CORPORATE_ACTIONS_MISSING` | no record (`None` never means "no events") |
+| `CORPORATE_ACTIONS_SYMBOL_MISMATCH` | record for another symbol |
+| `SPLIT_COVERAGE_MISSING` / `_GAP` | no attested split coverage, or it does not span every accepted bar |
+| `DIVIDEND_COVERAGE_MISSING` / `_GAP` | same for dividends, under `REQUIRE_COVERAGE` (default) |
+| `CORPORATE_ACTION_OUTSIDE_COVERAGE` | an event dated outside its attested window |
+| `SPLIT_EVENT_INVALID` / `DIVIDEND_EVENT_INVALID` | wrong symbol, non-session date, duplicate date (construction also refuses non-Decimal or non-positive amounts and a pay date before the ex-date) |
+| `CORPORATE_ACTION_CONFLICT` | split and dividend on the same session (order ambiguous) |
+| `SPLIT_NOT_REFLECTED_IN_PRICES` | a recorded split of at least 3:2 (or 2:3) whose raw close→open move is outside [0.75, 1.3334] of the ratio |
+| `SPLIT_SUSPECTED_UNRECORDED` | an unrecorded overnight **rise** of ≥ 20% matching a plausible split ratio (an unrecorded reverse split would fabricate a gain) |
+
+An unrecorded split-like **drop** is deliberately *not* fatal: rejecting the series
+would silently drop genuine crashes (survivorship bias). It is recorded as
+`PRICE_DISCONTINUITY_UNEXPLAINED`; no decision window may span that session
+(`WindowIssue.CORPORATE_ACTION_SUSPECT`) and a held position books it as a real gap
+(the conservative reading). `PRICE_RETURN_ONLY` must be chosen explicitly; it ignores
+dividend events, reports `DIVIDENDS_EXCLUDED` and labels the result
+(`dividends_included=false`). `derive_split_events` now returns the attested split
+coverage (first..last compared session) when resolved.
+
+*Dividend accounting:* a dividend accrues on its ex-date to shares held at the prior
+close (a position bought on the ex-date is not entitled; one sold on it is), sits in
+dividends receivable, and becomes cash on the pay date; it is part of the trade's
+result (`dividend_income`, R-multiple). Prices are never dividend-adjusted, so signals
+stay point-in-time on raw (split-adjusted only) prices. Corporate actions, coverage and
+the dividend policy are in the series digest, so they are part of the data fingerprint.
+
+**Tests.** `tests/unit/test_strategy_backtest.py` (44: gap below/at/above the stop,
+resting limit before the open, ambiguous vs sequential ordering, open vs completed
+accounting, reconciliation identities, stale and unvalued final marks, stale marks
+blocking entries, split and cash in lieu, dividend accrual/payment/entitlement/
+receivable, price-return labelling, unexplained drop as a gap, deterministic replay with
+corporate actions); `tests/unit/test_strategy_market_data.py` (12 new contract cases).
 
 ---
 
