@@ -62,6 +62,13 @@ ALLOWED_ORIGINS: Final[Mapping[Service, str]] = {
 }
 """The exact, HTTPS-only hosts this transport may contact. The SDK's live trading URL is
 never among them; a change in the SDK constants is refused rather than followed."""
+CORPORATE_ACTIONS_SERVICE: Final[Service] = "data"
+CORPORATE_ACTIONS_PATH: Final = "/v1/corporate-actions"
+"""The one endpoint outside ``/v2`` the transport can reach (Step 16.16B):
+``GET https://data.alpaca.markets/v1/corporate-actions``. Host, version and path are fixed
+constants used only by :meth:`AlpacaReadTransport.get_corporate_actions_json`; there is no
+version parameter, so no other ``v1`` path, no other version and no other host can be
+combined with it, and there is no fallback endpoint."""
 CONNECT_TIMEOUT_S: Final = 5
 READ_TIMEOUT_S: Final = 20
 _MAX_ERROR_TEXT: Final = 300
@@ -230,10 +237,25 @@ class AlpacaReadTransport:
         return "AlpacaReadTransport(paper, GET-only)"
 
     def get_json(self, service: Service, path: str, params: Mapping[str, str]) -> object:
+        """GET ``{origin}/v2{path}`` on the paper trading or market-data host."""
         _check_path(path)
+        return self._get(service, f"/{API_VERSION}{path}", params)
+
+    def get_corporate_actions_json(self, params: Mapping[str, str]) -> object:
+        """GET ``https://data.alpaca.markets/v1/corporate-actions`` (Step 16.16B).
+
+        The only non-``v2`` request this transport can make. Every other control is
+        shared with :meth:`get_json`: GET only, HTTPS allowlisted origin, no redirects, no
+        environment proxies or ``.netrc``, bounded timeouts, the same status taxonomy
+        (403 classification on the data host) and exact-decimal decoding."""
+        return self._get(CORPORATE_ACTIONS_SERVICE, CORPORATE_ACTIONS_PATH, params)
+
+    def _get(self, service: Service, versioned_path: str, params: Mapping[str, str]) -> object:
+        if not all(isinstance(v, str) for v in params.values()):
+            raise ValueError("query parameters must be pre-formatted strings")
         base = ALLOWED_ORIGINS[service]
-        url = f"{base}/{API_VERSION}{path}"
-        context = f"GET {service}{path}"
+        url = f"{base}{versioned_path}"
+        context = f"GET {service}{versioned_path.removeprefix('/' + API_VERSION)}"
         try:
             response = self._session.get(
                 url,

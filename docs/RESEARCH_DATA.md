@@ -113,24 +113,61 @@ consistency check and unexplained drops are warnings (`ACCEPTED_WITH_WARNINGS`);
 span a gap produce no signal. Rejected symbols stay in the research inputs with no
 corporate-action record, so every backtest audits them as `SERIES_REJECTED`.
 
-## 3. Historical data acquisition plan (`research/acquisition.py`, revised 16.15A)
+## 3. Historical data plans (`research/acquisition.py`, revised 16.16B)
 
-`build_acquisition_plan()` produces the exact plan (fingerprint `2c4d13f2377958cc…`).
-Nothing is sent by this step. **Logical requests** (one query each) are distinct from
-**HTTP requests** (pages × attempts).
+There are two separate, fingerprinted plans. Nothing is sent by building either.
+**Logical requests** (one query each) are distinct from **HTTP requests** (pages ×
+attempts).
+
+### 3.0 Capability probe (Step 16.16B) — `build_capability_probe_plan()`
+
+Plan `history-capability-probe-v1`, fingerprint
+`1bfd4451e9df58e7a7b6de64c072bafc8298c3e509db05af15cd592386909931`. Runner:
+`tests/contract/history_probe.py` (authorized operator only; RUNBOOK §15). It runs these
+six requests and nothing else, then stops. It never continues into acquisition and writes
+no dataset.
+
+| # | Method, host, path | Query | Pages (expected / cap) |
+|---|---|---|---|
+| P1 | GET `paper-api.alpaca.markets` `/v2/calendar` | `start=2020-07-01&end=2026-10-31&date_type=TRADING` | 1 / 1 |
+| P2 | GET `paper-api.alpaca.markets` `/v2/calendar` | `start=2020-07-01&end=2026-10-31&date_type=SETTLEMENT` | 1 / 1 |
+| P3 | GET `data.alpaca.markets` `/v2/stocks/bars` | `symbols=AAPL&timeframe=1Day&start=2020-07-01T03:59:59Z&end=2020-12-31T05:00:01Z&feed=sip&adjustment=raw&limit=100&sort=asc` (+`page_token`) | 2 / 2 |
+| P4 | GET `data.alpaca.markets` `/v2/stocks/bars` | `symbols=AAPL&…&start=2020-08-24T03:59:59Z&end=2020-09-04T04:00:01Z&adjustment=split&limit=10000` | 1 / 1 |
+| P5 | GET `data.alpaca.markets` `/v2/stocks/bars` | `symbols=META&…&start=2022-06-06T03:59:59Z&end=2022-06-10T04:00:01Z&adjustment=raw&limit=10000` | 1 / 1 |
+| P6 | GET `data.alpaca.markets` `/v1/corporate-actions` | `symbols=AAPL,SPY&types=forward_split,cash_dividend&start=2020-07-01&end=2021-06-30&limit=5&sort=asc` (+`page_token`) | 2 / 2 |
+
+* **Budget.** 8 expected HTTP requests; a hard cap of **10 actual attempts** (pages and
+  retries together; the 11th is refused before it is sent); a 120 s deadline.
+* **Timeouts and retries.** Connect 5 s and read 20 s, cut to the time left. At most one
+  retry per page, only after 429, 503 or a timeout. Backoff is 0.5 s, raised to a
+  `Retry-After` value, capped at 4 s.
+* **Stops.**
+  * 401 or 403 (never retried).
+  * 404 on P1–P5, any other 4xx, a 5xx other than 503, or a network error.
+  * A redirect or a response from another host.
+  * Budget or deadline exhausted.
+  * A 404 on P6 makes `CA-SHAPE` `UNAVAILABLE`; no fallback endpoint is tried.
+* **Expected counts come from the calendar.** P3's expected sessions and page layout are
+  derived from P1, never hard-coded.
+* **Holdout.** No probe reads a 2025–2026 price; only the calendars span that period.
+
+### 3.0a Acquisition — `build_acquisition_plan()`
+
+Fingerprint `c4d5d57649b501843fd96879c01286cd3947e4994c61306a36321fb6a825b7e9`. It
+names the probe plan's id and fingerprint and runs only after the probe's checks pass;
+it needs its own authorization (§7).
 
 | Phase | Logical requests | Expected HTTP | Page cap (planning) |
 |---|---|---|---|
-| PROBE | 7: TRADING calendar 2020-07; SETTLEMENT calendar 2024-05-20 → 06-07; SPY raw 2020-07-01 → 07-10; AAPL raw 2020-H2 with `limit=50`; NVDA raw + split 2021-07-14 → 07-23; one `/v1/corporate-actions` call (AAPL, 2020-07 → 2021-06) | 9 | 10 |
 | CORE | 42: TRADING + SETTLEMENT calendars 2020-07-01 → 2026-10-31; 20 symbols × {raw, split} daily SIP bars over the same window (`limit=10000`, ≈1,596 bars each) | 42 | 82 |
-| CONDITIONAL | 9: corporate actions, one per year 2020–2026 (only if `CA-SHAPE` passes; `PROVIDER_REPORTED` evidence only); FB raw/split before 2022-06-09 (only if META's early bars are missing) | 9 | 39 |
-| **Total** | **58** | **60** | **131** |
+| CONDITIONAL | 9: corporate actions, one per year 2020–2026 (only if `CA-SHAPE` passes; `PROVIDER_REPORTED` evidence only); FB raw/split before 2022-06-09 (only if `TICKER-IDENTITY` shows META's early bars missing) | 9 | 39 |
+| **Total** | **51** | **51** | **121** |
 
 * **Pagination.** Every request follows `next_page_token` to null; a repeated or
   non-string token, or a page beyond the request's planning cap, stops the session.
   Bar caps never exceed the adapter's 20.
 * **Retries.** Only 429, 503 and timeouts, at most 3 attempts per page with the same
-  token (worst case 131 × 3 = 393). The shared budget of **120** binds first:
+  token (worst case 121 × 3 = 363). The shared budget of **120** binds first:
   exhausting it stops the session with nothing published.
 * **Entitlement failures.** A data-host 403 (including the recent-SIP message, A§12.36),
   any other 403 or a 401 is never retried and stops the session.
@@ -140,25 +177,26 @@ Nothing is sent by this step. **Logical requests** (one query each) are distinct
 * **Credentials.** The read-only paper key selected with `STB_ENV_FILE`; GET only; no
   ledger opened.
 
-### 3.1 Capability-validation checklist (for the authorized session)
+### 3.1 Capability-validation checklist (answered by the probe)
 
-Run the probes first. Each check passes or stops (or disables) what depends on it:
+Each check passes or stops (or disables) what depends on it:
 
 | Check | Question | Probe | Passes when | On failure |
 |---|---|---|---|---|
-| CAL-DEPTH | 2020 trading sessions served? | P-CAL-2020 | every row parses; first session 2020-07-01 | stop |
-| SETTLE-CYCLE | T+2 → T+1 change on 2024-05-28 visible? | P-SETTLE-2024 | trades before 2024-05-28 settle two settlement days later, then one | stop |
-| SIP-DEPTH | SIP history for the oldest window? | P-SIP-2020 | HTTP 200, a bar for each session, `t` = market midnight | stop on 403 (no retry); new reviewed plan |
-| PAGINATION | does `next_page_token` work historically? | P-PAGES | 3 pages then null; no duplicate or out-of-order bar | stop |
-| SPLIT-ADJ | do raw vs adjusted bars show NVDA's 2021-07-20 4:1 split? | P-SPLIT-RAW + P-SPLIT-ADJ | `derive_split_events` finds it (same-provider consistency only) | keep raw bars; split coverage needs independent/review evidence |
-| CA-SHAPE | what does `/v1/corporate-actions` return? | P-CA | a documented shape with dates and exact amounts, recorded before any importer is written | skip all corporate-action requests; coverage stays unattested and symbols are rejected |
+| CAL-DEPTH | every research-window session served? | P1 | rows parse; strictly increasing, no weekend; first 2020-07-01, last 2026-10-30; listed closures absent; 2020-11-27 closes 13:00 | stop |
+| SETTLE-CYCLE | T+2 → T+1 change on 2024-05-28 visible? | P2 | trades before 2024-05-28 settle on the 2nd listed settlement day, from then on the 1st; 2024-05-24 and 2024-05-28 both settle 2024-05-29; agrees with P1's `settlement_date` | stop |
+| SIP-DEPTH | SIP history for the oldest window? | P3 | one bar per P1 session in 2020-H2, `t` = market midnight | stop on 403 (no retry); new reviewed plan |
+| PAGINATION | does `next_page_token` work historically? | P3 | `ceil(sessions/100)` pages of the expected sizes, then null; no repeated token, duplicate or out-of-order bar | stop |
+| SPLIT-ADJ | do raw vs adjusted bars show AAPL's 2020-08-31 4:1 split? | P3 + P4 | `derive_split_events` finds exactly it (same-provider consistency only) | keep raw bars; split coverage needs independent/review evidence |
+| TICKER-IDENTITY | does META return bars before the 2022-06-09 change? | P5 | a META bar for every P1 session 2022-06-06..10 | the FB conditional requests are needed |
+| CA-SHAPE | what does `/v1/corporate-actions` return? | P6 | an object of typed lists plus `next_page_token`; shape, value types, limit semantics and pagination recorded before any importer is written | skip all corporate-action requests; coverage stays unattested and symbols are rejected |
 
 The corporate-action endpoint is unverified: even a passing shape probe says nothing
 about historical completeness. Its lists enter the dataset as `PROVIDER_REPORTED`.
 
 ### 3.1a Validation procedure (after an authorized fetch)
 
-1. Evaluate the checklist; stop where it says stop.
+1. Review the probe evidence against the checklist (§3.1); stop where it says stop.
 2. Fetch calendars, then bars per symbol; any `InvalidBrokerDataError`, 401/403 or
    pagination anomaly stops the run with nothing published.
 3. Run the same-provider split consistency check (`derive_split_events`); record it as
@@ -313,18 +351,21 @@ profit exit — a design gap (A§12.45 open decision 1), not a result.
 
 No backtest number — synthetic or historical, either policy — changes any item above.
 
-## 7. Authorization needed before acquisition
+## 7. Authorizations still needed
 
-A separate, explicit authorization naming:
-
-1. the plan fingerprint to execute (`2c4d13f2377958cc…`, §3);
-2. the credential file to select via `STB_ENV_FILE`;
-3. read-only GETs to the data and trading hosts within the existing 120-request / 300 s
-   budget (60 expected HTTP requests);
-4. that the six probes run first and the checklist (§3.1) gates everything else;
-5. the destination `data/research/<dataset_id>/`, with no ledger access;
-6. how split and dividend coverage will be attested (independent source or operator
-   review — same-provider consistency does not count).
+1. **The capability probe** (RUNBOOK §15): an explicit statement naming the probe-plan
+   fingerprint (§3.0), the runner, the credential file selected with `STB_ENV_FILE`,
+   the two hosts and three endpoints, the 10-attempt / 120 s limits, and the evidence
+   location. No ledger access, broker write, trading enablement or dataset.
+2. **Acquisition**, only after the probe's evidence has been reviewed. A separate
+   statement naming:
+   1. the acquisition-plan fingerprint (§3.0a);
+   2. the credential file;
+   3. read-only GETs within the 120-request / 300 s budget (51 expected HTTP requests);
+   4. the probe evidence that gates it (§3.1);
+   5. the destination `data/research/<dataset_id>/`, with no ledger access;
+   6. how split and dividend coverage will be attested (independent source or operator
+      review; same-provider consistency does not count).
 
 ## 8. Operational deviation (Step 16.15)
 

@@ -54,7 +54,9 @@ and separate metrics for both exit policies; no historical data fetched, no stra
 result claimed. Step 16.15A (A§12.48): evidence-based corporate-action attestation
 (same-provider consistency never sufficient), probe-gated acquisition plan, explicit
 independent vs continuous portfolio modes, frozen research protocol; Step 16.15's
-out-of-scope read-only ledger access recorded as an operational deviation.**
+out-of-scope read-only ledger access recorded as an operational deviation. Step 16.16B
+(A§12.49): offline capability-probe runner (P1–P6, ≤ 10 HTTP attempts) and the fixed
+`/v1/corporate-actions` transport method; the probe has not been executed.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

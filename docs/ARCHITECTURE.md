@@ -4914,6 +4914,88 @@ Other test files:
 * `tests/unit/test_research_isolation.py`: the sqlite guard, refusal of ledger
   directories.
 
+
+### 12.49 Step 16.16B: historical capability probe runner (offline)
+
+Offline only: no request was sent, no credential read, no ledger access of any kind,
+trading disabled. The probe was planned in Step 16.16A and is not yet executed.
+
+**1. Transport (`broker/alpaca_http.py`).** `AlpacaReadTransport` gains exactly one
+method, `get_corporate_actions_json(params)`, for
+`GET https://data.alpaca.markets/v1/corporate-actions`. Service, version and path are
+fixed constants (`CORPORATE_ACTIONS_SERVICE`, `CORPORATE_ACTIONS_PATH`). There is no
+version argument and no fallback endpoint (`/v1beta1`, `/v2/corporate_actions/
+announcements`). `get_json` still reaches only `/v2` paths. Both methods share one
+private request path: allowlisted HTTPS origin, no redirects, `trust_env=False`,
+bounded timeouts, the 403 classification and exact-decimal decoding. Query values must
+be pre-formatted strings.
+
+**2. Plans (`research/acquisition.py`).** The capability probe is now its own plan,
+`build_capability_probe_plan()` (`history-capability-probe-v1`, fingerprint
+`1bfd4451…09931`): P1–P6 exactly as reviewed, 8 expected HTTP requests, cap 10,
+`continues_into_acquisition=False`. `build_acquisition_plan()` no longer contains probe
+requests (51 logical requests, 51 expected HTTP requests, 121 at page caps), names the
+probe's id and fingerprint, and gates the FB requests on a new `TICKER-IDENTITY` check
+(P5). Acquisition fingerprint `c4d5d576…5b7e9`. Both fingerprints are pinned in tests.
+
+**3. Runner (`tests/contract/history_probe.py`).** It reuses the contract supervisor.
+* `RequestBudget(10, 120 s)` counts every attempt before it is sent; the 11th is
+  refused. The budget is built inside the runner and cannot be injected.
+* `BudgetedSession` (GET-only, allowlisted origins, redirects disabled, timeouts cut to
+  the time left).
+* A new outer `ProbeSession` checks the exact (origin, path) pair before the budget is
+  touched, records per-attempt metadata, and stops on a 3xx or a response from another
+  host.
+* Retries: one per page, only after 429, 503 or a timeout (`ReadRetryPolicy(2, 0.5 s,
+  4 s)` with `bounded_sleep`).
+* 401 and 403 stop the session. A 404 on P6 makes `CA-SHAPE` `UNAVAILABLE`; any other
+  404 stops the session.
+* Invalid JSON or an unexpected shape fails that probe; the run continues.
+* Credentials: only an `STB_ENV_FILE` source is accepted; environment credentials and
+  `TRADING_ENABLED=true` are refused before a session exists.
+* `main()` also requires `RUN_ALPACA_HISTORY_PROBE=1` and `--plan-fingerprint` equal to
+  the plan's fingerprint.
+
+**4. Evaluation (pure functions over what was received).**
+* Calendar depth and spot checks.
+* Settlement-day distance per trade: 2 before 2024-05-28, 1 from it. The 05-24 and
+  05-28 trades must settle 05-29, and P2 must agree with P1's `settlement_date`.
+* P3's expected sessions and page layout derived from P1.
+* `derive_split_events` on P3 vs P4 (recorded as `SAME_PROVIDER_CONSISTENCY`).
+* META coverage across 2022-06-09.
+* P6's recorded shape, value types, `limit` semantics, pagination and duplicate ids,
+  recorded as `PROVIDER_REPORTED`. Nothing is imported.
+
+**5. Evidence.**
+* Location: `EvidenceWriter` under `contract-evidence/history-probe-<UTC>Z/`.
+  Git-ignored, 0700/0600, no symlinks, write-once, atomic no-replace publication.
+* Bodies are structurally sanitized with the run's identity values (the credentials)
+  before anything is written. An unparseable success body is withheld (its length and
+  SHA-256 are recorded).
+* Never stored: request headers, transport error messages (which can quote a body) and
+  page tokens (only their SHA-256 prefix). A request id that echoes a credential is
+  redacted.
+* A sanitization failure publishes nothing. The summary carries the SHA-256 of every
+  sanitized body; evidence is byte-identical for identical inputs.
+* The evidence root is refused if it or its parent holds a `ledger.*` file (names only).
+
+**6. Ledger isolation.**
+* The runner imports no `sqlite3`, ledger, OMS, CLI or dataset module (checked in a
+  fresh interpreter) and has no ledger parameter.
+* While it runs, a process audit hook (`LedgerGuard`) refuses every `sqlite3` event and
+  any open, listing, rename, removal, permission change or directory creation under
+  `data/`, before the system call.
+* `stat` has no audit event; no code path names a ledger file. Tests use temporary
+  directories; the default guard is checked by string comparison only.
+
+**Tests.**
+* `tests/unit/test_corporate_actions_transport.py` (7).
+* `tests/contract/test_history_probe.py` (26, synthetic provider, canary credentials).
+* `tests/unit/test_research_universe_and_plan.py` (probe definitions, accounting,
+  pinned fingerprints, separation).
+* `test_alpaca_http.py`: the transport's public surface is now `get_json` plus the one
+  corporate-actions method.
+
 ---
 
 ## 13. Configuration & secrets

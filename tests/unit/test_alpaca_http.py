@@ -184,7 +184,8 @@ def test_alpaca_modules_cannot_write(module: str) -> None:
 
 def test_transport_exposes_only_get_json() -> None:
     public = {n for n in vars(AlpacaReadTransport) if not n.startswith("_")}
-    assert public == {"get_json"}
+    # Step 16.16B: plus the single fixed corporate-actions GET (no version parameter)
+    assert public == {"get_json", "get_corporate_actions_json"}
     t, _ = transport()
     assert not any(isinstance(v, RESTClient) for v in vars(t).values())  # SDK client not kept
 

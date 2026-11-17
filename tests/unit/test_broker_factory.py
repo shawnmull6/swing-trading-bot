@@ -79,7 +79,7 @@ def test_factory_builds_only_the_read_adapter() -> None:
 
 def test_transport_and_adapter_expose_no_write_surface() -> None:
     public = {n for n, _ in inspect.getmembers(AlpacaReadTransport) if not n.startswith("_")}
-    assert public == {"get_json"}
+    assert public == {"get_json", "get_corporate_actions_json"}  # both GET-only (16.16B)
     for name in ("submit_order", "cancel_order", "replace_order", "close_position"):
         assert not hasattr(AlpacaPaperReadAdapter, name)
 

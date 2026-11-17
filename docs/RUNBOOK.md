@@ -437,3 +437,29 @@ this is an operator procedure, not an agent task:
 3. Remove **both** sidecars together; never remove one alone, and never while any
    connection may be open.
 4. Run `verify-ledger data/ledger.sqlite3` afterwards.
+
+## 15. Historical capability probe (Step 16.16B; authorized operator only)
+
+**Do not run without an explicit authorization naming the probe-plan fingerprint**
+(RESEARCH_DATA §3.0, §7). The probe is read-only, never touches the ledger, writes no
+dataset and never starts acquisition.
+
+1. No bot process needs to stop and the ledger is not involved; do not open it.
+2. Use a credential file, not environment variables. It must be an absolute path, mode
+   600, owned by you, not tracked by Git, `TRADING_MODE=paper`, and `TRADING_ENABLED`
+   absent or false. Unset every `ALPACA_*` variable in the shell first.
+3. Run (the fingerprint must equal the authorized one, or the runner refuses):
+
+```bash
+RUN_ALPACA_HISTORY_PROBE=1 STB_ENV_FILE=/abs/path/paper.env uv run python -m tests.contract.history_probe --plan-fingerprint <fingerprint>
+```
+
+4. Read the printed verdict and per-check outcomes. Evidence is in
+   `contract-evidence/history-probe-<UTC>Z/`: `summary.json` (attempt log with status,
+   request id, timing, page, sanitized parameters and body SHA-256; per-probe and
+   per-check outcomes; rate-limit headers) and `raw/` (sanitized bodies).
+5. Limits enforced by the runner: GET only; the three allowlisted endpoints; at most 10
+   HTTP attempts and 120 s; one retry per page (429/503/timeout only); 401/403, a
+   redirect or another host stops it.
+6. A passing probe authorizes nothing further. Acquisition needs its own authorization
+   after the evidence is reviewed.
