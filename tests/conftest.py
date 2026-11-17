@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NoReturn
@@ -71,7 +72,8 @@ class ProductionLedgerAccessError(RuntimeError):
 @pytest.fixture(autouse=True)
 def _protect_production_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests may only use isolated temporary databases (simulation ledgers under
-    tmp_path); the production ledger location is off limits."""
+    tmp_path); the production ledger location is off limits, through the ``Database``
+    API or a raw ``sqlite3.connect`` in any mode."""
     original_create = Database.create.__func__  # type: ignore[attr-defined]
     original_open = Database.open.__func__  # type: ignore[attr-defined]
 
@@ -90,6 +92,20 @@ def _protect_production_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(Database, "create", classmethod(create))
     monkeypatch.setattr(Database, "open", classmethod(open_))
+
+    original_connect = sqlite3.connect
+
+    def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        # Any mode, read-only included (Step 16.15A): no test may open a database file
+        # under data/, whether by path or by a ``file:`` URI.
+        target = os.fsdecode(database) if isinstance(database, (str, bytes, os.PathLike)) else ""
+        if target.startswith("file:"):
+            target = target[len("file:") :].split("?", 1)[0]
+        if target and target != ":memory:":
+            _guard(Path(target))
+        return original_connect(database, *args, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
 
 
 @pytest.fixture(autouse=True)

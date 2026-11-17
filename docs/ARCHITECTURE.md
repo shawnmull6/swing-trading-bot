@@ -4677,6 +4677,243 @@ blocking entries, split and cash in lieu, dividend accrual/payment/entitlement/
 receivable, price-return labelling, unexplained drop as a gap, deterministic replay with
 corporate actions); `tests/unit/test_strategy_market_data.py` (12 new contract cases).
 
+### 12.47 Step 16.15 (M2-4): research dataset and walk-forward validation (offline)
+
+Offline infrastructure only. No Alpaca request, no credential or environment access, no
+historical data fetched, real ledger untouched (schema 8; migration 0009 unapplied),
+trading disabled, no broker write path. Every result so far is on SYNTHETIC fixtures and
+is not evidence of profitability. Operator-facing detail, the acquisition plan and the
+authorization needed: `docs/RESEARCH_DATA.md`; procedures: RUNBOOK §14.
+
+| Module | Responsibility |
+|---|---|
+| `research/universe.py` | `PILOT_UNIVERSE` (20 fixed symbols, sector and asset class, `FIXED_PRESENT_DAY_PILOT`, `survivorship_bias_free=false`, limitations, fingerprint) |
+| `research/dataset.py` | schema-v1 dataset: canonical JSON, decimal-string prices, SHA-256 manifest, atomic write-once publication, integrity-checked loader, identity/batch provenance checks, corporate-action coverage acceptance, raw-vs-split cross-check, per-symbol quality |
+| `research/acquisition.py` | deterministic, fingerprinted request plan (revised in §12.48: 58 logical requests, probes first); performs no request |
+| `strategy/walk_forward.py` | periods, fold construction, embargo, warm-up, point-in-time `SealedResearchData.view`, holdout release, fixed-defaults selection, protocol fingerprint, fold runner |
+| `strategy/evaluation.py` | `PerformanceReport` per backtest; explicit `None` + `ReportNote` for undefined metrics; `cost_sensitivity` |
+
+**Package boundaries.** `strategy/` stays pure (the existing isolation test now also
+covers `walk_forward.py` and `evaluation.py`). `research/` may read and write only the
+paths it is given; it imports `broker.models`, `broker.mapping` and `broker.errors` (pure
+payload mapping, so captured responses pass the adapter's exact validation) but no
+transport, settings, ledger, OMS or app module (`tests/unit/test_research_isolation.py`,
+AST and fresh-interpreter checks). `strategy/` never imports `research/`.
+
+**1. Dataset contract.** Raw SIP daily bars are the only decision and execution input;
+provider split-adjusted bars are stored only to cross-check the split record. The
+manifest records schema version, universe, research window and warm-up start, every
+acquisition batch (provider, endpoint, parameters, request/receipt times, request count)
+and every file's checksum; its digest is the dataset identity and enters every
+downstream fingerprint. Each bar row names its batch and `source_symbol`, checked
+against `identity.json` (ticker spans, listing, delisting). The calendar must carry
+explicit settlement dates and cover the warm-up and research window. Integrity and schema
+faults raise; per-symbol data faults reject only that symbol, which stays in the research
+inputs with no corporate-action record so the backtest audits it (`SERIES_REJECTED`) —
+nothing is silently dropped or repaired.
+
+**2. Corporate-action completeness.** *(Evidence model superseded by §12.48 ¶3: the
+former `PROVIDER_CROSS_CHECKED` method wrongly treated a same-provider raw/adjusted
+comparison as independent.)* Coverage per list (splits, cash distributions, other
+events) must be attested; `PROVIDER_REPORTED` is **not** accepted by default. Unaccepted
+coverage is treated as absent (fail closed through `prepare_series`, A§12.46). Other
+rejections: `SPLIT_DERIVATION_MISMATCH` (raw-vs-split derivation ≠ recorded splits in the
+bar span), `UNSUPPORTED_CORPORATE_ACTION` (merger, spin-off, stock dividend, rights,
+delisting inside the span), `OTHER_EVENT_COVERAGE_MISSING`, `IDENTITY_MISMATCH`,
+`UNKNOWN_BATCH`, `BAR_ROW_INVALID`. ETF distributions of every kind are booked as cash.
+
+**3. Walk-forward.** Development 2021–2023, validation 2024, holdout 2025-01-01 →
+2026-10-31 (`DEFAULT_PERIODS`). Default folds: expanding training, four 6-month
+walk-forward test windows inside development plus the 12-month validation fold, 5-session
+embargo. `SealedResearchData.view(until)` physically removes bars, sessions and
+corporate-action events after `until` and clips coverage, so neither selection nor a
+test can see the future; selection gets `view(train_end)`. Every test window starts flat;
+open positions at its end are marked and reported as open. Folds lacking
+`params.required_sessions` of history are `INSUFFICIENT_WARMUP`; short windows are
+`INSUFFICIENT_TEST_SESSIONS`; neither is evaluated. Holdout: any view at or after its
+start without a `HoldoutRelease` for the dataset raises; `run_walk_forward` never asks;
+`run_holdout` requires a release matching the protocol and parameter fingerprints. Only
+`FixedDefaultsSelector` exists (the 15 defaults); its id is in the protocol fingerprint.
+
+**4. Metrics.** Both policies are evaluated on identical data and reported separately in
+every fold. Completed-trade statistics never include open trades; return metrics need a
+fully valued final position; annualization needs ≥ 252 sessions; profit factor is
+undefined without a loss; fewer than 30 completed trades is `INSUFFICIENT`. Slippage
+appears only in fills and is studied by re-running (`cost_sensitivity`), never imputed.
+
+**Findings.** (1) On the synthetic fixtures `PROTECTION_FIRST` completes almost no
+trades: with partial profits deferred it has no profit exit, so positions only stop out
+or stay open. This confirms §12.45 open decision 1 is a precondition for any meaningful
+executable-policy evaluation. (2) The historical settlement cycle changed from T+2 to
+T+1 on 2024-05-28; the dataset therefore requires explicit per-session settlement dates
+rather than the offline next-session approximation. (3) The only local SIP data is a
+handful of 2026-11 sessions for three symbols and one 2024-06 NVDA split window
+(contract evidence); no research dataset exists yet.
+
+**Tests.** `tests/unit/test_research_dataset.py` (round trip, determinism, read-only
+files, five tampering modes, strict JSON, float rows, calendar settlement/coverage,
+unknown batch, missing record audited by the backtest, provider-only coverage per list,
+coverage gaps, unsupported events, split cross-check, unrecorded split-like drop,
+dividends, ticker change and identity mismatch, missing/late/early history, non-session
+bar, zero volume, adapter-equivalent page import), `tests/unit/test_walk_forward.py`
+(month arithmetic, period/design validation, fold table, rolling windows, holdout fold,
+sealed views, truncation of bars/dividends/splits/coverage, selection-sees-only-training
+spy, no holdout view requested, future/holdout bars cannot change earlier folds,
+determinism, fingerprint sensitivity, selector mismatch, insufficient warm-up and test
+windows, release matching, Hypothesis property on views),
+`tests/unit/test_strategy_evaluation.py` (metric identities, open-vs-completed, zero
+signals, short periods and small samples, unvalued final marks, profit factor without
+losses, capacity ranking, cost sensitivity, determinism),
+`tests/unit/test_research_universe_and_plan.py`, `tests/unit/test_research_isolation.py`.
+Fixtures: `tests/support/research_fixture.py` (SYNTHETIC calendar 2020-07 → 2026-10 and
+sawtooth bars).
+
+### 12.48 Step 16.15A: research framework hardening (offline)
+
+Offline only; same prohibitions as §12.47. No ledger access of any kind in this step, no
+Alpaca request, no credentials, no data fetched, trading disabled.
+
+**1. Operational deviation: real-ledger access during Step 16.15 (recorded, not
+repeated).** During Step 16.15's final verification (2026-11-16, ~17:26 PST) the agent
+ran, outside the authorized scope, to confirm the schema version for its report:
+
+```
+sqlite3 -readonly data/ledger.sqlite3 'PRAGMA user_version' 2>/dev/null \
+  || uv run python -c "import sqlite3; c = sqlite3.connect('file:data/ledger.sqlite3?mode=ro', uri=True); ..."
+```
+
+* The `sqlite3` CLI (3.51.0, supports `-readonly`) ran first with stderr discarded; it
+  exited non-zero, so the Python fallback ran. Whether the CLI opened the file before
+  failing is unknown and was not investigated (investigating would need ledger access).
+* The Python fallback opened the database through a read-only URI and returned
+  `user_version 8`.
+* Before the test runs and again after the access, the agent recorded the main file's
+  mtime (2026-11-16 11:59:22 PST), size (331,776 bytes) and SHA-256
+  (`dcbde9fa…442d54bf`, computed with `shasum`, which reads the file's bytes); all three
+  were unchanged afterwards.
+* The access left two sidecars, timestamped 17:26: `ledger.sqlite3-wal` (0 bytes) and
+  `ledger.sqlite3-shm` (32,768 bytes). The ledger uses WAL journalling (A§12.1), and opening
+  it, read-only included, creates the shared-memory index and an empty WAL. A 0-byte WAL
+  holds no transactions.
+* The sidecars were **left untouched**: not deleted, modified or checkpointed. Their
+  current state was not re-inspected in Step 16.15A.
+* Recommended cleanup, **operator-controlled and not executed** (RUNBOOK §14): leaving
+  them is safe, because SQLite reuses and manages them on the next normal open. If
+  removal is wanted: stop every bot process, confirm nothing holds the ledger or its
+  lock, take a backup (RUNBOOK §10), then remove both sidecars together, never one alone.
+* Prevention: tests now refuse any raw `sqlite3.connect` under `data/` (paths and `file:`
+  URIs, read-only included) in addition to the existing `Database.create/open` guard
+  (`tests/conftest.py`, tested without touching the real ledger). Dataset write and load
+  refuse a directory, or a directory's parent, that holds a `ledger.*` file; they list
+  names only and never open one. Ledger state is to be taken from recorded reports or an
+  authorized operator command, never verified ad hoc.
+* Found while validating this step: the pre-existing guard test
+  `tests/unit/test_scaffolding.py::test_tests_cannot_touch_the_production_ledger` read
+  the real ledger's bytes and mtime and asserted that no sidecars existed. That is a
+  plain file read, not an SQLite open, but it means every full offline pytest run read
+  the ledger's contents, including the Step 16.15 runs and the first two Step 16.15A
+  runs. Because of the sidecars above, it then failed. The test now proves the guard
+  with paths inside nonexistent directories under `data/` only. No test reads, stats or
+  opens the real ledger.
+
+**2. Acquisition plan revision** (`research/acquisition.py`). The plan now separates
+*logical requests* (58: 7 `PROBE`, 42 `CORE`, 9 `CONDITIONAL`) from *HTTP requests*:
+60 expected (one probe paginates on purpose); 131 at every planning page cap; 393 if
+every page also used all 3 read attempts. Retries apply only to 429, 503 and timeouts.
+The shared budget of 120 binds first, and exhausting it stops the session with nothing
+published. Entitlement failures (data-host 403 recent-SIP, any other 401/403) are never
+retried and stop the session. Six capability checks (`CAPABILITY_CHECKS`: calendar
+depth, settlement-cycle change, SIP depth, pagination, split adjustment, corporate-action
+shape) gate the core requests. `/v1/corporate-actions` is treated as unverified: its
+requests are conditional on a shape probe, and its lists are at most
+`PROVIDER_REPORTED` evidence. Plan fingerprint `2c4d13f2377958cc…`.
+
+**3. Corporate-action evidence** (`research/dataset.py`, schema version 2). A coverage
+claim is `{start, end, evidence[]}` and each evidence item is `{kind, source, reference}`.
+There are four kinds:
+
+| Kind | Meaning | Can establish completeness? |
+|---|---|---|
+| `PROVIDER_REPORTED` | the provider's own fully paginated list | only by an explicit, labelled policy (`PROVIDER_ONLY_COVERAGE_ACCEPTED`) |
+| `SAME_PROVIDER_CONSISTENCY` | internal check of one provider's data, e.g. its raw vs split-adjusted bars | **never** (a policy listing it is refused) |
+| `INDEPENDENT_SOURCE` | a different authoritative source | yes (default) |
+| `OPERATOR_REVIEW` | a recorded human review of named evidence | yes (default) |
+
+* A same-provider claim must be re-checkable from the dataset itself: for splits, the
+  split-adjusted bars must be stored and pass the derivation. Anything else is
+  `EVIDENCE_UNVERIFIABLE` (fatal).
+* The derivation outcome is recorded per symbol (`split_consistency`: PASSED, FAILED or
+  UNAVAILABLE), and a mismatch is still fatal.
+* The manifest carries `corporate_action_claims` (symbol, list, claimed window and
+  evidence). `write_dataset` derives it from the files; `load_dataset` re-derives and
+  compares it.
+* All other fail-closed rules are unchanged.
+
+**4. Portfolio state at fold boundaries** (`PortfolioMode`).
+
+* *`INDEPENDENT_FOLDS`* (the default, and the only mode used by `run_walk_forward` and
+  `run_holdout`):
+  * Every test window starts flat with the template's initial equity. It has no
+    positions, pending orders, unsettled proceeds or receivables.
+  * No decision is made on a window's last session, so no order is pending at its end.
+  * Open positions are marked at the last close. Sale proceeds still unsettled stay in
+    cash and in equity, and are reported separately. Dividends whose ex-date falls in
+    the window and whose pay date falls after it stay receivable and count in equity.
+  * Splits and dividends after the window end are clipped from its view.
+  * The end state is reported (`PerformanceReport.end_state`, backed by the new
+    `BacktestSummary.unsettled_proceeds` / `pending_orders_at_end`) and then discarded.
+  * Fold returns are never chained; aggregates hold counts only.
+* *`CONTINUOUS`*: `run_continuous` replays every walk-forward and validation test window
+  as one portfolio in one backtest.
+  * Positions, orders, cash, settlement and receivables cross boundaries inside the
+    replay, and boundary snapshots list the carried trades.
+  * It is accepted only when one replay represents it exactly: identical selected
+    parameters in every fold, calendar-contiguous test windows, and sufficient warm-up.
+    Anything else raises `UnsupportedEvaluationModeError`.
+  * `run_walk_forward` and `run_holdout` refuse a CONTINUOUS protocol, and the holdout
+    is never part of a continuous run.
+
+**5. Frozen protocol** (`FrozenProtocol`, `freeze_protocol`). The frozen protocol holds
+everything that determines a result:
+
+* dataset digest and per-file SHA-256;
+* universe id and fingerprint, symbols, feed and dividend policy;
+* strategy id/version, `ENGINE_VERSION`, `PROTOCOL_VERSION`;
+* parameter values and fingerprint;
+* the execution template (exit template; fees, slippage, entry timing and final-price
+  policy; risk limits; capital);
+* the reported policies and the portfolio mode;
+* every fold (including the holdout fold), the periods and the design;
+* the metrics version, sample minimum and sessions per year;
+* the selection procedure;
+* `RELEASE_CONDITIONS`.
+
+`HoldoutRelease` names the dataset digest, the frozen fingerprint and the fingerprint of
+the walk-forward report. `run_holdout` refuses unless the frozen fingerprint recomputed
+now matches and a fresh walk-forward run reproduces the named report, so any change
+after the release voids it. Holdout-fold parameter selection uses only data before its
+embargo (tested).
+
+**Tests added.** `tests/unit/test_walk_forward_boundaries.py`:
+* independent folds start fresh after open positions;
+* unsettled proceeds of a last-session sale;
+* a dividend receivable at a boundary;
+* a split after a fold end leaves earlier folds byte-identical;
+* CONTINUOUS refused by the independent runners;
+* continuous carry-over and boundary snapshots, and continuous capital reconciliation;
+* continuous refused for gaps and per-fold parameters.
+
+Other test files:
+* `tests/unit/test_research_dataset.py`: same-provider evidence never sufficient,
+  consistency plus review accepted, unverifiable evidence, evidence fields, manifest
+  claims recorded and tamper-checked.
+* `tests/unit/test_walk_forward.py`: the frozen protocol covers every choice, a release
+  is voided by any change, holdout selection never sees the holdout.
+* `tests/unit/test_research_universe_and_plan.py`: logical vs HTTP estimates,
+  checks-to-probes mapping, page caps.
+* `tests/unit/test_research_isolation.py`: the sqlite guard, refusal of ledger
+  directories.
+
 ---
 
 ## 13. Configuration & secrets

@@ -393,3 +393,47 @@ by the OS automatically, and the JSON note in the file is diagnostic only.
 | 4 `RECON_*` halt | reconciliation mismatch | inspect `audit` / `reconcile --json` findings; rebaseline only for external cash events |
 | 4 `RECON_ACCOUNT` | connected account differs from the ledger or identity uncertain | check credentials; never rebaseline to another account |
 | 6 | lock held | wait (§12) |
+
+## 14. Offline research datasets and the sealed holdout (Step 16.15)
+
+Research code never contacts Alpaca, reads credentials or opens the ledger
+(`docs/RESEARCH_DATA.md`, A§12.47). Historical data acquisition is **not authorized**;
+the request plan and the authorization it needs are in RESEARCH_DATA §3 and §7.
+
+* **Location.** Datasets live under `data/research/<dataset_id>/` (git-ignored, like the
+  ledger). A dataset is immutable: never edit, add or delete a file inside it — the
+  loader refuses any change. A correction is a new dataset id.
+* **Validate before use.** In Python: `load_dataset(Path("data/research/<id>"))`, then read
+  `quality` for every symbol. `REJECTED` symbols stay rejected; do not "fix" their files.
+  `PROVIDER_REPORTED` coverage is not accepted unless a reviewed, recorded decision
+  passes an explicit `CoverageAcceptance`, and such results must be labelled.
+* **Holdout (2025-01-01 → 2026-10-31).** Do not evaluate the strategy on, chart, or
+  otherwise inspect holdout-period results before a recorded `HoldoutRelease` (approver,
+  reason, date, dataset digest, protocol and parameter fingerprints). Any change to the
+  protocol or parameters after a release invalidates it. One release, one evaluation.
+* **Reading results.** Report `PROTECTION_FIRST` and `HYPOTHETICAL_LINKED_EXITS`
+  separately; the second is not executable. A metric shown as `None` is undefined for
+  the data (see its `ReportNote`), never zero. Fewer than 30 completed trades is
+  `INSUFFICIENT`. No backtest result authorizes paper or live execution.
+* **Evidence.** A raw-vs-split-adjusted comparison from the same provider is an internal
+  consistency check, never independent verification. Coverage is accepted only with an
+  independent source or a recorded operator review (with a reference to the evidence).
+* **Portfolio mode.** Walk-forward, validation and holdout folds are independent: each
+  starts flat with fresh capital. A continuous portfolio is evaluated only with
+  `run_continuous`, which refuses anything one replay cannot represent exactly. Never
+  chain fold returns by hand.
+
+### 14.1 Ledger sidecars left by the Step 16.15 deviation (operator decision)
+
+Research work must never open the ledger, not even read-only (ARCHITECTURE §12.48 ¶1).
+The Step 16.15 deviation left `data/ledger.sqlite3-wal` (0 bytes) and
+`data/ledger.sqlite3-shm` (32,768 bytes); the main file was unchanged. **Leaving them is
+safe**: SQLite reuses and manages them on the next normal open. If you want them gone,
+this is an operator procedure, not an agent task:
+
+1. Stop every bot process; confirm the lock is free (§12) and nothing has the files open
+   (for example `lsof data/ledger.sqlite3*` prints nothing).
+2. Back up `data/` (§10).
+3. Remove **both** sidecars together; never remove one alone, and never while any
+   connection may be open.
+4. Run `verify-ledger data/ledger.sqlite3` afterwards.

@@ -47,7 +47,14 @@ orchestrator (simulation); partial profits deferred by default, touch-triggered 
 exit simulation-only opt-in; linked exits still required. Step 16.13A (A§12.44):
 breached stop → persistent `STOP_BREACHED_UNPROTECTED` halt with recorded evidence, no
 automatic sell, operator resume only; strict evidence contract (identity, session,
-feed, duplicate/out-of-order); partial-profit opt-in unreachable from app config.**
+feed, duplicate/out-of-order); partial-profit opt-in unreachable from app config.
+Step 16.15 (A§12.47): offline research dataset format, fixed 20-symbol pilot universe,
+acquisition plan (not executed), walk-forward framework with a sealed 2025–2026 holdout
+and separate metrics for both exit policies; no historical data fetched, no strategy
+result claimed. Step 16.15A (A§12.48): evidence-based corporate-action attestation
+(same-provider consistency never sufficient), probe-gated acquisition plan, explicit
+independent vs continuous portfolio modes, frozen research protocol; Step 16.15's
+out-of-scope read-only ledger access recorded as an operational deviation.**
 Architecture: `docs/ARCHITECTURE.md` (section references below as A§n).
 
 ## 1. Goal

@@ -346,6 +346,12 @@ class BacktestSummary:
     partial_deferred_touches: int
     stale_final_marks: int
     valuation_complete: bool
+    unsettled_proceeds: Decimal
+    """Sale proceeds in ``cash`` whose settlement date is after the last replayed session
+    (counted in equity; not yet available for new buys)."""
+    pending_orders_at_end: int
+    """Entry orders still unworked after the last session (none: no decision is made on
+    the last session, because its next session is outside the replay)."""
     dividends_included: bool
     entry_timing: EntryTiming
     missing_final_price: MissingPricePolicy
@@ -901,7 +907,7 @@ def _max_drawdown(curve: Sequence[EquityPoint]) -> Decimal:
 
 
 def _summary(
-    rp: _Replay, trades: Sequence[TradeRecord], *, dividends_included: bool
+    rp: _Replay, trades: Sequence[TradeRecord], *, dividends_included: bool, last: date
 ) -> BacktestSummary:
     initial = rp.cfg.initial_equity
     done = [t for t in trades if t.completed]
@@ -932,6 +938,8 @@ def _summary(
         gap_through_stop_rejections=rp.gap_rejections, gap_through_stop_fills=rp.gap_fills,
         partial_deferred_touches=sum(t.partial_deferred_touches for t in trades),
         stale_final_marks=sum(1 for t in still if t.mark_stale),
+        unsettled_proceeds=sum((a for a, d in rp.unsettled if d > last), ZERO),
+        pending_orders_at_end=len(rp.pending),
         valuation_complete=valued, dividends_included=dividends_included,
         entry_timing=rp.ax.entry_timing, missing_final_price=rp.ax.missing_final_price,
     )  # fmt: skip
@@ -973,7 +981,7 @@ def run_backtest(
         records.append(_record(pos, mark))
     trades = sorted(records, key=lambda t: t.trade_id)
     dividends_included = all(s.dividends_included for s in series.values())
-    summary = _summary(rp, trades, dividends_included=dividends_included)
+    summary = _summary(rp, trades, dividends_included=dividends_included, last=last)
     config_fp = _fp(config.canonical())
     data_fp = _fp([[p.symbol, p.series.provenance.digest if p.series else None,
                     [asdict(f) for f in p.findings]] for p in preps]
