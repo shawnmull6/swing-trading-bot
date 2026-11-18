@@ -20,3 +20,6 @@ htmlcov/
 
 # Local, never-committed raw evidence from authorized contract runs (Step 15)
 contract-evidence/
+
+# Local parallel-agent git worktrees (Step 16.17D.1); never committed
+/agent_workspace/
