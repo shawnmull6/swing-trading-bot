@@ -12,6 +12,18 @@
   :func:`~swing_trading_bot.research.staging.run_session`'s (120 attempts / 300 s, a
   batch starts only if its whole budget and 30 s fit, at most once per batch, nothing
   of a failed batch staged). It never runs a second session and never publishes.
+* **Session limit (Step 16.17C.3).** ``--new-store`` seals the authorization's
+  ``max_sessions`` into the store's write-once ``store.json`` (``session_limit``, covered
+  by ``store_sha256``). ``--resume`` must name exactly that limit, every journal start
+  must agree with it, and every started session counts — an interrupted one too, before
+  and after :func:`recover` (which never touches ``store.json`` or a start record).
+* **Session accounting (Step 16.17C.3.1).** Every started session also *consumes* one
+  of the store's slot files (``StagingStore.consume_slot``: deleted and fsynced right
+  after its journal start, before any request). Resume, recovery and publication
+  require the journal and the consumed slots to agree
+  (:func:`check_session_accounting`); deleting the newest start and report therefore
+  leaves a consumed slot with no session (``SESSION_ACCOUNTING_INCONSISTENT``) instead
+  of a free one, and recovery can only consume a slot, never restore one.
 * :func:`recover` — explicit crash recovery: quarantines the lock and in-flight files
   (``StagingStore.recover``), re-verifies every staged batch and closes the journal
   entry of the interrupted session. Sends nothing.
@@ -69,6 +81,7 @@ from swing_trading_bot.research.dataset import (
     sha256,
 )
 from swing_trading_bot.research.staging import (
+    SESSION_LIMIT_RANGE,
     Fetch,
     SessionReport,
     StagingError,
@@ -298,6 +311,11 @@ def _write_once(path: Path, doc: Mapping[str, object]) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     path.chmod(0o444)
+    fd = os.open(path.parent, os.O_RDONLY)  # the new entry itself is durable too
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,7 +378,8 @@ class Authorization:
     def __post_init__(self) -> None:
         if not _LABEL.match(self.label):
             raise RunnerRefusedError("INVALID_AUTHORIZATION_LABEL")
-        if not 1 <= self.max_sessions <= 9:
+        low, high = SESSION_LIMIT_RANGE
+        if type(self.max_sessions) is not int or not low <= self.max_sessions <= high:
             raise RunnerRefusedError("INVALID_MAX_SESSIONS")
 
 
@@ -399,6 +418,44 @@ def _check_journal_gates(entries: Sequence[tuple[int, dict[str, Any], Any]],
             raise RunnerRefusedError("GATES_CHANGED_BETWEEN_SESSIONS")
 
 
+def check_session_limit(store: StagingStore,
+                        entries: Sequence[tuple[int, dict[str, Any], Any]],
+                        authorization: Authorization) -> int:  # fmt: skip
+    """The store's sealed session limit, enforced: the request must name it exactly,
+    every journal start must agree with it, and the started sessions (interrupted ones
+    included) must leave room for one more. Returns the limit."""
+    limit = store.session_limit
+    if limit is None:
+        raise RunnerRefusedError("SESSION_LIMIT_MISSING")
+    if authorization.max_sessions != limit:
+        raise RunnerRefusedError("SESSION_LIMIT_MISMATCH")
+    if any(start.get("max_sessions") != limit for _, start, _ in entries):
+        raise RunnerRefusedError("JOURNAL_SESSION_LIMIT_MISMATCH")
+    used = check_session_accounting(store, entries)
+    if max(len(entries), len(used)) >= limit:
+        raise RunnerRefusedError("SESSION_LIMIT_REACHED")
+    return limit
+
+
+def check_session_accounting(
+    store: StagingStore, entries: Sequence[tuple[int, dict[str, Any], Any]]
+) -> list[int]:
+    """The journal and the store's consumed slots must tell the same story: no more
+    sessions than slots, no consumed slot without a journal start (the newest session's
+    records deleted), and no closed session whose slot is still present (a restored
+    slot). Only an unreported (interrupted) session may still hold its slot: it was
+    interrupted between its start record and the consumption. Returns the consumed
+    slots."""
+    if store.session_limit is None:
+        raise RunnerRefusedError("SESSION_LIMIT_MISSING")
+    used = set(store.consumed_slots())
+    started = {n for n, _, _ in entries}
+    closed = {n for n, _, report in entries if report is not None}
+    if len(entries) > store.session_limit or not used <= started or not closed <= used:
+        raise RunnerRefusedError("SESSION_ACCOUNTING_INCONSISTENT")
+    return sorted(used)
+
+
 def _open_for_resume(
     root: Path, plan: AcquisitionPlan, authorization: Authorization, probe: ProbeGates
 ) -> tuple[StagingStore, list[tuple[int, dict[str, Any], dict[str, Any] | None]],
@@ -414,8 +471,7 @@ def _open_for_resume(
         raise RunnerRefusedError("INTERRUPTED_SESSION", "recover explicitly first")
     if not entries:
         raise RunnerRefusedError("NO_SESSION_JOURNAL", "store not made by a session")
-    if len(entries) >= authorization.max_sessions:
-        raise RunnerRefusedError("SESSION_LIMIT_REACHED")
+    check_session_limit(store, entries, authorization)
     if any(start.get("authorization") == authorization.label for _, start, _ in entries):
         raise RunnerRefusedError("AUTHORIZATION_LABEL_REUSED")
     _check_journal_gates(entries, probe)
@@ -465,7 +521,8 @@ def run_authorized_session(
         if store is None:
             paths.root.mkdir(mode=0o700, exist_ok=True)
             (paths.root / STAGING_DIR).mkdir(mode=0o700, exist_ok=True)
-            store = StagingStore.create(root, plan, created_at=now())
+            store = StagingStore.create(root, plan, created_at=now(),
+                                        session_limit=authorization.max_sessions)  # fmt: skip
         journal = Journal(root / JOURNAL_DIR)
         journal.ensure()
         n = len(entries) + 1
@@ -476,6 +533,7 @@ def run_authorized_session(
             "gates": gates, "started_at": now().isoformat(),
             "pending_batches": len(pending), "verified_batches": len(committed),
         })  # fmt: skip
+        store.consume_slot(n)  # durable before the first request; never given back
         clock_start.append(monotonic())
         report = run_session(store, fetch, gates=gates, monotonic=monotonic, sleep=sleep,
                              now=now)  # fmt: skip
@@ -503,13 +561,17 @@ def recover(*, paths: ResearchPaths, plan: AcquisitionPlan, fingerprint: str, la
             raise RunnerRefusedError("STORE_MISSING")
         store = StagingStore.open(root, plan)
         journal = Journal(root / JOURNAL_DIR)
-        unreported = journal.unreported()
+        entries = journal.entries()
+        unreported = [n for n, _, report in entries if report is None]
         if not store.interruption() and not unreported:
             raise RunnerRefusedError("NOTHING_TO_RECOVER")
+        used = check_session_accounting(store, entries)
         if (root / "quarantine" / label).exists():
             raise RunnerRefusedError("RECOVERY_LABEL_USED")
         moved, verified = store.recover(label=label)
         for n in unreported:
+            if n not in used:  # interrupted before its slot was consumed: consume it now
+                store.consume_slot(n)
             journal.report(n, {"session": n, "status": "INTERRUPTED_RECOVERED",
                                "recovery_label": label, "recovered_at": now().isoformat(),
                                "quarantined": moved, "verified_batches": len(verified),
@@ -540,6 +602,7 @@ def publish(*, paths: ResearchPaths, plan: AcquisitionPlan, fingerprint: str,
             raise RunnerRefusedError("NO_SESSION_JOURNAL")
         if any(report is None for _, _, report in entries):
             raise RunnerRefusedError("PREVIOUS_SESSION_INTERRUPTED", "recover explicitly first")
+        check_session_accounting(store, entries)
         _check_journal_gates(entries, probe)
         published = publish_dataset(
             store, universe, destination, gates=gates, semantics=OBSERVED_16_16D,
@@ -574,8 +637,16 @@ def status(*, paths: ResearchPaths, plan: AcquisitionPlan, fingerprint: str,
         interruption = store.interruption()
         committed = store.committed()
         entries = Journal(root / JOURNAL_DIR).entries()
+        consumed = store.consumed_slots()
+        try:
+            check_session_accounting(store, entries)
+            accounting = "CONSISTENT"
+        except RunnerRefusedError as exc:
+            accounting = exc.code
     out: dict[str, object] = {
         "store": "PRESENT", "plan_fingerprint": plan.fingerprint,
+        "session_limit": store.session_limit, "sessions_started": len(entries),
+        "slots_consumed": consumed, "session_accounting": accounting,
         "verified_batches": sorted(committed), "interruption": interruption,
         "sessions": [{"session": n, "authorization": s.get("authorization"),
                       "status": None if r is None else r.get("status"),
@@ -740,6 +811,8 @@ __all__ = [
     "ResearchPaths",
     "RunnerRefusedError",
     "check_gates",
+    "check_session_accounting",
+    "check_session_limit",
     "gates_from_probe_summary",
     "load_probe_gates",
     "main",

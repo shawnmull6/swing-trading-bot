@@ -12,7 +12,8 @@ wall-clock limit. It adds nothing to the runner's authority:
   ``publish`` are never run: those stay explicit operator commands.
 * **Fixed command.** The child's argv is built here from validated values (the approved
   plan fingerprint only, the runner's own label and evidence-name patterns, an integer
-  session count, one of ``--new-store`` / ``--resume``) and passed as a list; no shell,
+  session count, passed unchanged — the runner enforces it against the limit sealed in
+  the store — one of ``--new-store`` / ``--resume``) and passed as a list; no shell,
   no operator-supplied executable, module or extra argument. The runner has no budget
   argument, so 120 attempts / 300 s cannot be raised from here.
 * **Hard limit.** :data:`SUPERVISOR_LIMIT` (300 s, the plan's session deadline) is
@@ -79,6 +80,7 @@ from swing_trading_bot.history_acquisition.runner import (
     REPO,
 )
 from swing_trading_bot.research.acquisition import build_acquisition_plan
+from swing_trading_bot.research.staging import SESSION_LIMIT_RANGE
 
 RUNNER_MODULE: Final = "swing_trading_bot.history_acquisition"
 SUPERVISOR_LIMIT: Final = timedelta(seconds=300)
@@ -103,14 +105,15 @@ PRE_SESSION_REFUSALS: Final = frozenset({
     "AUTHORIZATION_LABEL_REUSED", "CONDITIONAL_GATE_UNDETERMINED", "CORE_GATE_NOT_PASSED",
     "CREDENTIALS_UNAVAILABLE", "CREDENTIAL_SOURCE_NOT_FILE", "GATES_CHANGED_BETWEEN_SESSIONS",
     "INVALID_AUTHORIZATION_LABEL", "INVALID_MAX_SESSIONS", "INVALID_PROBE_EVIDENCE_NAME",
-    "JOURNAL_INCONSISTENT", "JOURNAL_NOT_A_DIRECTORY", "JOURNAL_UNKNOWN_FILE",
-    "JOURNAL_UNREADABLE", "LIVE_SESSION_NOT_ENABLED", "NOTHING_TO_FETCH",
+    "JOURNAL_INCONSISTENT", "JOURNAL_NOT_A_DIRECTORY", "JOURNAL_SESSION_LIMIT_MISMATCH",
+    "JOURNAL_UNKNOWN_FILE", "JOURNAL_UNREADABLE", "LIVE_SESSION_NOT_ENABLED", "NOTHING_TO_FETCH",
     "NO_SESSION_JOURNAL", "PLAN_DRIFT", "PLAN_FINGERPRINT_MISMATCH",
     "PLAN_FINGERPRINT_NOT_AUTHORIZED", "PROBE_EVIDENCE_UNAVAILABLE", "PROBE_NOT_COMPLETED",
     "PROBE_PLAN_DRIFT", "PROBE_PLAN_MISMATCH", "PROBE_SUMMARY_INVALID",
     "REPOSITORY_NOT_FOUND", "RESEARCH_PATH_NOT_A_DIRECTORY", "RESEARCH_ROOT_NOT_ABSOLUTE",
-    "RESEARCH_ROOT_NOT_APPROVED", "SESSION_LIMIT_REACHED", "STORE_EXISTS", "STORE_MISSING",
-    "TRADING_ENABLED_REFUSED",
+    "RESEARCH_ROOT_NOT_APPROVED", "SESSION_ACCOUNTING_INCONSISTENT", "SESSION_LIMIT_MISMATCH",
+    "SESSION_LIMIT_MISSING",
+    "SESSION_LIMIT_REACHED", "STORE_EXISTS", "STORE_MISSING", "TRADING_ENABLED_REFUSED",
 })  # fmt: skip
 
 EXIT_COMPLETE: Final = 0
@@ -161,7 +164,8 @@ class SessionArgs:
             raise SupervisorRefusedError("INVALID_PROBE_EVIDENCE_NAME")
         if not _LABEL.match(self.authorization):
             raise SupervisorRefusedError("INVALID_AUTHORIZATION_LABEL")
-        if type(self.max_sessions) is not int or not 1 <= self.max_sessions <= 9:
+        low, high = SESSION_LIMIT_RANGE
+        if type(self.max_sessions) is not int or not low <= self.max_sessions <= high:
             raise SupervisorRefusedError("INVALID_MAX_SESSIONS")
         if type(self.resume) is not bool:
             raise SupervisorRefusedError("INVALID_MODE")

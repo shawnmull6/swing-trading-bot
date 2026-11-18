@@ -57,6 +57,27 @@ def _runner_session(data: Path, marker: Path, *, hang_in_link: bool) -> None:
     _print(t.session(paths, http))
 
 
+def _runner_resume(data: Path, label: str, max_sessions: str) -> None:
+    """A real ``run_authorized_session --resume`` over the mocked HTTP of the runner
+    tests, reporting a refusal exactly as the runner CLI does (``{"refused": code}``,
+    exit 2). The connect callable fails the child if it is ever reached."""
+    sys.path.insert(0, str(REPO))
+    from swing_trading_bot.history_acquisition.runner import (  # noqa: PLC0415
+        ResearchPaths,
+        RunnerRefusedError,
+    )
+    from tests.unit import test_history_acquisition_runner as t  # noqa: PLC0415
+
+    paths = ResearchPaths(data / "research")
+    try:
+        out = t.session(paths, resume=True, label=label, max_sessions=int(max_sessions),
+                        connect=t.never_connect)  # fmt: skip
+    except RunnerRefusedError as exc:
+        _print({"refused": exc.code})
+        sys.exit(2)
+    _print(out)
+
+
 def main() -> None:
     mode, log = sys.argv[1], sys.argv[2]
     rest = sys.argv[3:]
@@ -103,6 +124,8 @@ def main() -> None:
         _print({"status": "COMPLETE"})
     elif mode in ("runner_hang", "runner_link_hang"):
         _runner_session(Path(rest[0]), Path(rest[1]), hang_in_link=mode == "runner_link_hang")
+    elif mode == "runner_resume":
+        _runner_resume(Path(rest[0]), rest[1], rest[2])
     else:
         raise SystemExit(f"unknown mode {mode}")
 

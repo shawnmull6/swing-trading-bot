@@ -8,7 +8,10 @@ unit, or not at all.
 
 **Staging store** (one directory per acquisition-plan fingerprint)::
 
-    <root>/store.json              plan id, fingerprint and batch ids (write-once)
+    <root>/store.json              plan id, fingerprint, batch ids, the store's session
+                                   limit and its slot commitments, sealed by
+                                   ``store_sha256`` (write-once)
+    <root>/slots/<NN>.slot         one unconsumed session slot each (write-once, 0444)
     <root>/blobs/<sha256>.json     response bodies, content-addressed (write-once, 0444)
     <root>/batches/<batch_id>.json committed batch records (write-once, 0444)
     <root>/tmp/                    in-flight files; never trusted
@@ -26,6 +29,18 @@ fingerprint, and a record naming another plan or an unknown batch.
 left by a crash makes the store refuse new sessions and publication until
 :meth:`StagingStore.recover` has moved them to ``quarantine/`` (never deleted, never
 reused) and re-verified every committed batch.
+
+**Session slots** (Step 16.17C.3.1). A store created with a ``session_limit`` of *L*
+holds *L* slot files, each a random 32-byte secret whose SHA-256 is committed, in order,
+in ``store.json``. Starting session *n* *consumes* slot *n* by deleting its file (then
+fsyncing the directory) before any request is sent. Consumption is destruction: a
+missing slot file is a used slot, and a deleted file cannot be recreated without its
+secret, so deleting journal records, slot files or the whole ``slots/`` directory can
+only ever *use up* capacity, never restore it. A present slot file that does not match
+its commitment, or an unknown file in ``slots/``, is ``SESSION_SLOT_TAMPERED``. Trust
+boundary: this defends against deletion and loss, not against an actor who restores a
+copy of the slot files made before they were consumed (a backup or snapshot of the
+store), or who rewrites ``store.json`` *and* every journal start consistently.
 
 **Budgets** (never raised here): the session's attempt cap and deadline are the plan's
 (``REQUEST_BUDGET`` / ``SESSION_DEADLINE_S``); every attempt — first pages, later pages
@@ -140,6 +155,9 @@ from swing_trading_bot.research.dataset import (
 from swing_trading_bot.research.universe import ResearchUniverse
 
 STORE_FILE: Final = "store.json"
+SESSION_LIMIT_RANGE: Final = (1, 9)
+"""Allowed values of a store's ``session_limit`` (the authorized session count)."""
+SLOTS_DIR: Final = "slots"
 LOCK_FILE: Final = "session.lock"
 BACKOFF_BASE: Final = timedelta(milliseconds=500)
 BACKOFF_MAX: Final = timedelta(seconds=4)
@@ -222,27 +240,50 @@ class BatchRecord:
 class StagingStore:
     """A verified handle on one plan's staging directory (see the module docstring)."""
 
-    def __init__(self, root: Path, plan: AcquisitionPlan) -> None:
+    def __init__(self, root: Path, plan: AcquisitionPlan, *, session_limit: int | None = None,
+                 slot_commitments: Sequence[str] = ()) -> None:  # fmt: skip
         self.root = root
         self.plan = plan
+        self.session_limit = session_limit
+        """The maximum number of sessions ever authorized for this store, fixed when the
+        store was created (``None``: created without one; a runner refuses to resume it)."""
+        self._slots = tuple(slot_commitments)
         self._batches = {b.batch_id: b for b in plan.batches}
 
     # ---------------------------------------------------------------- lifecycle
     @classmethod
-    def create(cls, root: Path, plan: AcquisitionPlan, *, created_at: datetime) -> StagingStore:
+    def create(cls, root: Path, plan: AcquisitionPlan, *, created_at: datetime,
+               session_limit: int | None = None) -> StagingStore:  # fmt: skip
+        """A new, empty store. ``session_limit`` is written into ``store.json`` in the same
+        single write-once link as the plan identity, so a store either has its final,
+        sealed limit or no readable metadata at all (``STORE_UNREADABLE``); it can never
+        be changed afterwards. Its slot files are written and fsynced first, so a crash
+        before ``store.json`` is linked leaves no usable store."""
+        if session_limit is not None and not _valid_session_limit(session_limit):
+            raise StagingError("SESSION_LIMIT_INVALID")
         refuse_ledger_location(root)
         try:
             root.mkdir(mode=0o700)
         except FileExistsError:
             raise StagingError("STORE_EXISTS", str(root)) from None
-        for name in ("blobs", "batches", "tmp", "quarantine"):
+        for name in ("blobs", "batches", "tmp", "quarantine", SLOTS_DIR):
             (root / name).mkdir(mode=0o700)
-        store = cls(root, plan)
-        store._write_new(root / STORE_FILE, encode_json({
+        commitments = []
+        for n in range(1, (session_limit or 0) + 1):
+            secret = os.urandom(32).hex().encode()
+            _write_durable(root / SLOTS_DIR / _slot_name(n), secret)
+            commitments.append(sha256(secret))
+        _fsync_dir(root / SLOTS_DIR)
+        store = cls(root, plan, session_limit=session_limit, slot_commitments=commitments)
+        doc: dict[str, object] = {
             "kind": "acquisition-staging", "plan_fingerprint": plan.fingerprint,
             "capability_probe_fingerprint": plan.capability_probe_fingerprint,
             "universe_id": plan.universe_id, "created_at": created_at.isoformat(),
-            "batches": sorted(store._batches)}))  # fmt: skip
+            "batches": sorted(store._batches), "session_limit": session_limit,
+            "session_slots": commitments}  # fmt: skip
+        doc["store_sha256"] = sha256(canonical(doc).encode())
+        store._write_new(root / STORE_FILE, encode_json(doc))
+        _fsync_dir(root)
         return store
 
     @classmethod
@@ -252,12 +293,61 @@ class StagingStore:
             doc = json.loads((root / STORE_FILE).read_bytes())
         except (OSError, ValueError):
             raise StagingError("STORE_UNREADABLE", str(root)) from None
-        if not isinstance(doc, dict) or doc.get("plan_fingerprint") != plan.fingerprint:
+        if not isinstance(doc, dict):
+            raise StagingError("STORE_UNREADABLE", str(root))
+        body = {k: v for k, v in doc.items() if k != "store_sha256"}
+        if doc.get("store_sha256") != sha256(canonical(body).encode()):
+            raise StagingIntegrityError("STORE_METADATA_TAMPERED", "store.json digest")
+        if "session_limit" not in doc:
+            raise StagingIntegrityError("STORE_METADATA_TAMPERED", "session_limit absent")
+        limit = doc["session_limit"]
+        if limit is not None and not _valid_session_limit(limit):
+            raise StagingIntegrityError("STORE_METADATA_INVALID", "session_limit")
+        if "session_slots" not in doc:
+            raise StagingIntegrityError("STORE_METADATA_TAMPERED", "session_slots absent")
+        slots = doc["session_slots"]
+        if (not isinstance(slots, list) or len(slots) != (limit or 0)
+                or not all(isinstance(c, str) and _SHA256_HEX.match(c) for c in slots)
+                or len(set(slots)) != len(slots)):  # fmt: skip
+            raise StagingIntegrityError("STORE_METADATA_INVALID", "session_slots")
+        if doc.get("plan_fingerprint") != plan.fingerprint:
             raise IncompatiblePlanError("INCOMPATIBLE_PLAN", "the store was made for another "
                                         "acquisition plan; never mixed")  # fmt: skip
         if doc.get("batches") != sorted(b.batch_id for b in plan.batches):
             raise IncompatiblePlanError("INCOMPATIBLE_PLAN", "batch list differs")
-        return cls(root, plan)
+        return cls(root, plan, session_limit=limit, slot_commitments=slots)
+
+    # ---------------------------------------------------------------- session slots
+    def consumed_slots(self) -> list[int]:
+        """Slot numbers (1-based) whose file is gone: each one is a started session. A
+        missing ``slots/`` directory means every slot is used. Raises
+        ``SESSION_SLOT_TAMPERED`` for a present slot that does not match its
+        commitment, a non-regular file or an unknown name."""
+        directory = self.root / SLOTS_DIR
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise StagingIntegrityError("SESSION_SLOT_TAMPERED", SLOTS_DIR)
+        present = sorted(p.name for p in directory.iterdir()) if directory.is_dir() else []
+        known = {_slot_name(n): n for n in range(1, len(self._slots) + 1)}
+        unknown = [name for name in present if name not in known]
+        if unknown:
+            raise StagingIntegrityError("SESSION_SLOT_TAMPERED", unknown[0])
+        for name in present:
+            path = directory / name
+            if path.is_symlink() or not path.is_file():
+                raise StagingIntegrityError("SESSION_SLOT_TAMPERED", name)
+            if sha256(path.read_bytes()) != self._slots[known[name] - 1]:
+                raise StagingIntegrityError("SESSION_SLOT_TAMPERED", name)
+        return sorted(set(known.values()) - {known[name] for name in present})
+
+    def consume_slot(self, n: int) -> None:
+        """Use up slot ``n`` durably: verify it, delete its file and fsync the directory.
+        Refused when it is already gone (``SESSION_SLOT_CONSUMED``) or out of range."""
+        if not 1 <= n <= len(self._slots):
+            raise StagingError("SESSION_SLOT_UNAVAILABLE", str(n))
+        if n in self.consumed_slots():
+            raise StagingError("SESSION_SLOT_CONSUMED", str(n))
+        (self.root / SLOTS_DIR / _slot_name(n)).unlink()
+        _fsync_dir(self.root / SLOTS_DIR)
 
     def interruption(self) -> list[str]:
         """Names left by a session that did not finish cleanly (empty when none)."""
@@ -409,6 +499,34 @@ class StagingStore:
 
     def pages(self, record: BatchRecord) -> list[bytes]:
         return [(self.root / "blobs" / f"{d}.json").read_bytes() for d in record.pages]
+
+
+def _slot_name(n: int) -> str:
+    return f"{n:02d}.slot"
+
+
+def _fsync_dir(path: Path) -> None:
+    """Make a directory's entries (a link, creation or removal) durable."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_durable(path: Path, data: bytes) -> None:
+    """Create ``path`` (never replacing it), fsync it and make it read-only."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    path.chmod(0o444)
+
+
+def _valid_session_limit(value: object) -> bool:
+    low, high = SESSION_LIMIT_RANGE
+    return type(value) is int and low <= value <= high
 
 
 def _valid_received(entry: Mapping[str, object]) -> bool:
@@ -1026,6 +1144,8 @@ __all__ = [
     "MIN_ATTEMPT_TIME",
     "RECEIVED_DIGEST_SCOPE",
     "RESPONSE_AFTER_DEADLINE",
+    "SESSION_LIMIT_RANGE",
+    "SLOTS_DIR",
     "STORED_DIGEST_SCOPE",
     "STORE_FILE",
     "BatchRecord",
